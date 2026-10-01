@@ -545,12 +545,15 @@ class _CommandResult:
 class _FakeClient:
     """Stand-in for tenki.Client: hands out the given sessions in order and records calls."""
 
-    def __init__(self, *sessions, create_error=None, create_delay=0.0, leftover=None, list_error=None):
+    def __init__(
+        self, *sessions, create_error=None, create_delay=0.0, leftover=None, list_error=None, close_error=None
+    ):
         self._sessions = list(sessions)
         self._create_error = create_error
         self._create_delay = create_delay
         self._leftover = list(leftover or [])
         self._list_error = list_error
+        self._close_error = close_error
         self.create_started = threading.Event()
         self.closing = threading.Event()
         self.close_gate = None
@@ -581,6 +584,8 @@ class _FakeClient:
         self.closing.set()
         if self.close_gate is not None:
             self.close_gate.wait(timeout=5)
+        if self._close_error is not None:
+            raise self._close_error
         self.closed = True
 
 
@@ -746,6 +751,17 @@ def test_validate_config_warns_about_a_missing_or_non_tenki_key(monkeypatch, log
     assert bool(logs) is warns
 
 
+def test_validate_config_reports_a_config_it_cannot_read(monkeypatch, logs):
+    glb, _ = _make_global(monkeypatch, {})
+
+    def unreadable(logical_type, conn_config):
+        raise KeyError('connConfig')
+
+    monkeypatch.setattr(mod, 'Config', SimpleNamespace(getNodeConfig=unreadable), raising=False)
+    glb.validateConfig()
+    assert any('connConfig' in message for message in logs)
+
+
 # ---------------------------------------------------------------------------
 # get_session: lazy creation
 # ---------------------------------------------------------------------------
@@ -877,6 +893,20 @@ def test_session_the_service_no_longer_knows_is_replaced(monkeypatch, logs):
         lambda session: _raise(mod.SessionNotFoundError('session not found')) if session is gone else session.id
     )
     assert result == 'sb-fresh'
+    assert len(client.create_calls) == 2
+
+
+def test_an_ended_session_whose_close_fails_is_still_replaced(monkeypatch, logs):
+    # A failing close is expected when the session really is gone, so it must not stop the replacement.
+    ended = _FakeSession('sb-1', state='USER_SHUTDOWN', close_error=mod.SessionNotFoundError('not found'))
+    glb, client = _started(monkeypatch, ended, _FakeSession('sb-fresh'))
+    reported = []
+    outcome = glb.call_with_session(
+        lambda session: _raise(mod.SessionTerminatedError('session_terminated')) if session is ended else 'ok',
+        on_recovery=reported.append,
+    )
+    assert outcome == 'ok'
+    assert reported == ['replaced']
     assert len(client.create_calls) == 2
 
 
@@ -1429,6 +1459,14 @@ def test_make_directory_creates_the_directory_and_its_parents(monkeypatch, logs)
     assert {'/home/tenki/data', '/home/tenki/data/raw'} <= session.fs.dirs
 
 
+def test_make_directory_reports_a_failure_to_the_agent(monkeypatch, logs):
+    session = _FakeSession('sb-1', fail={'mkdir': inst_mod.PermissionDeniedError('read-only file system')})
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.make_directory({'path': 'data'})
+    assert result['success'] is False
+    assert 'read-only file system' in result['error']
+
+
 @pytest.mark.parametrize(
     ('tool', 'args'), [('write_file', {'path': 'a.txt', 'content': 'x'}), ('make_directory', {'path': 'data'})]
 )
@@ -1837,6 +1875,7 @@ def test_git_clone_asks_for_a_directory_when_the_repository_names_no_folder(monk
         'file:///home/tenki/secret',
         'git://github.com/org/repo.git',
         '/home/tenki/local-repo',
+        'https:///org/repo.git',
     ],
 )
 def test_git_clone_refuses_a_repository_that_is_not_a_public_http_url(monkeypatch, logs, repo):
@@ -1848,6 +1887,11 @@ def test_git_clone_refuses_a_repository_that_is_not_a_public_http_url(monkeypatc
     with pytest.raises(ValueError):
         inst.git_clone({'repo': repo})
     assert _git_calls(session, 'clone') == []
+
+
+def test_absent_git_output_is_returned_as_empty_text():
+    # The SDK declares git output as str; were it ever absent, the result must still be well formed.
+    assert inst_mod._git_result(None, 100) == {'output': '', 'truncated': False}
 
 
 def test_git_clone_returns_git_failures_to_the_agent(monkeypatch, logs):
@@ -2361,6 +2405,39 @@ def test_a_session_shutdown_left_running_is_closed_and_reported_to_the_operator(
     glb.endGlobal()
     assert 'close' in leaked.calls
     assert any('sb-leaked' in message for message in logs)
+
+
+def test_shutdown_before_the_pipeline_ever_started_is_harmless(monkeypatch, logs):
+    # In config mode, or after a failed start, there is no client and no session to close.
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY})
+    glb.endGlobal()
+    assert glb.client is None
+    assert logs == []
+
+
+def test_the_shutdown_sweep_never_runs_without_this_runs_tag(monkeypatch, logs):
+    # Not reachable today, since beginGlobal sets the tag before it creates the client. Kept as an
+    # interlock: listing by an empty tag could match other runs' sessions, and close their work.
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'), leftover=[_FakeSession('sb-other')])
+    glb._run_tag = ''
+    glb.endGlobal()
+    assert client.list_calls == []
+
+
+def test_a_leftover_session_that_will_not_close_is_reported_to_the_operator(monkeypatch, logs):
+    stuck = _FakeSession('sb-left', close_error=mod.SandboxError('permission denied'))
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'), leftover=[stuck])
+    glb.get_session()
+    glb.endGlobal()
+    assert client.closed is True
+    assert any('could not close leftover session sb-left' in message for message in logs)
+
+
+def test_a_failed_client_close_is_logged_and_the_client_still_dropped(monkeypatch, logs):
+    glb, _ = _started(monkeypatch, _FakeSession('sb-1'), close_error=RuntimeError('channel already closed'))
+    glb.endGlobal()
+    assert glb.client is None
+    assert any('channel already closed' in message for message in logs)
 
 
 def test_a_failed_shutdown_sweep_is_logged_and_the_client_still_closes(monkeypatch, logs):
