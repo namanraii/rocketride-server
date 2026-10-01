@@ -61,7 +61,9 @@ functions are published depends on the **Tool groups** field; by default all thr
 | `git_log` | Show commit history, bounded by a maximum count. |
 
 Every path argument is resolved under `/home/tenki` and confined to it, so the file functions cannot
-read or write elsewhere in the VM. Execution functions return `exit_code`, `stdout`, `stderr`,
+read or write elsewhere in the VM. `read_file` fetches a file in one request, so it refuses one over
+4,000,000 bytes rather than pulling it into the engine; read part of a larger file with
+`run_command` instead (`head`, `tail` or `sed -n`). Execution functions return `exit_code`, `stdout`, `stderr`,
 `timed_out` and `truncated`; a command stopped at its timeout comes back as an ordinary result with
 `timed_out` set, not as an error. Output longer than the configured cap is truncated before it
 reaches the agent, with `truncated` set so the agent knows it did not see everything.

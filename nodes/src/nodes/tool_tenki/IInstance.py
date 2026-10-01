@@ -89,6 +89,13 @@ _RESULT_GRACE_SECS = 30
 # apt-get install, pytest -v, a build) runs to completion and is merely truncated. It sits above the
 # most the agent can ever be shown (1M characters, at most 4 MB of UTF-8), so it never cuts into that.
 _OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024
+# The largest file read_file fetches. It reads through the SDK's unary ReadFile call, which carries
+# the client deadline; the streaming read does not, so a half-open connection could hang it for good.
+# ReadFile takes no length and returns the whole file, so the size is checked with stat first and a
+# larger file is refused without being fetched. The limit sits just under gRPC's default 4 MiB receive
+# limit, which the SDK's channels keep, so a file that grows between the two calls fails there rather
+# than arriving whole.
+_READ_LIMIT_BYTES = 4_000_000
 _KILLED_NOTICE = (
     '[tool_tenki: the command was killed before it finished, because it produced more than {limit:,} bytes '
     'of output, the most a command may stream back. Send large output to a file instead (for example '
@@ -629,42 +636,37 @@ class IInstance(IInstanceBase):
         },
         description=lambda self: (
             'Read a text file from the remote Tenki sandbox, decoded as UTF-8. At most '
-            f'{self.IGlobal.max_output_chars} characters are returned. {_PATH_NOTE} {_SESSION_NOTE}'
+            f'{self.IGlobal.max_output_chars} characters are returned, and a file over '
+            f'{_READ_LIMIT_BYTES:,} bytes is refused. {_PATH_NOTE} {_SESSION_NOTE}'
         ),
     )
     def read_file(self, args):
         """Read a text file from the shared Tenki session."""
         args = normalize_tool_input(args, tool_name='tenki')
         path = _normalize_path(args.get('path'))
-        cap = self.IGlobal.max_output_chars
-        # UTF-8 spends at most 4 bytes on a character. Reading that many bytes per character, plus
-        # one, returns the whole file whenever it fits in `cap` characters, and more than `cap`
-        # characters whenever it does not, so truncation is still detected.
-        limit = cap * 4 + 1
 
         def read(session):
-            stream = session.fs.read_stream(path, length=limit)
-            data = bytearray()
-            try:
-                # Bounded here as well as by length: a multi-gigabyte file must never be pulled
-                # whole into the engine's memory, whatever the service does with the hint.
-                for chunk in stream:
-                    data += chunk
-                    if len(data) >= limit:
-                        break
-            finally:
-                close = getattr(stream, 'close', None)
-                if callable(close):
-                    close()
-            return bytes(data[:limit])
+            info = session.fs.stat(path)
+            if info.is_dir or info.size > _READ_LIMIT_BYTES:
+                return info, None
+            return info, session.fs.read_bytes(path)
 
         recoveries = []
         try:
-            data = self.IGlobal.call_with_session(read, replace=False, on_recovery=recoveries.append)
+            info, data = self.IGlobal.call_with_session(read, replace=False, on_recovery=recoveries.append)
         except (SandboxError, SessionEndedError) as e:
             failed = {'path': path, 'content': '', 'truncated': False, 'error': _fs_error(e, path)}
             return _with_session_event(failed, recoveries)
-        content, truncated = _truncate(data.decode('utf-8', errors='replace'), cap)
+        if data is None:
+            if info.is_dir:
+                error = f'{path} is a directory; use list_files to see what is in it'
+            else:
+                error = (
+                    f'{path} is {info.size:,} bytes, more than the {_READ_LIMIT_BYTES:,} read_file fetches; '
+                    'read the part you need with run_command (head, tail or sed -n)'
+                )
+            return _with_session_event({'path': path, 'content': '', 'truncated': False, 'error': error}, recoveries)
+        content, truncated = _truncate(data.decode('utf-8', errors='replace'), self.IGlobal.max_output_chars)
         return _with_session_event({'path': path, 'content': content, 'truncated': truncated}, recoveries)
 
     @tenki_tool(

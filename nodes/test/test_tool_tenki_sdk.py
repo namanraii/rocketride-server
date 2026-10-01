@@ -136,7 +136,9 @@ def test_the_client_refuses_a_key_without_the_tk_prefix_before_any_request():
 
 def test_the_client_deadline_covers_every_unary_call_the_node_makes():
     # The deadline IGlobal passes, and the clone limit git_clone describes, apply only to unary calls.
+    # read_file uses stat and read_file for that reason: read_file_stream gets no deadline at all.
     unary = {'create_session', 'get_session', 'resume_session', 'terminate_session', 'git_operation'}
+    unary |= {'stat', 'read_file', 'write_file', 'list', 'mkdir', 'remove'}
     assert not unary & _STREAMING_OUT
 
 
@@ -259,11 +261,42 @@ def test_records_and_results_have_the_fields_the_node_reads():
 
 def test_the_file_api_signatures():
     assert _parameters(SandboxFS.write_text) == {'path': _REQUIRED, 'text': _REQUIRED, 'encoding': 'utf-8'}
-    assert inspect.isgeneratorfunction(SandboxFS.read_stream)  # so read_file can close it
-    assert _parameters(SandboxFS.read_stream) == {'path': _REQUIRED, 'offset': 0, 'length': 0, 'chunk_bytes': 0}
+    assert _parameters(SandboxFS.stat) == {'path': _REQUIRED}
+    assert _parameters(SandboxFS.read_bytes) == {'path': _REQUIRED}
     assert _parameters(SandboxFS.list) == {'path': _REQUIRED, 'include_hidden': False}
     assert _parameters(SandboxFS.mkdir) == {'path': _REQUIRED, 'recursive': True, 'mode': 0o755}
     assert _parameters(SandboxFS.remove) == {'path': _REQUIRED, 'recursive': True}
+
+
+def test_stat_reports_size_and_kind_and_read_bytes_is_one_unary_request():
+    # read_file checks the size before fetching, because ReadFile has no length and returns it all.
+    calls = []
+
+    class _Rpc:
+        def stat(self, request):
+            calls.append(('stat', request.path))
+            return pb.StatResponse(exists=True, size=5, is_dir=False)
+
+        def read_file(self, request):
+            calls.append(('read_file', request.path))
+            return pb.ReadFileResponse(path=request.path, content=b'hello')
+
+    fs = SandboxFS(_Rpc(), 'sb-contract')
+    info = fs.stat('/home/tenki/a.txt')
+    assert (info.size, info.is_dir) == (5, False)
+    assert fs.read_bytes('/home/tenki/a.txt') == b'hello'
+    assert calls == [('stat', '/home/tenki/a.txt'), ('read_file', '/home/tenki/a.txt')]
+    assert [field.name for field in pb.ReadFileRequest.DESCRIPTOR.fields] == ['session_id', 'path']
+
+
+def test_stat_on_a_missing_path_raises_the_sdk_file_not_found_error():
+    # _fs_error turns this into "no such file or directory: <path>" for the agent.
+    class _Rpc:
+        def stat(self, request):
+            return pb.StatResponse(exists=False)
+
+    with pytest.raises(tenki.FileNotFoundError):
+        SandboxFS(_Rpc(), 'sb-contract').stat('/home/tenki/missing.txt')
 
 
 def test_the_git_api_signatures():

@@ -379,11 +379,9 @@ class _FakeFS:
     """Stand-in for tenki's SandboxFS over an in-memory tree, with the SDK's signatures.
 
     Calls are logged into the session's call log, a paused session refuses them like the fake
-    exec does, and ``fail`` maps an operation name to the error it raises. ``read_stream``
-    deliberately ignores ``length``, so a test can show that the reader bounds itself.
+    exec does, and ``fail`` maps an operation name to the error it raises. There is deliberately
+    no ``read_stream``: it has no deadline, so the node must never call it.
     """
-
-    chunk_bytes = 4096
 
     def __init__(self, session, *, files=None, dirs=None, fail=None):
         self._session = session
@@ -391,11 +389,6 @@ class _FakeFS:
         self.files = dict(files or {})
         self.dirs = {'/home/tenki', *(dirs or ())}
         self.written = {}
-        self.streamed_bytes = 0
-        self.stream_closed = None
-        # Holding the generators keeps garbage collection from closing them, so a test sees
-        # whether the reader closed its stream itself.
-        self.streams = []
 
     def _enter(self, operation):
         if self._session.state == 'PAUSED':
@@ -415,25 +408,21 @@ class _FakeFS:
         self.files[path] = text
         self.written[path] = text
 
-    def read_stream(self, path, *, offset=0, length=0, chunk_bytes=0):
-        self._session.calls.append(('read_stream', path, {'offset': offset, 'length': length}))
-        stream = self._stream(path)
-        self.streams.append(stream)
-        return stream
+    def stat(self, path):
+        self._session.calls.append(('stat', path))
+        self._enter('stat')
+        if path in self.dirs:
+            return _FileInfo(path=path, size=4096, mode=0o755, is_dir=True, modified_unix_ns=0)
+        if path not in self.files:
+            raise self._missing(path)
+        return _FileInfo(path=path, size=len(self.files[path].encode()), mode=0o644, is_dir=False, modified_unix_ns=0)
 
-    def _stream(self, path):
-        self.stream_closed = False
-        try:
-            self._enter('read_stream')
-            if path not in self.files:
-                raise self._missing(path)
-            data = self.files[path].encode()
-            for start in range(0, len(data), self.chunk_bytes):
-                chunk = data[start : start + self.chunk_bytes]
-                self.streamed_bytes += len(chunk)
-                yield chunk
-        finally:
-            self.stream_closed = True
+    def read_bytes(self, path):
+        self._session.calls.append(('read_bytes', path))
+        self._enter('read_bytes')
+        if path not in self.files:
+            raise self._missing(path)
+        return self.files[path].encode()
 
     def list(self, path, *, include_hidden=False):
         self._session.calls.append(('list', path, include_hidden))
@@ -1465,24 +1454,47 @@ def test_read_file_returns_the_file_text(monkeypatch, logs):
     }
 
 
-def test_read_file_asks_the_service_for_a_bounded_number_of_bytes(monkeypatch, logs):
-    session = _FakeSession('sb-1', files={'/home/tenki/big.log': 'x'})
-    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
-    inst.read_file({'path': 'big.log'})
-    [(_, _, kwargs)] = [call for call in session.calls if call[0] == 'read_stream']
-    assert 0 < kwargs['length'] <= 4001  # UTF-8's worst case of 4 bytes per character, plus one
+def test_read_file_checks_the_size_then_reads_through_calls_that_carry_the_client_deadline(monkeypatch, logs):
+    # The SDK's streaming read has no deadline, so a half-open connection would hang it for good.
+    # stat and read_bytes are unary calls, bounded by the deadline IGlobal gives the client.
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.md': 'x'})
+    inst, _ = _instance(monkeypatch, session)
+    inst.read_file({'path': 'notes.md'})
+    assert [call for call in session.calls if call[0] in ('stat', 'read_bytes')] == [
+        ('stat', '/home/tenki/notes.md'),
+        ('read_bytes', '/home/tenki/notes.md'),
+    ]
 
 
-def test_read_file_stops_reading_a_huge_file_even_if_the_service_sends_it_all(monkeypatch, logs):
-    # The fake ignores length, like a service that does not honour it: a multi-megabyte file
-    # must not be pulled whole into the engine's memory just to be cut down afterwards.
-    session = _FakeSession('sb-1', files={'/home/tenki/huge.log': 'x' * 1_000_000})
-    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+def test_read_file_refuses_a_file_over_the_read_limit_without_fetching_it(monkeypatch, logs):
+    # read_bytes returns the whole file, so a huge log must be refused before it is pulled into the
+    # engine's memory, not cut down afterwards.
+    monkeypatch.setattr(inst_mod, '_READ_LIMIT_BYTES', 4096)
+    session = _FakeSession('sb-1', files={'/home/tenki/huge.log': 'x' * 4097})
+    inst, _ = _instance(monkeypatch, session)
     result = inst.read_file({'path': 'huge.log'})
-    assert result['content'] == 'x' * 1000
-    assert result['truncated'] is True
-    assert session.fs.streamed_bytes <= 4001 + _FakeFS.chunk_bytes
-    assert session.fs.stream_closed is True
+    assert result['content'] == ''
+    assert result['truncated'] is False
+    assert '4,097 bytes' in result['error']
+    assert 'run_command' in result['error']
+    assert not any(call[0] == 'read_bytes' for call in session.calls)
+
+
+def test_read_file_reads_a_file_exactly_at_the_read_limit(monkeypatch, logs):
+    monkeypatch.setattr(inst_mod, '_READ_LIMIT_BYTES', 4096)
+    session = _FakeSession('sb-1', files={'/home/tenki/edge.txt': 'x' * 4096})
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.read_file({'path': 'edge.txt'})['content'] == 'x' * 4096
+
+
+def test_read_file_on_a_directory_says_to_list_it(monkeypatch, logs):
+    session = _FakeSession('sb-1', dirs={'/home/tenki/src'})
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.read_file({'path': 'src'})
+    assert result['content'] == ''
+    assert 'is a directory' in result['error']
+    assert 'list_files' in result['error']
+    assert not any(call[0] == 'read_bytes' for call in session.calls)
 
 
 @pytest.mark.parametrize(
@@ -1620,7 +1632,7 @@ def test_delete_path_reports_a_missing_path(monkeypatch, logs):
 def test_looking_at_an_ended_session_does_not_start_a_new_one(monkeypatch, logs, tool, args):
     # A fresh, empty session cannot contain what these look for, so creating one only adds cost.
     ended = mod.SessionTerminatedError('session_terminated')
-    dead = _FakeSession('sb-dead', state='TERMINATED', fail={'read_stream': ended, 'list': ended, 'remove': ended})
+    dead = _FakeSession('sb-dead', state='TERMINATED', fail={'stat': ended, 'list': ended, 'remove': ended})
     inst, client = _instance(monkeypatch, dead, _FakeSession('sb-fresh'))
     result = getattr(inst, tool)(args)
     assert result['error']
