@@ -68,6 +68,7 @@ from tenki import (
     Client,
     InvalidStateError,
     Sandbox,
+    SandboxError,
     SessionNotFoundError,
     SessionTerminatedError,
     TemplateRuntimeFailedError,
@@ -108,6 +109,15 @@ class SessionEndedError(Exception):
             'the sandbox session has ended, so its files are gone; the next command or file write '
             'starts a fresh, empty sandbox'
         )
+
+
+class SessionUnavailableError(SandboxError):
+    """No usable session could be had: it could not be created or resumed, or could not be reached.
+
+    The SDK reports some of these as a plain RuntimeError or TimeoutError rather than as one of its
+    own errors. This is a SandboxError, so each tool's error handling returns it to the agent as an
+    error result, as it does every other sandbox failure, instead of letting it out of the tool.
+    """
 
 
 def _int_or(value, default: int, *, lo: int, hi: int) -> int:
@@ -210,7 +220,7 @@ class IGlobal(IGlobalBase):
         if session is None:
             with self._session_lock:
                 if self._ending:
-                    raise RuntimeError(
+                    raise SessionUnavailableError(
                         'tool_tenki: the pipeline is shutting down, so no new sandbox session is created'
                     )
                 if self.session is None:
@@ -246,6 +256,10 @@ class IGlobal(IGlobalBase):
         except (WaitReadyFailedError, TemplateRuntimeFailedError) as e:
             self._close_left_running(e)
             raise
+        except (RuntimeError, TimeoutError) as e:
+            # The SDK re-raises its readiness wait's own plain RuntimeError when the new sandbox went
+            # straight to a terminal state. There is nothing left running to close.
+            raise SessionUnavailableError(f'the new sandbox session did not start: {e}') from e
 
     def _close_left_running(self, error: Exception) -> None:
         """Close the sandbox a failed create left running, so it stops billing.
@@ -284,16 +298,23 @@ class IGlobal(IGlobalBase):
         can tell the agent that its call ran on a resumed session, or on a fresh and empty one.
         """
         epoch = self.session_epoch
-        session = self.get_session()
         try:
-            return call(session)
-        except _LIFECYCLE_ERRORS:
-            recovery = self.recover_session(session, epoch, replace=replace)
-            if not recovery:
-                raise
-        if on_recovery is not None:
-            on_recovery(recovery)
-        return call(self.get_session())
+            session = self.get_session()
+            try:
+                return call(session)
+            except _LIFECYCLE_ERRORS:
+                recovery = self.recover_session(session, epoch, replace=replace)
+                if not recovery:
+                    raise
+            if on_recovery is not None:
+                on_recovery(recovery)
+            return call(self.get_session())
+        except (RuntimeError, TimeoutError) as e:
+            # The SDK raises a few failures as plain exceptions rather than its own errors (Sandbox.start
+            # does when the data plane cannot be reached), which a tool's SandboxError handling would let
+            # out of the tool. Logged as well: these are rare, and worth an operator's attention.
+            warning(f'tool_tenki: sandbox call failed with {type(e).__name__}: {e}')
+            raise SessionUnavailableError(str(e)) from e
 
     def recover_session(self, session: Sandbox, epoch: int, *, replace: bool = True) -> str | None:
         """Bring a session that failed a call back to a usable state.
@@ -328,32 +349,46 @@ class IGlobal(IGlobalBase):
             except SessionNotFoundError:
                 state = None
             if state is None or state in _GONE_STATES:
-                # Close it even when the service reported it not-found (state None): that report can
-                # be wrong, and a still-running VM would otherwise bill until max_duration. A close
-                # that fails here is expected when the session really is gone, so it is only logged.
-                try:
-                    session.close_if_open()
-                except Exception as e:
-                    debug(f'tool_tenki: could not close dropped session {session.id}: {e}')
-                self.session = None
-                self.session_epoch += 1
-                self.last_replacement_epoch = self.session_epoch
-                self.last_recovery = 'replaced'
-                # A warning rather than debug output: the next call pays for a new VM and starts empty.
-                warning(
-                    f'tool_tenki: session {session.id} is {state or "gone"}; the next call starts a new, empty session'
-                )
-                if not replace:
-                    raise SessionEndedError()
-                return 'replaced'
+                return self._drop_session(session, state, replace=replace)
             if state == 'PAUSED':
                 session.resume()
-                session.wait_ready(timeout=_READY_WAIT_SECS)
+                try:
+                    session.wait_ready(timeout=_READY_WAIT_SECS)
+                except (RuntimeError, TimeoutError) as e:
+                    # The SDK's plain errors for "went terminal while waiting" and "never got to
+                    # RUNNING". Its max_duration can run out mid-resume, and that session is as gone
+                    # as any other. One merely slow to come up keeps its files, so it is not dropped.
+                    if session.state in _GONE_STATES:
+                        return self._drop_session(session, session.state, replace=replace)
+                    raise SessionUnavailableError(f'session {session.id} did not finish resuming: {e}') from e
                 self.session_epoch += 1
                 self.last_recovery = 'resumed'
                 debug(f'tool_tenki: resumed paused session {session.id}')
                 return 'resumed'
             return None
+
+    def _drop_session(self, session: Sandbox, state: str | None, *, replace: bool) -> str:
+        """Forget a session that has ended, so the next ``get_session`` creates a fresh one.
+
+        Called with the session lock held. Returns 'replaced', or raises ``SessionEndedError`` for a
+        caller passing ``replace=False``, whom a fresh, empty session could not serve.
+        """
+        # Close it even when the service reported it not-found (state None): that report can be
+        # wrong, and a still-running VM would otherwise bill until max_duration. A close that fails
+        # here is expected when the session really is gone, so it is only logged.
+        try:
+            session.close_if_open()
+        except Exception as e:
+            debug(f'tool_tenki: could not close dropped session {session.id}: {e}')
+        self.session = None
+        self.session_epoch += 1
+        self.last_replacement_epoch = self.session_epoch
+        self.last_recovery = 'replaced'
+        # A warning rather than debug output: the next call pays for a new VM and starts empty.
+        warning(f'tool_tenki: session {session.id} is {state or "gone"}; the next call starts a new, empty session')
+        if not replace:
+            raise SessionEndedError()
+        return 'replaced'
 
     def validateConfig(self) -> None:
         try:

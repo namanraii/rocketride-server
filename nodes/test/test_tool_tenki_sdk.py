@@ -40,6 +40,7 @@ import pytest
 
 tenki = pytest.importorskip('tenki')
 
+from tenki_sandbox import errors as sdk_errors
 from tenki_sandbox._pb import pb
 from tenki_sandbox._transport import _STREAMING_OUT
 from tenki_sandbox.client import build_create_session_request
@@ -79,6 +80,19 @@ def _parameters(function):
 def test_the_errors_the_node_handles_are_sandbox_errors(name):
     # The tools catch SandboxError; an error that stopped subclassing it would escape as a crash.
     assert issubclass(getattr(tenki, name), tenki.SandboxError)
+
+
+def test_no_sdk_error_is_also_a_plain_runtime_or_timeout_error():
+    # call_with_session turns a plain RuntimeError or TimeoutError into SessionUnavailableError. An SDK
+    # error that also subclassed either would be swallowed into it and lose its type: a
+    # CommandTimeoutError would stop coming back to the agent as timed_out.
+    errors = [
+        value
+        for value in vars(sdk_errors).values()
+        if isinstance(value, type) and issubclass(value, Exception) and value.__module__ == sdk_errors.__name__
+    ]
+    assert len(errors) > 10
+    assert [error.__name__ for error in errors if issubclass(error, (RuntimeError, TimeoutError))] == []
 
 
 def test_the_sdk_file_not_found_error_still_subclasses_the_builtin():

@@ -217,6 +217,8 @@ class _FakeSession:
         stalls=None,
         flood=None,
         run_error=None,
+        ready_state=None,
+        ready_error=None,
     ):
         self.id = session_id
         self.state = state
@@ -228,6 +230,8 @@ class _FakeSession:
         self._stalls = stalls
         self._flood = flood
         self._run_error = run_error
+        self._ready_state = ready_state
+        self._ready_error = ready_error
         self.processes = []
         self.calls = []
         self.ready_timeouts = []
@@ -260,6 +264,12 @@ class _FakeSession:
     def wait_ready(self, timeout=180):
         self.calls.append('wait_ready')
         self.ready_timeouts.append(timeout)
+        # The SDK raises a plain RuntimeError when the session went terminal while it waited, and a
+        # plain TimeoutError when it never got to RUNNING; it updates the session's state first.
+        if self._ready_state is not None:
+            self.state = self._ready_state
+        if self._ready_error is not None:
+            raise self._ready_error
 
     def close(self):
         self.calls.append('close')
@@ -609,9 +619,9 @@ def _started(monkeypatch, *sessions, cfg=None, **client_kwargs):
     return glb, client
 
 
-def _instance(monkeypatch, *sessions, cfg=None):
+def _instance(monkeypatch, *sessions, cfg=None, **client_kwargs):
     """Return an IInstance on a real, started IGlobal whose client hands out ``sessions``."""
-    glb, client = _started(monkeypatch, *sessions, cfg=cfg)
+    glb, client = _started(monkeypatch, *sessions, cfg=cfg, **client_kwargs)
     inst = inst_mod.IInstance()
     inst.IGlobal = glb
     return inst, client
@@ -2087,6 +2097,85 @@ def test_recovery_waits_a_bounded_time_for_a_resumed_session(monkeypatch, logs):
     assert all(timeout is not None and 0 < timeout <= 600 for timeout in paused.ready_timeouts)
 
 
+# ---------------------------------------------------------------------------
+# Failures the SDK raises as plain RuntimeError or TimeoutError, which a tool's
+# `except SandboxError` would otherwise let out of the tool
+# ---------------------------------------------------------------------------
+
+_ENDED_WHILE_WAITING = RuntimeError('sandbox entered terminal state: TERMINATED')
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args'), [('run_command', {'command': 'ls'}), ('write_file', {'path': 'a.txt', 'content': 'x'})]
+)
+def test_a_session_that_ends_while_it_resumes_is_replaced_and_the_call_retried(monkeypatch, logs, tool, args):
+    # Its max_duration can run out mid-resume: the dead session must not stay in place, and the
+    # call can still be served by a fresh one.
+    paused = _FakeSession('sb-1', state='PAUSED', ready_state='TERMINATED', ready_error=_ENDED_WHILE_WAITING)
+    inst, client = _instance(monkeypatch, paused, _FakeSession('sb-fresh'))
+    result = getattr(inst, tool)(args)
+    assert result['session'] == 'replaced'
+    assert 'error' not in result
+    assert len(client.create_calls) == 2
+
+
+def test_a_read_from_a_session_that_ends_while_it_resumes_says_the_session_ended(monkeypatch, logs):
+    # A fresh, empty session could not contain the file, so none is created for the read.
+    paused = _FakeSession('sb-1', state='PAUSED', ready_state='TERMINATED', ready_error=_ENDED_WHILE_WAITING)
+    inst, client = _instance(monkeypatch, paused, _FakeSession('sb-fresh'))
+    result = inst.read_file({'path': 'notes.md'})
+    assert result['content'] == ''
+    assert 'session has ended' in result['error']
+    assert len(client.create_calls) == 1
+
+
+def test_a_resume_that_runs_out_of_time_comes_back_to_the_agent_as_an_error(monkeypatch, logs):
+    # Not replaced: the session may still come up, and with it every file the agent wrote.
+    stuck = TimeoutError('timeout waiting for sandbox sb-1')
+    paused = _FakeSession('sb-1', state='PAUSED', ready_state='RESUMING', ready_error=stuck)
+    inst, client = _instance(monkeypatch, paused)
+    result = inst.run_command({'command': 'ls'})
+    assert result['exit_code'] == -1
+    assert 'did not finish resuming' in result['error']
+    assert len(client.create_calls) == 1
+    assert inst.IGlobal.session is paused
+
+
+def test_a_session_that_ends_as_it_is_created_comes_back_to_the_agent_as_an_error(monkeypatch, logs):
+    # Client.create re-raises its readiness wait's plain RuntimeError when the new sandbox went
+    # straight to a terminal state.
+    inst, client = _instance(monkeypatch, create_error=_ENDED_WHILE_WAITING)
+    result = inst.run_command({'command': 'ls'})
+    assert result['exit_code'] == -1
+    assert 'did not start' in result['error']
+    assert 'terminal state' in result['error']
+
+
+def test_a_tool_called_after_shutdown_comes_back_to_the_agent_as_an_error(monkeypatch, logs):
+    inst, client = _instance(monkeypatch, _FakeSession('sb-1'))
+    inst.IGlobal.endGlobal()
+    result = inst.run_command({'command': 'ls'})
+    assert result['exit_code'] == -1
+    assert 'shutting down' in result['error']
+    assert client.create_calls == []
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args'),
+    [('run_command', {'command': 'ls'}), ('run_code', {'code': 'print(1)'}), ('list_files', {})],
+)
+def test_a_plain_runtime_error_from_the_sdk_comes_back_to_the_agent_as_an_error(monkeypatch, logs, tool, args):
+    # Sandbox.start raises one when the session's data plane cannot be reached, and nothing in the
+    # SDK promises it is the only one, so no tool may let one out.
+    unreachable = RuntimeError('sandbox data-plane endpoint unavailable')
+    session = _FakeSession('sb-1', exec_error=unreachable, fail={'list': unreachable})
+    inst, _ = _instance(monkeypatch, session)
+    result = getattr(inst, tool)(args)
+    assert 'data-plane endpoint unavailable' in result['error']
+    # Unexpected enough to be worth an operator's attention, not only the agent's.
+    assert any('data-plane endpoint unavailable' in message for message in logs)
+
+
 def test_a_tool_call_racing_shutdown_cannot_create_a_session(monkeypatch, logs):
     # endGlobal closes the session and then the client. A call arriving in between must not create
     # a session that nothing would ever close.
@@ -2097,7 +2186,7 @@ def test_a_tool_call_racing_shutdown_cannot_create_a_session(monkeypatch, logs):
     ender.start()
     try:
         assert client.closing.wait(timeout=5)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(mod.SessionUnavailableError):
             glb.get_session()
     finally:
         client.close_gate.set()
