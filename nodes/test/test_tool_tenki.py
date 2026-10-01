@@ -31,6 +31,7 @@ import importlib
 import importlib.util
 import json
 import posixpath
+import queue
 import sys
 import threading
 import time
@@ -214,6 +215,8 @@ class _FakeSession:
         git_outputs=None,
         fail=None,
         stalls=None,
+        flood=None,
+        run_error=None,
     ):
         self.id = session_id
         self.state = state
@@ -223,6 +226,9 @@ class _FakeSession:
         self._exec_result = exec_result
         self._exec_error = exec_error
         self._stalls = stalls
+        self._flood = flood
+        self._run_error = run_error
+        self.processes = []
         self.calls = []
         self.ready_timeouts = []
         self.fs = _FakeFS(self, files=files, dirs=dirs, fail=fail)
@@ -236,7 +242,9 @@ class _FakeSession:
         if self._exec_error is not None:
             raise self._exec_error
         result = self._exec_result if self._exec_result is not None else _CommandResult(argv=list(argv), exit_code=0)
-        return _FakeProcess(self, result, stalls=self._stalls)
+        process = _FakeProcess(self, result, stalls=self._stalls, flood=self._flood, run_error=self._run_error)
+        self.processes.append(process)
+        return process
 
     def refresh(self):
         self.calls.append('refresh')
@@ -264,17 +272,89 @@ class _FakeSession:
             self.close()
 
 
+class _FakeStream:
+    """Stand-in for tenki's ProcessStream: a queue the run pushes chunks into, read by iterating.
+
+    Iteration blocks until the next chunk or the end, as the SDK's does. ``taken`` is set each time
+    a reader takes something from it, which is how a flooding command is paced by its reader, as a
+    real one is paced by the network.
+    """
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self.taken = threading.Event()
+
+    def push(self, data):
+        if data:
+            self._queue.put(data)
+
+    def close(self):
+        self._queue.put(None)
+
+    def fail(self, error):
+        self._queue.put(error)
+
+    def __iter__(self):
+        while True:
+            item = self._queue.get()
+            self.taken.set()
+            if item is None:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+
 class _FakeProcess:
     """Stand-in for tenki's Process, whose stream can stall before the command starts or before it ends.
 
     As in the SDK, close_stdin waits for the start and raises TimeoutError when it never comes,
     without cancelling anything, while a wait that runs out kills the process before it raises.
+    Output streams in while the command runs and the result arrives once it exits. ``flood``, a
+    ``(chunk, budget)`` pair, makes the command print ``chunk`` until it is killed, or until it has
+    printed ``budget`` bytes or nothing reads it, either of which ends it on its own.
     """
 
-    def __init__(self, session, result, *, stalls=None):
+    def __init__(self, session, result, *, stalls=None, flood=None, run_error=None):
         self._session = session
         self._result = result
         self._stalls = stalls
+        self._error = run_error
+        self.stdout = _FakeStream()
+        self.stderr = _FakeStream()
+        self.printed = 0
+        self._killed = threading.Event()
+        self._exited = threading.Event()
+        if stalls is None:
+            threading.Thread(target=self._run, args=(flood,), daemon=True).start()
+
+    def _run(self, flood):
+        if self._error is not None:
+            # As in the SDK: a run that fails ends both streams with its error.
+            self.stdout.fail(self._error)
+            self.stderr.fail(self._error)
+        elif flood is None:
+            self.stdout.push(self._result.stdout)
+            self.stderr.push(self._result.stderr)
+        else:
+            chunk, budget = flood
+            while self.printed < budget and not self._killed.is_set():
+                self.stdout.taken.clear()
+                self.stdout.push(chunk)
+                self.printed += len(chunk)
+                if not self.stdout.taken.wait(timeout=1):
+                    break
+            killed = self._killed.is_set()
+            self._result = _CommandResult(
+                argv=self._result.argv,
+                exit_code=-1 if killed else 0,
+                stdout=chunk * (self.printed // len(chunk)),
+                signal='SIGKILL' if killed else None,
+            )
+        # As in the SDK: the result is ready before the streams are ended.
+        self._exited.set()
+        self.stdout.close()
+        self.stderr.close()
 
     def close_stdin(self):
         self._session.calls.append(('close_stdin',))
@@ -283,13 +363,16 @@ class _FakeProcess:
 
     def wait(self, timeout=None):
         self._session.calls.append(('wait', timeout))
-        if self._stalls == 'result':
+        if self._stalls == 'result' or not self._exited.wait(timeout):
             self.kill()
             raise TimeoutError('timed out waiting for command')
+        if self._error is not None:
+            raise self._error
         return self._result
 
     def kill(self):
         self._session.calls.append(('kill',))
+        self._killed.set()
 
 
 class _FakeFS:
@@ -1919,6 +2002,67 @@ def test_a_command_that_never_starts_is_cancelled_and_reported_as_a_timeout(monk
     assert result['exit_code'] == -1
     assert 'did not start' in result['error']
     assert ('kill',) in session.calls
+
+
+# The SDK keeps everything a command prints in memory until it exits, with no limit of its own.
+_FLOOD = b'y\n' * 4096  # what `yes` prints, 8 KiB at a time
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args'), [('run_command', {'command': 'yes'}), ('run_code', {'code': 'while True: print("y")'})]
+)
+def test_a_command_that_floods_its_output_is_killed_and_the_agent_told_why(monkeypatch, logs, tool, args):
+    # Left alone, `yes` would grow the engine's memory for the whole execution timeout.
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit))
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = getattr(inst, tool)(args)
+    assert ('kill',) in session.calls
+    [process] = session.processes
+    # Killed on the chunk that crossed the limit, not left to print until it stopped on its own.
+    assert process.printed <= limit + 2 * len(_FLOOD)
+    assert result['truncated'] is True
+    assert 'killed' in result['stderr']
+    assert f'{limit:,} bytes' in result['stderr']
+    assert 'to a file' in result['stderr']
+
+
+def test_a_chatty_command_that_finishes_is_truncated_but_not_killed(monkeypatch, logs):
+    # max_output_chars caps what the agent sees, not how long a command may run: a large apt-get
+    # install prints far more than that, and killing it mid-dpkg would break the VM's packages.
+    output = b'Setting up libfoo (1.2.3) ...\n' * 5000
+    session = _FakeSession('sb-1', exec_result=_CommandResult(argv=['bash'], exit_code=0, stdout=output))
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = inst.run_command({'command': 'sudo apt-get install -y build-essential'})
+    assert ('kill',) not in session.calls
+    assert result['exit_code'] == 0
+    assert result['truncated'] is True
+    assert 'killed' not in result['stderr']
+
+
+def test_a_stalled_command_leaves_no_output_reader_running(monkeypatch, logs):
+    # The readers block until their stream ends, and a stalled stream never does on its own.
+    session = _FakeSession('sb-1', stalls='result')
+    inst, _ = _instance(monkeypatch, session, cfg={'exec_timeout_secs': 45})
+    before = set(threading.enumerate())
+    returned = threading.Event()
+    worker = threading.Thread(target=lambda: (inst.run_command({'command': 'sleep 999'}), returned.set()), daemon=True)
+    worker.start()
+    assert returned.wait(timeout=5), 'the call hung waiting for its output readers'
+    worker.join(timeout=5)
+    assert [thread for thread in threading.enumerate() if thread not in before] == []
+
+
+def test_a_run_that_fails_partway_is_reported_once_and_not_from_a_reader_thread(monkeypatch, logs):
+    # The SDK ends both output streams with the run's error, so the readers see it as well as wait().
+    escaped = []
+    monkeypatch.setattr(threading, 'excepthook', escaped.append)
+    session = _FakeSession('sb-1', run_error=inst_mod.SandboxError('run stream reset'))
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.run_command({'command': 'make'})
+    assert result['error'] == 'run stream reset'
+    assert escaped == []
 
 
 def test_recovery_waits_a_bounded_time_for_a_resumed_session(monkeypatch, logs):

@@ -46,7 +46,7 @@ from tenki_sandbox.client import build_create_session_request
 from tenki_sandbox.errors import map_rpc_error
 from tenki_sandbox.fs import SandboxFS
 from tenki_sandbox.git import SandboxGit
-from tenki_sandbox.process import Process
+from tenki_sandbox.process import Process, ProcessStream
 
 _REQUIRED = inspect.Parameter.empty
 
@@ -190,6 +190,32 @@ def test_a_process_can_be_waited_on_with_a_limit_and_cancelled():
     assert _parameters(Process.close_stdin) == {}
     assert 'timeout' in _parameters(Process.wait)
     assert _parameters(Process.kill) == {}
+
+
+def test_a_process_stream_yields_as_it_arrives_and_ends_when_closed():
+    # _OutputGuard reads stdout and stderr while the command runs, and ends them itself after a stall.
+    stream = ProcessStream()
+    stream.push(b'a')
+    stream.push(b'b')
+    stream.close()
+    assert list(stream) == [b'a', b'b']
+    # The SDK keeps its own copy of everything read, which is why the guard kills instead of only reading.
+    assert stream.read() == b'ab'
+
+
+def test_a_failed_run_ends_both_output_streams_with_its_error():
+    # Otherwise a reader would block for good on a run that had already failed.
+    class _NoNetwork:
+        def run(self, requests):
+            raise ConnectionError('no network in contract tests')
+
+    process = Process(_NoNetwork(), 'sb-contract', ['true'])
+    for stream in (process.stdout, process.stderr):
+        assert isinstance(stream, ProcessStream)
+        with pytest.raises(tenki.SandboxError):
+            list(stream)
+    with pytest.raises(tenki.SandboxError):
+        process.wait(timeout=5)
 
 
 def test_the_session_states_the_node_compares_against_still_exist():

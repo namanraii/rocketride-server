@@ -66,6 +66,12 @@ read or write elsewhere in the VM. Execution functions return `exit_code`, `stdo
 `timed_out` set, not as an error. Output longer than the configured cap is truncated before it
 reaches the agent, with `truncated` set so the agent knows it did not see everything.
 
+A command that streams back more than 8 MiB of output is killed before it finishes. The engine
+holds a command's whole output in memory until it exits, so a runaway one (`yes`, say) would
+otherwise grow it for as long as the execution timeout allows. The cap and this limit are separate:
+a chatty command that finishes, such as a large `apt-get install`, is only truncated. A killed one
+comes back with `truncated` set and a note on `stderr` saying why.
+
 A call that had to recover the session first also carries a `session` field: `"resumed"` when the VM
 had been paused and its files survived, or `"replaced"` when the old session had ended and this call
 ran on a fresh, empty one. An agent that ignores that field can wrongly assume its earlier files are

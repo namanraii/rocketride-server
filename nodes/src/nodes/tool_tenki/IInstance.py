@@ -39,6 +39,7 @@ import json
 import posixpath
 import re
 import shlex
+import threading
 import urllib.parse
 import uuid
 from typing import Callable
@@ -80,6 +81,19 @@ _MAX_LOG_COUNT = 1000
 #: How long past the execution timeout a command's result may take to arrive. Tenki stops the command
 #: at the timeout and reports it on the result; only a stalled stream ever reaches this limit.
 _RESULT_GRACE_SECS = 30
+# The most output one command may stream back before it is treated as runaway and killed. The SDK
+# keeps everything a command prints in memory until the command exits, with no limit of its own, so
+# a command that floods its output (`yes`, `cat /dev/urandom | base64`) would grow the engine for as
+# long as the execution timeout allows. This is a memory ceiling, not the output cap:
+# max_output_chars still decides what the agent is shown, and a chatty but finite command (a large
+# apt-get install, pytest -v, a build) runs to completion and is merely truncated. It sits above the
+# most the agent can ever be shown (1M characters, at most 4 MB of UTF-8), so it never cuts into that.
+_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024
+_KILLED_NOTICE = (
+    '[tool_tenki: the command was killed before it finished, because it produced more than {limit:,} bytes '
+    'of output, the most a command may stream back. Send large output to a file instead (for example '
+    '`> out.log 2>&1`) and read back the part you need.]'
+)
 
 _SESSION_EVENT = {
     'type': 'string',
@@ -113,7 +127,11 @@ _EXEC_OUTPUT_SCHEMA = {
             'type': 'boolean',
             'description': 'True if the command was stopped at the execution timeout; the exit code can still be 0.',
         },
-        'truncated': {'type': 'boolean', 'description': 'True if stdout or stderr was cut to fit the output cap.'},
+        'truncated': {
+            'type': 'boolean',
+            'description': 'True if stdout or stderr was cut to fit the output cap, or the command was killed for '
+            'producing too much output (stderr then says so).',
+        },
         'error': {'type': 'string', 'description': 'Error message if the sandbox call failed.'},
         'session': _SESSION_EVENT,
     },
@@ -280,26 +298,81 @@ def _truncate(text: str, cap: int) -> tuple[str, bool]:
     return text[:cap], True
 
 
-def _exec_result(result, cap: int) -> dict:
+def _exec_result(result, cap: int, *, killed: bool = False) -> dict:
     """Shape a Tenki CommandResult into the tool output, with ``cap`` shared by both streams.
 
     Errors usually land on stderr, so a flood on stdout must not push them out: stderr may
     always keep up to half of the cap, and either stream may use whatever the other leaves.
+    ``killed`` means the command was stopped for producing too much output; the agent is told
+    so on stderr, where a shell would report the kill, after the cap so it is never cut off.
     """
     stdout_text, stderr_text = result.stdout_text, result.stderr_text
     stderr, stderr_cut = _truncate(stderr_text, max(cap // 2, cap - len(stdout_text)))
     stdout, stdout_cut = _truncate(stdout_text, cap - len(stderr))
+    if killed:
+        notice = _KILLED_NOTICE.format(limit=_OUTPUT_LIMIT_BYTES)
+        stderr = f'{stderr}\n{notice}' if stderr else notice
     return {
         'exit_code': result.exit_code,
         'stdout': stdout,
         'stderr': stderr,
         'timed_out': bool(result.timed_out),
-        'truncated': stdout_cut or stderr_cut,
+        'truncated': killed or stdout_cut or stderr_cut,
     }
 
 
+class _OutputGuard:
+    """Reads a running command's output as it arrives, and kills the command once there is too much.
+
+    Reading as it arrives is what lets the limit be noticed while the command runs rather than after
+    it exits. It does not shrink what the SDK holds, which keeps its own copy of every chunk until
+    the command exits; that is why the command is killed rather than merely no longer read.
+    """
+
+    def __init__(self, process, limit: int):
+        self._process = process
+        self._limit = limit
+        self._lock = threading.Lock()
+        self._received = 0
+        self.killed = False
+        self._readers = [
+            threading.Thread(target=self._read, args=(stream,), name='tool_tenki-output', daemon=True)
+            for stream in (process.stdout, process.stderr)
+        ]
+        for reader in self._readers:
+            reader.start()
+
+    def _read(self, stream) -> None:
+        try:
+            for chunk in stream:
+                with self._lock:
+                    self._received += len(chunk)
+                    kill = self._received > self._limit and not self.killed
+                    self.killed = self.killed or kill
+                if kill:
+                    self._process.kill()
+        except Exception:
+            # A stream fails when its run does, and wait() raises that same error, so it is reported there.
+            pass
+
+    def stop(self) -> None:
+        """End both streams and wait for the readers.
+
+        Once a command exits the SDK has ended its streams already, and this only adds an end marker
+        nobody reads. After a stalled run it never will, and without this the readers would block for
+        good: the one thing that releases them is ending the streams they are reading.
+        """
+        for stream in (self._process.stdout, self._process.stderr):
+            stream.close()
+        for reader in self._readers:
+            reader.join()
+
+
 def _run_process(session, argv, timeout: int):
-    """Run ``argv`` in ``session`` and return its CommandResult, without ever waiting unboundedly.
+    """Run ``argv`` in ``session``, without ever waiting unboundedly or holding unbounded output.
+
+    Returns the CommandResult, and whether the command was killed for producing more than
+    _OUTPUT_LIMIT_BYTES of output (see _OutputGuard).
 
     Sandbox.exec waits on the output stream with no local limit, so a stream that stalls (on a
     half-open connection, say) would hang the tool call for good. Tenki stops the command at
@@ -316,10 +389,14 @@ def _run_process(session, argv, timeout: int):
     except TimeoutError as e:
         process.kill()
         raise CommandTimeoutError('the sandbox did not start the command in time, so it was cancelled') from e
+    guard = _OutputGuard(process, _OUTPUT_LIMIT_BYTES)
     try:
-        return process.wait(timeout=limit)
+        result = process.wait(timeout=limit)
     except TimeoutError as e:
         raise CommandTimeoutError(f'the sandbox reported no result within {limit}s, so the command was stopped') from e
+    finally:
+        guard.stop()
+    return result, guard.killed
 
 
 def _with_session_event(output: dict, recoveries: list) -> dict:
@@ -413,13 +490,13 @@ class IInstance(IInstanceBase):
 
         recoveries = []
         try:
-            result = self.IGlobal.call_with_session(
+            result, killed = self.IGlobal.call_with_session(
                 lambda session: _run_process(session, ('bash', '-lc', command), self.IGlobal.exec_timeout_secs),
                 on_recovery=recoveries.append,
             )
         except SandboxError as e:
             return _with_session_event(_exec_error(e), recoveries)
-        return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars), recoveries)
+        return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars, killed=killed), recoveries)
 
     @tenki_tool(
         group='execution',
@@ -479,10 +556,10 @@ class IInstance(IInstanceBase):
 
         recoveries = []
         try:
-            result = self.IGlobal.call_with_session(run, on_recovery=recoveries.append)
+            result, killed = self.IGlobal.call_with_session(run, on_recovery=recoveries.append)
         except SandboxError as e:
             return _with_session_event(_exec_error(e), recoveries)
-        return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars), recoveries)
+        return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars, killed=killed), recoveries)
 
     # -----------------------------------------------------------------------
     # Group: filesystem
