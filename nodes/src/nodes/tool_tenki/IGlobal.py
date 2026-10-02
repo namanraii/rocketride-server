@@ -36,12 +36,14 @@ through ``call_with_session``, which owns recovery.
 
 Three things differ from tool_daytona and shape this file:
 
-* An idle Tenki session is paused, not deleted, and there is no ephemeral
-  flag. ``endGlobal`` closes a session promptly, but the engine force-kills a
-  chat- or webhook-sourced task on terminate and on idle-TTL expiry without
-  running node teardown (measured on engine 3.3.0), so ``max_duration`` is the
-  only guaranteed end for a session and ``idle_timeout_minutes`` the only
-  guaranteed stop to compute billing.
+* Tenki has no ephemeral flag and no idle timeout: the SDK's idle-timeout
+  option never paused anything (Tenki's changelog of 2026-09-18 removed it as
+  having "never had any effect"), so an unused session bills until it is
+  closed or ``max_duration`` ends it. ``endGlobal`` closes a session
+  promptly, but teardown is not reached after an engine crash, and engines
+  before the fix in #2396 skipped it for chat- and webhook-sourced tasks
+  (measured on engine 3.3.0, #2300). ``max_duration`` is the backstop for
+  both, which is why its default is short.
 * A create whose readiness wait fails can leave a live, billing sandbox that
   nothing references, so the create path closes it explicitly.
 * Recovery follows the session's actual state, not the exception alone: a
@@ -160,8 +162,7 @@ class IGlobal(IGlobalBase):
     cpu_cores: int = 2
     memory_mb: int = 4096
     disk_size_gb: int = 5
-    idle_timeout_minutes: int = 5
-    max_duration_minutes: int = 60
+    max_duration_minutes: int = 15
     exec_timeout_secs: int = 120
     max_output_chars: int = 50000
     tool_groups: frozenset = DEFAULT_GROUPS
@@ -204,8 +205,9 @@ class IGlobal(IGlobalBase):
         self.memory_mb = memory_mb - memory_mb % 2
         # The SDK refuses a disk under 5 GB before sending the request.
         self.disk_size_gb = _int_or(cfg.get('disk_size_gb'), 5, lo=5, hi=100)
-        self.idle_timeout_minutes = _int_or(cfg.get('idle_timeout_minutes'), 5, lo=1, hi=120)
-        self.max_duration_minutes = _int_or(cfg.get('max_duration_minutes'), 60, lo=1, hi=1440)
+        # Pipelines saved before the idle-timeout field was retired may still carry it; it is not
+        # read, so it never reaches Tenki, which ignored it anyway.
+        self.max_duration_minutes = _int_or(cfg.get('max_duration_minutes'), 15, lo=1, hi=1440)
         self.exec_timeout_secs = _int_or(cfg.get('exec_timeout_secs'), 120, lo=1, hi=1200)
         self.max_output_chars = _int_or(cfg.get('max_output_chars'), 50000, lo=1000, hi=1000000)
 
@@ -234,11 +236,10 @@ class IGlobal(IGlobalBase):
             'cpu_cores': self.cpu_cores,
             'memory_mb': self.memory_mb,
             'disk_size_gb': self.disk_size_gb,
-            'idle_timeout_minutes': self.idle_timeout_minutes,
-            # Tenki has no ephemeral flag and its idle timeout only pauses, so this is what
-            # ends a session whose pipeline never reached endGlobal (a crashed engine). The
-            # SDK takes seconds. sticky stays at its default of False: a sticky session
-            # discards max_duration and is never paused for idling.
+            # Tenki has no ephemeral flag and no idle timeout, so this is the one thing that
+            # ends a session whose pipeline never reached endGlobal (a crashed engine, or one
+            # that skips teardown). The SDK takes seconds. sticky stays at its default of
+            # False: a sticky session discards max_duration.
             'max_duration': self.max_duration_minutes * 60,
             # Inbound exposure can only be set at create time, and no tool this node
             # publishes uses it, so sessions are created closed to inbound traffic.
@@ -328,8 +329,9 @@ class IGlobal(IGlobalBase):
           service already did), so the next ``get_session`` creates a fresh one. Its files
           are lost either way. With ``replace=False`` the caller is not retried on that fresh
           session: ``SessionEndedError`` is raised instead.
-        * Paused by Tenki's idle timeout: resume it and wait until it runs. Never replace
-          it, since a pause preserves the agent's memory and files.
+        * Paused (by hand in Tenki's console or CLI, or by Tenki when the workspace runs out
+          of credit): resume it and wait until it runs. Never replace it, since a pause
+          preserves the agent's memory and files.
         * Any other state (running, starting, pausing): the failure had another cause, so
           it is surfaced.
         """
@@ -440,8 +442,8 @@ class IGlobal(IGlobalBase):
     def endGlobal(self) -> None:
         # First, so that no tool call can create a session after the close below.
         self._ending = True
-        # Load-bearing for Tenki: a session left open keeps billing until its idle timeout
-        # pauses it, then holds storage until max_duration ends it. Taking the lock lets a
+        # Load-bearing for Tenki: a session left open keeps billing until max_duration ends
+        # it, since nothing pauses an idle session. Taking the lock lets a
         # create still in flight finish first, so the session it produces is closed too.
         with self._session_lock or nullcontext():
             if self.session is not None:

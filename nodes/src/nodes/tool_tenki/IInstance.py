@@ -57,15 +57,16 @@ from .tool_groups import tenki_tool
 #: The session's home and default working directory, and the only root Tenki's file API accepts.
 _HOME = '/home/tenki'
 
-# Tenki-specific on purpose. Daytona's sandbox is deleted when idle and comes back empty, but an
-# idle Tenki session is paused: memory and /home/tenki survive, /tmp does not. An agent given
-# Daytona's account would reinstall and re-clone for nothing, and not know to keep work out of /tmp.
+# Tenki-specific on purpose. Daytona's sandbox is deleted when idle and comes back empty, but a
+# Tenki session persists until its lifetime ends and can be paused and resumed: memory and
+# /home/tenki survive a pause, /tmp does not. An agent given Daytona's account would reinstall and
+# re-clone for nothing, and not know to keep work out of /tmp.
 _SESSION_NOTE = (
     'All Tenki Sandbox tools share one Linux VM, with /home/tenki as the home and working '
-    'directory; files and installed packages persist between calls. An idle session is paused '
-    'and resumed on the next call: memory and files under /home/tenki survive, but /tmp is '
-    'cleared and open network connections drop, so keep work under /home/tenki. When the '
-    'session reaches its maximum lifetime it is replaced by a fresh, empty one.'
+    'directory; files and installed packages persist between calls. A paused session is resumed '
+    'on the next call: memory and files under /home/tenki survive, but /tmp is cleared and open '
+    'network connections drop, so keep work under /home/tenki. When the session reaches its '
+    'maximum lifetime it is replaced by a fresh, empty one.'
 )
 
 _PATH_NOTE = (

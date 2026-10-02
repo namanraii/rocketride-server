@@ -162,7 +162,6 @@ def test_create_accepts_every_option_the_node_sends():
         'cpu_cores',
         'memory_mb',
         'disk_size_gb',
-        'idle_timeout_minutes',
         'max_duration',
         'allow_inbound',
         'image',

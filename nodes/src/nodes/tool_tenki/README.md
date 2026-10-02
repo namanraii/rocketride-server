@@ -9,7 +9,7 @@ inside the engine's own process.
 
 Tenki Cloud runs Sandbox, a service that starts isolated Linux microVMs on demand and drives them
 over an API. Each sandbox is a full virtual machine with its own kernel rather than a shared
-container, so it behaves like an ordinary Linux host. An idle machine is paused rather than
+container, so it behaves like an ordinary Linux host. A machine can be paused rather than
 destroyed, and resumes later with its files and memory intact.
 
 ## What it does
@@ -18,9 +18,9 @@ Gives the pipeline one sandbox session, created on the first tool call and share
 after it, so files written and packages installed by one call are visible to the next. The agent
 gets 11 functions in three groups: running commands and code, editing files under `/home/tenki`, and
 working in a git repository. Pick it over `tool_python` when the work needs a real operating system
-instead of a restricted interpreter, and over `tool_daytona` when you want a machine whose idle
-state is paused rather than deleted. The node holds no credentials and places none inside the VM, so
-`git_clone` reaches public repositories only.
+instead of a restricted interpreter, and over `tool_daytona` when you want a machine that keeps its
+files and installed packages for the whole session. The node holds no credentials and places none
+inside the VM, so `git_clone` reaches public repositories only.
 
 ## Example pipelines
 
@@ -94,18 +94,20 @@ A function that is not published is invisible to the agent and refused if it is 
 value naming only unknown groups stops the pipeline at startup rather than quietly falling back to
 the default, so a typo surfaces immediately instead of widening access.
 
-### Idle Timeout (minutes) and Max Duration (minutes)
+### Max Duration (minutes)
 
-These two bound cost, and Tenki enforces both, so they hold regardless of what the pipeline or the
-engine does. The idle timeout **pauses** the session, which stops compute billing while preserving
-files and memory; the next tool call resumes it. Max duration is a hard lifetime: when it elapses
-the session ends for good, and the next call starts a fresh, empty one.
+The one setting that bounds cost. Tenki enforces it, so it holds regardless of what the pipeline or
+the engine does: when it elapses the session ends for good, and the next call starts a fresh, empty
+one. Tenki has **no idle timeout**. An unused session keeps billing compute until it is closed or
+this lifetime ends; nothing pauses it. (Tenki's changelog of 2026-09-18 removed the idle-timeout
+option as having "never had any effect", and the SDK ignores it.)
 
-Size them as though they were the only cleanup, because in a chat-driven pipeline they effectively
-are — see [Teardown](#teardown). A short idle timeout costs little, since a paused session resumes
-in seconds, so keep it low unless an agent routinely pauses mid-task. Max duration bounds a single
-session rather than total spend: a long-running pipeline that keeps working simply starts another
-session once one ends.
+Size it as the only guaranteed cleanup, because it is: the node closes the session on teardown, but
+teardown is not reached when the engine crashes, and engines before the fix in #2396 skip it for
+chat- and webhook-sourced pipelines (see [Teardown](#teardown)). The default of 15 minutes caps what
+an orphaned session can bill. Raise it for work that genuinely runs longer, and remember it bounds a
+single session rather than total spend: a long-running pipeline that keeps working simply starts
+another session once one ends, and the agent is told when that happens.
 
 ### Execution Timeout (seconds)
 
@@ -151,11 +153,13 @@ inside the VM for every later command, and every later caller, to read.
 
 ### Session lifecycle
 
-Tenki pauses an idle session rather than deleting it, and the node is built around that:
+A session persists, with its files and installed packages, until its lifetime ends, and it can be
+paused and resumed. The node handles both:
 
-- **Paused** — memory and files under `/home/tenki` survive, but `/tmp` is cleared and open network
-  connections drop. The next tool call resumes the session and retries automatically.
-- **Ended** — past its max duration, or terminated. The next call starts a fresh, empty session, and
+- **Paused** - by hand in Tenki's console or CLI, or by Tenki when the workspace runs out of credit.
+  Memory and files under `/home/tenki` survive, but `/tmp` is cleared and open network connections
+  drop. The next tool call resumes the session and retries automatically.
+- **Ended** - past its max duration, or terminated. The next call starts a fresh, empty session, and
   earlier files and installed packages are gone.
 
 Recovery follows the session's real state rather than the error that surfaced: a paused session is
@@ -165,12 +169,14 @@ in its `session` field, and a replacement is also logged as a warning, since it 
 
 ### Teardown
 
-`endGlobal` closes the session and sweeps any session still carrying the run's unique tag — but the
-engine does not always run node teardown. A pipeline sourced from `chat` or `webhook` is force-killed
-when it is terminated and when its idle TTL expires; measured on engine 3.3.0 with a probe node, both
-paths recorded `beginGlobal` and never `endGlobal`. For those pipelines the VM is not closed when the
-pipeline stops: it runs until the idle timeout pauses it and max duration ends it. That is why those
-two fields, rather than teardown, are the cleanup that counts.
+`endGlobal` closes the session and sweeps any session still carrying the run's unique tag - when the
+engine runs node teardown. Engines before the fix in #2396 (merged to `develop` on 2026-09-22) did
+not for a pipeline sourced from `chat` or `webhook`: on terminate and on idle-TTL expiry the task was
+force-killed first, and measured on engine 3.3.0 with a probe node, both paths recorded `beginGlobal`
+and never `endGlobal` (#2300). With that fix, both paths run teardown and the session is closed. No
+engine runs teardown after a crash. In every case the VM that is not closed runs until max duration
+ends it, since nothing pauses an idle session. That is why that field, rather than teardown, is the
+cleanup to size.
 
 Sessions are named `rocketride-tool-tenki-<suffix>` and tagged `rocketride`, so anything orphaned is
 recognisable in the Tenki console and can be closed there.

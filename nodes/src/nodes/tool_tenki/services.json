@@ -63,19 +63,11 @@
 			"minimum": 5,
 			"maximum": 100
 		},
-		"tenki.idle_timeout_minutes": {
-			"type": "integer",
-			"title": "Idle Timeout (minutes)",
-			"description": "Tenki pauses the session after this many minutes without activity. A pause keeps memory and files under /home/tenki but clears /tmp; it does not terminate the session.",
-			"default": 5,
-			"minimum": 1,
-			"maximum": 120
-		},
 		"tenki.max_duration_minutes": {
 			"type": "integer",
 			"title": "Max Duration (minutes)",
-			"description": "Upper bound on each session's lifetime, set when it is created: the cost backstop if the pipeline never shuts the session down, for example after an engine crash. It limits each session, not total spend: once a session ends, the next command or file write starts a new one.",
-			"default": 60,
+			"description": "Upper bound on each session's lifetime, set when it is created, and the only thing that stops an unused session from billing: Tenki has no idle timeout. Size it as the cost backstop for a session the pipeline never shuts down, for example after an engine crash. It limits each session, not total spend: once a session ends, the next command or file write starts a new one.",
+			"default": 15,
 			"minimum": 1,
 			"maximum": 1440
 		},
@@ -134,7 +126,7 @@
 		{
 			"section": "Pipe",
 			"title": "Tenki Sandbox",
-			"properties": ["type", "tenki.apikey", "tenki.base_url", "tenki.cpu_cores", "tenki.memory_mb", "tenki.disk_size_gb", "tenki.idle_timeout_minutes", "tenki.max_duration_minutes", "tenki.exec_timeout_secs", "tenki.max_output_chars", "tenki.image", "tenki.toolGroups"]
+			"properties": ["type", "tenki.apikey", "tenki.base_url", "tenki.cpu_cores", "tenki.memory_mb", "tenki.disk_size_gb", "tenki.max_duration_minutes", "tenki.exec_timeout_secs", "tenki.max_output_chars", "tenki.image", "tenki.toolGroups"]
 		}
 	]
 }

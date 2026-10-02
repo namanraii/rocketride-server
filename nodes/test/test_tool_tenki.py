@@ -706,8 +706,6 @@ def test_config_mode_tolerates_a_missing_key(monkeypatch, logs):
         ('memory_mb', 4097, 4096),  # Tenki rejects odd sizes
         ('disk_size_gb', 1, 5),  # the SDK rejects anything under 5 before sending
         ('disk_size_gb', 500, 100),
-        ('idle_timeout_minutes', 0, 1),
-        ('idle_timeout_minutes', 1000, 120),
         ('max_duration_minutes', 0, 1),
         ('max_duration_minutes', 100000, 1440),
         ('exec_timeout_secs', 0, 1),
@@ -729,12 +727,11 @@ def test_unset_or_unparseable_integers_fall_back_to_defaults(monkeypatch, logs):
         glb.cpu_cores,
         glb.memory_mb,
         glb.disk_size_gb,
-        glb.idle_timeout_minutes,
         glb.max_duration_minutes,
         glb.exec_timeout_secs,
         glb.max_output_chars,
     )
-    assert settings == (2, 4096, 5, 5, 60, 120, 50000)
+    assert settings == (2, 4096, 5, 15, 120, 50000)
 
 
 @pytest.mark.parametrize(
@@ -781,7 +778,6 @@ def test_create_sends_sizing_a_lifetime_cap_in_seconds_and_no_inbound(monkeypatc
         'cpu_cores': 4,
         'memory_mb': 8192,
         'disk_size_gb': 20,
-        'idle_timeout_minutes': 10,
         'max_duration_minutes': 90,
     }
     glb, client = _started(monkeypatch, _FakeSession('sb-1'), cfg=cfg)
@@ -794,11 +790,30 @@ def test_create_sends_sizing_a_lifetime_cap_in_seconds_and_no_inbound(monkeypatc
             'cpu_cores': 4,
             'memory_mb': 8192,
             'disk_size_gb': 20,
-            'idle_timeout_minutes': 10,
             'max_duration': 5400,
             'allow_inbound': False,
         }
     ]
+
+
+def test_create_sends_the_default_lifetime_cap_of_fifteen_minutes(monkeypatch, logs):
+    # Tenki's idle timeout never paused anything (its changelog, 2026-09-18), and the engine does not
+    # run teardown for chat or webhook pipelines (#2300), so this cap is the only guaranteed end for
+    # a session an agent stopped using. 15 minutes bounds what an orphaned VM can bill.
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'))
+    glb.get_session()
+    [call] = client.create_calls
+    assert call['max_duration'] == 15 * 60
+
+
+def test_a_pipeline_saved_with_the_retired_idle_timeout_field_still_starts_without_sending_it(monkeypatch, logs):
+    # Pipelines saved before the field was retired still carry it. They must keep starting, and the
+    # value must not reach Tenki, which ignores it on 1.0.6 and warns on it from 1.4.0.
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'), cfg={'idle_timeout_minutes': 10})
+    glb.get_session()
+    [call] = client.create_calls
+    assert 'idle_timeout_minutes' not in call
+    assert not hasattr(glb, 'idle_timeout_minutes')
 
 
 def test_image_is_sent_when_configured(monkeypatch, logs):
