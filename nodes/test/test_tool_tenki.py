@@ -193,6 +193,11 @@ for _name in _added_stubs:
 # ---------------------------------------------------------------------------
 
 
+# What Tenki answers a resume while it is still tearing the paused VM down (measured: one to three
+# times over 18 to 48 seconds after a pause, then the resume is accepted).
+_NOT_YET = 'paused source is still being torn down, retry shortly: deadline_exceeded: context deadline exceeded'
+
+
 class _FakeSession:
     """Stand-in for tenki.Sandbox, with the SDK's semantics for the lifecycle calls.
 
@@ -219,9 +224,16 @@ class _FakeSession:
         run_error=None,
         ready_state=None,
         ready_error=None,
+        paused_error=None,
+        resume_refusals=0,
     ):
         self.id = session_id
+        # How many times resume is refused first, as Tenki does while it is still tearing the paused VM down.
+        self._resume_refusals = resume_refusals
         self.state = state
+        # What a call on this session raises while it is paused. Tenki usually names the state; it
+        # has also been seen to answer with an error the SDK cannot classify.
+        self.paused_error = paused_error or mod.InvalidStateError('session is paused')
         self._refresh_error = refresh_error
         self._resume_delay = resume_delay
         self._close_error = close_error
@@ -242,7 +254,7 @@ class _FakeSession:
         kwargs = {'cwd': cwd, 'env': env, 'timeout': timeout, 'stdin': stdin, 'privileged': privileged}
         self.calls.append(('start', argv, kwargs))
         if self.state == 'PAUSED':
-            raise mod.InvalidStateError('session is paused')
+            raise self.paused_error
         if self._exec_error is not None:
             raise self._exec_error
         result = self._exec_result if self._exec_result is not None else _CommandResult(argv=list(argv), exit_code=0)
@@ -258,6 +270,9 @@ class _FakeSession:
 
     def resume(self):
         self.calls.append('resume')
+        if self._resume_refusals:
+            self._resume_refusals -= 1
+            raise mod.SandboxError(_NOT_YET)
         time.sleep(self._resume_delay)
         self.state = 'RUNNING'
 
@@ -402,7 +417,7 @@ class _FakeFS:
 
     def _enter(self, operation):
         if self._session.state == 'PAUSED':
-            raise mod.InvalidStateError('session is paused')
+            raise self._session.paused_error
         if operation in self._fail:
             raise self._fail[operation]
 
@@ -1171,6 +1186,31 @@ def test_tool_descriptions_resolve_and_state_the_configured_limits(monkeypatch, 
         assert isinstance(text, str) and text, name
         if name in _EXECUTION_TOOLS:
             assert '45s' in text, name
+
+
+def test_tool_descriptions_say_a_session_past_its_lifetime_is_paused_not_replaced(monkeypatch, logs):
+    # Tenki pauses a session at its max duration and keeps its state (changelog of 2026-09-11; measured
+    # on 2026-10-05), and the node resumes it. An agent told it had been replaced would redo work that
+    # survived, so every description that mentions the lifetime has to say what really happens.
+    inst, _ = _instance(monkeypatch, cfg={'toolGroups': ['all']})
+    mentions = 0
+    for name, method in inst._collect_tool_methods().items():
+        description = method.__tool_meta__['description']
+        text = description(inst) if callable(description) else description
+        for sentence in text.split('. '):
+            if 'maximum lifetime' in sentence:
+                mentions += 1
+                assert 'paus' in sentence and 'resum' in sentence, (name, sentence)
+                assert 'replaced' not in sentence and 'fresh' not in sentence, (name, sentence)
+    assert mentions, 'no tool description says what happens at the maximum lifetime'
+
+
+def test_the_max_duration_help_says_tenki_pauses_the_session():
+    # The editor's help for the one cost setting: it must not promise that the session ends.
+    services = json.loads((_NODES_SRC / 'nodes' / 'tool_tenki' / 'services.json').read_text())
+    description = services['fields']['tenki.max_duration_minutes']['description']
+    assert 'pauses' in description
+    assert 'once a session ends' not in description
 
 
 # ---------------------------------------------------------------------------
@@ -2142,7 +2182,9 @@ def test_a_run_that_fails_partway_is_reported_once_and_not_from_a_reader_thread(
     session = _FakeSession('sb-1', run_error=inst_mod.SandboxError('run stream reset'))
     inst, _ = _instance(monkeypatch, session)
     result = inst.run_command({'command': 'make'})
-    assert result['error'] == 'run stream reset'
+    # Reported once, with its cause, and as what it is: the stream broke, the command may not have.
+    assert result['error'].count('run stream reset') == 1 and 'not run again' in result['error']
+    assert len(session.processes) == 1
     assert escaped == []
 
 
@@ -2168,7 +2210,7 @@ _ENDED_WHILE_WAITING = RuntimeError('sandbox entered terminal state: TERMINATED'
     ('tool', 'args'), [('run_command', {'command': 'ls'}), ('write_file', {'path': 'a.txt', 'content': 'x'})]
 )
 def test_a_session_that_ends_while_it_resumes_is_replaced_and_the_call_retried(monkeypatch, logs, tool, args):
-    # Its max_duration can run out mid-resume: the dead session must not stay in place, and the
+    # It can be terminated mid-resume: the dead session must not stay in place, and the
     # call can still be served by a fresh one.
     paused = _FakeSession('sb-1', state='PAUSED', ready_state='TERMINATED', ready_error=_ENDED_WHILE_WAITING)
     inst, client = _instance(monkeypatch, paused, _FakeSession('sb-fresh'))
@@ -2256,6 +2298,273 @@ def test_a_tool_call_racing_shutdown_cannot_create_a_session(monkeypatch, logs):
 def test_a_call_that_ran_on_a_resumed_session_says_so(monkeypatch, logs):
     inst, _ = _instance(monkeypatch, _FakeSession('sb-1', state='PAUSED'))
     assert inst.run_command({'command': 'ls'})['session'] == 'resumed'
+
+
+# What Tenki answered a read on a session it had paused 45 seconds earlier (measured through the node on
+# 2026-10-05). The SDK has no class for it, so it arrives as a plain SandboxError.
+_VSOCK = (
+    'dial guest-agent stream after 3 attempts: failed to connect to vsock at /opt/cloud-hypervisor/data/'
+    'instances/sandbox/sb-1/rootfs.img.vsock: connect: no such file or directory'
+)
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args', 'key', 'expected'),
+    [
+        ('read_file', {'path': 'notes.txt'}, 'content', 'kept'),
+        ('write_file', {'path': 'new.txt', 'content': 'x'}, 'success', True),
+        ('run_command', {'command': 'ls'}, 'exit_code', 0),
+    ],
+)
+def test_a_pause_reported_as_an_unclassified_error_is_still_resumed(monkeypatch, logs, tool, args, key, expected):
+    # Recovery follows the session's real state, not the error that surfaced. Seen on a real VM: the
+    # first read after a lifetime pause came back as this infrastructure error, and only the agent's
+    # own retry resumed the session.
+    session = _FakeSession(
+        'sb-1', state='PAUSED', paused_error=mod.SandboxError(_VSOCK), files={'/home/tenki/notes.txt': 'kept'}
+    )
+    inst, client = _instance(monkeypatch, session)
+    result = getattr(inst, tool)(args)
+    assert 'error' not in result, result
+    assert result[key] == expected and result['session'] == 'resumed'
+    assert session.calls.count('resume') == 1 and len(client.create_calls) == 1
+
+
+def test_an_unclassified_error_on_a_running_session_is_reported_as_it_is(monkeypatch, logs):
+    # The look at the state must not turn every failure into a retry: a session that is running has
+    # nothing to recover, so the error goes back unchanged and the call is not made a second time.
+    session = _FakeSession('sb-1', fail={'stat': mod.SandboxError('upstream reset')})
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.read_file({'path': 'notes.txt'})
+    assert result['error'] == 'upstream reset'
+    assert session.calls.count('refresh') == 1 and 'resume' not in session.calls
+    assert [call for call in session.calls if call[0] == 'stat'] == [('stat', '/home/tenki/notes.txt')]
+
+
+def test_an_error_the_sdk_did_classify_costs_no_look_at_the_session(monkeypatch, logs):
+    # A missing file is an answer, not a symptom. It must not cost a control-plane call.
+    session = _FakeSession('sb-1')
+    inst, _ = _instance(monkeypatch, session)
+    assert 'no such file' in inst.read_file({'path': 'absent.txt'})['error']
+    assert 'refresh' not in session.calls
+
+
+def test_a_resume_tenki_refuses_at_first_is_asked_again_until_it_takes(monkeypatch, logs):
+    # "Not yet" is not a failure. Reporting it would hand the agent an error for a session that is
+    # about to be fine, at the moment every long-running pipeline reaches every max_duration.
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    session = _FakeSession('sb-1', state='PAUSED', resume_refusals=3, files={'/home/tenki/notes.txt': 'kept'})
+    inst, client = _instance(monkeypatch, session)
+    result = inst.read_file({'path': 'notes.txt'})
+    assert result.get('content') == 'kept' and result['session'] == 'resumed', result
+    assert session.calls.count('resume') == 4 and len(client.create_calls) == 1
+
+
+def test_a_resume_that_keeps_being_refused_is_reported_and_the_session_kept(monkeypatch, logs):
+    # Bounded: a call must not wait on Tenki for ever. The session is not replaced, since its files
+    # are still there for the call that finally gets through.
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    monkeypatch.setattr(mod, '_RESUME_RETRY_SECS', 0)
+    session = _FakeSession('sb-1', state='PAUSED', resume_refusals=1000)
+    inst, client = _instance(monkeypatch, session)
+    result = inst.run_command({'command': 'ls'})
+    assert result['exit_code'] == -1 and 'still being torn down' in result['error']
+    assert session.calls.count('resume') == 1 and len(client.create_calls) == 1
+    assert inst.IGlobal.session is session
+
+
+def test_a_resume_refused_for_a_reason_tenki_names_is_not_asked_again(monkeypatch, logs):
+    # Only the catch-all "not yet" is worth repeating. An error with a class of its own means something.
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    session = _FakeSession('sb-1', state='PAUSED')
+    refused = inst_mod.PermissionDeniedError('workspace suspended')
+
+    def resume():
+        session.calls.append('resume')
+        raise refused
+
+    session.resume = resume
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.run_command({'command': 'ls'})['error'] == 'workspace suspended'
+    assert session.calls.count('resume') == 1
+
+
+class _PausedBeforeStart(_FakeSession):
+    """A session whose pause surfaces as a command that never starts.
+
+    As measured: no error names the pause, the SDK just times out waiting for the start. After the
+    resume, commands start normally.
+    """
+
+    def __init__(self, session_id, **kwargs):
+        super().__init__(session_id, stalls='start', **kwargs)
+        self.paused = True
+
+    def refresh(self):
+        self.calls.append('refresh')
+        return SimpleNamespace(id=self.id, state='PAUSED' if self.paused else 'RUNNING')
+
+    def resume(self):
+        super().resume()
+        self.paused = False
+        self._stalls = None
+
+
+@pytest.mark.parametrize(('tool', 'args'), [('run_command', {'command': 'ls'}), ('run_code', {'code': 'print(1)'})])
+def test_a_command_a_paused_session_never_started_is_run_after_the_resume(monkeypatch, logs, tool, args):
+    # Measured on a real VM: a command sent as the session read PAUSED waited 30 seconds, failed with
+    # "did not start the command in time", and left the session paused. It had not started, so running
+    # it once the session is back repeats nothing.
+    session = _PausedBeforeStart('sb-1', exec_result=_CommandResult(argv=['bash'], exit_code=0, stdout=b'ok\n'))
+    inst, client = _instance(monkeypatch, session)
+    result = getattr(inst, tool)(args)
+    assert result.get('stdout') == 'ok\n' and result['session'] == 'resumed', result
+    assert session.calls.count('resume') == 1 and len(_execs(session)) == 2 and len(client.create_calls) == 1
+
+
+def test_a_command_that_does_not_start_on_a_running_session_still_times_out(monkeypatch, logs):
+    session = _FakeSession('sb-1', stalls='start')
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.run_command({'command': 'ls'})
+    assert result['timed_out'] is True and 'did not start' in result['error']
+    assert 'resume' not in session.calls and len(_execs(session)) == 1
+
+
+class _PausedMidCommand(_FakeSession):
+    """A session Tenki pauses while its first command is running.
+
+    As measured on a real VM: the command's streams end with the SDK's termination error, the session
+    then reads PAUSED, and commands started after the resume run normally.
+    """
+
+    _CUT = 'session_terminated:terminate_requested: termination requested'
+
+    def __init__(self, session_id, **kwargs):
+        super().__init__(session_id, run_error=mod.SessionTerminatedError(self._CUT), **kwargs)
+
+    def start(self, *argv, **kwargs):
+        process = super().start(*argv, **kwargs)
+        if self._run_error is not None:
+            self.state = 'PAUSED'
+        return process
+
+    def resume(self):
+        super().resume()
+        self._run_error = None
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args'), [('run_command', {'command': 'make deploy'}), ('run_code', {'code': 'print(1)'})]
+)
+def test_a_command_running_when_the_session_was_paused_is_not_run_again(monkeypatch, logs, tool, args):
+    # Measured on a real VM (2026-10-05): the retry after the resume started the command a second time
+    # while the first copy's process still existed. Whether that first copy then carries on (Tenki
+    # documents that it survives a pause) or dies soon after the resume (what later measurements
+    # showed), it had already done part of its work. Whatever the command does, it must not be done twice.
+    session = _PausedMidCommand('sb-1')
+    inst, client = _instance(monkeypatch, session)
+    result = getattr(inst, tool)(args)
+    assert len(_execs(session)) == 1
+    assert session.calls.count('resume') == 1
+    assert result['session'] == 'resumed'
+    assert result['exit_code'] == -1 and result['timed_out'] is False
+    assert 'paused' in result['error'] and 'not run again' in result['error']
+    assert 'part of its work may be done' in result['error'] and 'Check what it did' in result['error']
+    assert 'survives' not in result['error']  # not something the node can promise: see the measurements
+    assert len(client.create_calls) == 1
+
+
+class _CutAndStuck(_FakeSession):
+    """A session that cuts its first command off and then cannot be brought back within the call.
+
+    ``stuck`` says how: it still reads PAUSING when recovery looks, its resume keeps being refused, or
+    it never becomes ready after the resume. All three were seen, or follow from what was seen, on
+    real sessions in the minute after a pause.
+    """
+
+    def __init__(self, session_id, stuck, **kwargs):
+        cut = mod.SessionTerminatedError('session_terminated:terminate_requested: termination requested')
+        ready = TimeoutError('timeout waiting for sandbox') if stuck == 'never ready' else None
+        super().__init__(
+            session_id, run_error=cut, ready_state='RESUMING' if ready else None, ready_error=ready, **kwargs
+        )
+        self._stuck = stuck
+
+    def refresh(self):
+        self.calls.append('refresh')
+        if not self.processes:
+            return SimpleNamespace(id=self.id, state=self.state)
+        return SimpleNamespace(id=self.id, state='PAUSING' if self._stuck == 'pausing' else 'PAUSED')
+
+    def resume(self):
+        if self._stuck == 'refused':
+            self.calls.append('resume')
+            raise mod.SandboxError(_NOT_YET)
+        super().resume()
+
+
+@pytest.mark.parametrize('stuck', ['pausing', 'refused', 'never ready'])
+@pytest.mark.parametrize(
+    ('tool', 'args'), [('run_command', {'command': 'make deploy'}), ('run_code', {'code': 'print(1)'})]
+)
+def test_a_started_command_is_never_reported_as_simply_failed(monkeypatch, logs, tool, args, stuck):
+    # Whatever stopped the call, the command had started and a paused VM keeps it. An agent handed only
+    # "termination requested" or "retry shortly" repeats the command and ends up running two.
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    monkeypatch.setattr(mod, '_RESUME_RETRY_SECS', 0)
+    session = _CutAndStuck('sb-1', stuck)
+    inst, client = _instance(monkeypatch, session)
+    result = getattr(inst, tool)(args)
+    assert result['exit_code'] == -1 and result['timed_out'] is False
+    assert 'not run again' in result['error'] and 'part of its work may be done' in result['error'], result['error']
+    assert len(session.processes) == 1 and len(client.create_calls) == 1
+
+
+def test_a_command_started_by_the_retry_and_cut_again_is_reported_the_same_way(monkeypatch, logs):
+    # Seen on a real VM with a one minute lifetime: the session was paused before the command started,
+    # the retry after the resume started it, and the next pause cut that one. The agent got the raw
+    # termination text. The command the retry started is as likely to be running as any other.
+    cut = mod.SessionTerminatedError('session_terminated:terminate_requested: termination requested')
+    session = _FakeSession('sb-1', state='PAUSED', run_error=cut)
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.run_command({'command': 'make deploy'})
+    assert 'not run again' in result['error'] and 'part of its work may be done' in result['error'], result['error']
+    assert result['session'] == 'resumed' and len(session.processes) == 1
+
+
+def test_a_command_the_node_stopped_at_its_deadline_is_reported_as_timed_out(monkeypatch, logs):
+    # The one failure after a start that is not "cut off, check what it did": the wait ran out and
+    # the process was killed.
+    session = _FakeSession('sb-1', stalls='result')
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.run_command({'command': 'sleep 999'})
+    assert result['timed_out'] is True and 'not run again' not in result['error']
+    assert ('kill',) in session.calls
+
+
+def test_the_command_after_an_interrupted_one_runs_normally(monkeypatch, logs):
+    session = _PausedMidCommand('sb-1', exec_result=_CommandResult(argv=['bash'], exit_code=0, stdout=b'ok\n'))
+    inst, _ = _instance(monkeypatch, session)
+    assert 'not run again' in inst.run_command({'command': 'make deploy'})['error']
+    after = inst.run_command({'command': 'ls'})
+    assert after['stdout'] == 'ok\n' and 'session' not in after
+    assert len(_execs(session)) == 2
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args'), [('run_command', {'command': 'make deploy'}), ('run_code', {'code': 'print(1)'})]
+)
+def test_a_command_cut_off_by_a_terminated_session_is_run_again_on_the_fresh_one(monkeypatch, logs, tool, args):
+    # Nothing of the first run survives a terminated session, so starting over repeats nothing inside
+    # the sandbox. (What a command did outside it, a deploy say, is the agent's to judge either way.)
+    ended = mod.SessionTerminatedError('session_terminated')
+    dead = _FakeSession('sb-dead', run_error=ended)
+    dead.refresh = lambda: SimpleNamespace(id=dead.id, state='TERMINATED')
+    fresh = _FakeSession('sb-fresh', exec_result=_CommandResult(argv=['bash'], exit_code=0, stdout=b'ok\n'))
+    inst, _ = _instance(monkeypatch, dead, fresh)
+    result = getattr(inst, tool)(args)
+    assert result['session'] == 'replaced' and result['stdout'] == 'ok\n'
+    assert len(_execs(dead)) == 1 and len(_execs(fresh)) == 1
 
 
 @pytest.mark.parametrize(

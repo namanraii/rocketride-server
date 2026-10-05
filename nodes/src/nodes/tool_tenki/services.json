@@ -66,7 +66,7 @@
 		"tenki.max_duration_minutes": {
 			"type": "integer",
 			"title": "Max Duration (minutes)",
-			"description": "Upper bound on each session's lifetime, set when it is created, and the only thing that stops an unused session from billing: Tenki has no idle timeout. Size it as the cost backstop for a session the pipeline never shuts down, for example after an engine crash. It limits each session, not total spend: once a session ends, the next command or file write starts a new one.",
+			"description": "How long a session may run before Tenki pauses it, set when the session is created, and the only thing that stops an unused session from billing compute: Tenki has no idle timeout. Size it as the cost backstop for a session the pipeline never shuts down, for example after an engine crash. A paused session keeps its files and memory, and the next tool call resumes it for another period of the same length, so this limits one stretch of running, not total spend.",
 			"default": 15,
 			"minimum": 1,
 			"maximum": 1440

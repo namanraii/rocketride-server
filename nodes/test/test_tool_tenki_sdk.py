@@ -114,11 +114,15 @@ def test_a_failed_create_still_carries_what_it_left_running(name):
         ('NOT_FOUND', 'open /home/tenki/a.txt: no such file or directory', 'FileNotFoundError'),
         ('DEADLINE_EXCEEDED', 'deadline exceeded', 'CommandTimeoutError'),
         ('PERMISSION_DENIED', 'permission denied', 'PermissionDeniedError'),
+        ('UNAVAILABLE', 'Received http2 header with status: 502', 'SandboxError'),
+        ('UNKNOWN', 'paused source is still being torn down, retry shortly', 'SandboxError'),
     ],
 )
 def test_the_error_mapping_the_node_is_designed_around(code, details, expected):
     # The two catch-alls are why recovery checks a session's real state instead of trusting the error;
-    # the file-not-found mapping is what lets write_file create a missing parent directory.
+    # the file-not-found mapping is what lets write_file create a missing parent directory. A failure
+    # the SDK has no class for arrives as exactly SandboxError, which is how the node tells "this says
+    # nothing about the session" from an answer such as a missing file.
     class _RpcError(Exception):
         def code(self):
             return SimpleNamespace(name=code)
@@ -203,6 +207,9 @@ def test_the_session_methods_the_node_calls():
 
 def test_a_process_can_be_waited_on_with_a_limit_and_cancelled():
     assert _parameters(Process.close_stdin) == {}
+    # The node takes "close_stdin returned" to mean the sandbox confirmed the start: that is what
+    # decides whether a command may be run again after a pause.
+    assert '_wait_started' in inspect.getsource(Process.close_stdin)
     assert 'timeout' in _parameters(Process.wait)
     assert _parameters(Process.kill) == {}
 

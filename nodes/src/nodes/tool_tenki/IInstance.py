@@ -51,22 +51,23 @@ from ai.common.utils import normalize_tool_input, optional_bool, optional_int
 from tenki import CommandTimeoutError, PermissionDeniedError, SandboxError
 from tenki import FileNotFoundError as TenkiFileNotFoundError  # also subclasses the builtin it shadows
 
-from .IGlobal import IGlobal, SessionEndedError
+from .IGlobal import CommandNotStartedError, IGlobal, SessionEndedError
 from .tool_groups import tenki_tool
 
 #: The session's home and default working directory, and the only root Tenki's file API accepts.
 _HOME = '/home/tenki'
 
 # Tenki-specific on purpose. Daytona's sandbox is deleted when idle and comes back empty, but a
-# Tenki session persists until its lifetime ends and can be paused and resumed: memory and
-# /home/tenki survive a pause, /tmp does not. An agent given Daytona's account would reinstall and
-# re-clone for nothing, and not know to keep work out of /tmp.
+# Tenki session persists until it is terminated, and is paused rather than ended when its lifetime
+# runs out: memory and /home/tenki survive a pause, /tmp does not. An agent given Daytona's account
+# would reinstall and re-clone for nothing, and not know to keep work out of /tmp.
 _SESSION_NOTE = (
     'All Tenki Sandbox tools share one Linux VM, with /home/tenki as the home and working '
     'directory; files and installed packages persist between calls. A paused session is resumed '
     'on the next call: memory and files under /home/tenki survive, but /tmp is cleared and open '
-    'network connections drop, so keep work under /home/tenki. When the session reaches its '
-    'maximum lifetime it is replaced by a fresh, empty one.'
+    'network connections drop, so keep work under /home/tenki. Tenki pauses a session that reaches '
+    'its maximum lifetime, and the next call resumes it the same way, which can take a minute. Only '
+    'a session that has been terminated is replaced by a fresh, empty one.'
 )
 
 _PATH_NOTE = (
@@ -376,11 +377,71 @@ class _OutputGuard:
             reader.join()
 
 
-def _run_process(session, argv, timeout: int):
+class CommandInterruptedError(SandboxError):
+    """A command had started when its call lost the session, and it was not started again."""
+
+    def __init__(self, reason: str | None = None) -> None:
+        if reason is None:
+            # Measured on real sessions paused at max_duration: the command's process was gone within two
+            # seconds of the resume and did no further work, so this says "cut off", not "still running".
+            message = (
+                'the sandbox was paused while this command was running, and has been resumed. The command was '
+                'cut off part-way and was not run again, so part of its work may be done. Check what it did '
+                'before running it again.'
+            )
+        else:
+            message = (
+                f'the call lost the sandbox while this command was running ({reason}). The command was not run '
+                'again: it may still be running, or it may have been cut off part-way, so part of its work may '
+                'be done. Check what it did before running it again.'
+            )
+        super().__init__(message)
+
+
+class _StartedOnce:
+    """Runs ``run(session, started)`` for ``call_with_session`` without ever starting one command twice.
+
+    ``call_with_session`` calls again after it recovers the session. That is right when the
+    command never started, and when the session was replaced: nothing of the first run exists on
+    a fresh VM. On a resumed session it is wrong once the command had started: the files are still
+    there, and so is whatever the command did before the pause cut it off. Measured on real VMs,
+    the cut-off process was still listed for about a second after the resume, did no further work
+    and was gone after that, so running the command again repeats the part already done. ``run``
+    appends to ``started`` once its command has.
+
+    The same fact shapes what the agent is told when the call fails for good (see ``reported``).
+    """
+
+    def __init__(self, run, recoveries: list):
+        self._run = run
+        self._recoveries = recoveries
+        self.started = []
+
+    def __call__(self, session):
+        if self.started and self._recoveries and self._recoveries[-1] == 'resumed':
+            raise CommandInterruptedError()
+        return self._run(session, self.started)
+
+    def reported(self, error: SandboxError) -> SandboxError:
+        """The error to hand the agent for a call that failed.
+
+        A command that had started is never reported as simply failed. Whatever ended the call (the
+        session still pausing, a resume Tenki would not take yet, Tenki's own "termination
+        requested"), part of the command's work may be done, and an agent told only the cause
+        repeats it blind. The exception is the node's own deadline, which kills the command before
+        it reports.
+        """
+        if not self.started or isinstance(error, (CommandInterruptedError, CommandTimeoutError)):
+            return error
+        return CommandInterruptedError(str(error))
+
+
+def _run_process(session, argv, timeout: int, started: list):
     """Run ``argv`` in ``session``, without ever waiting unboundedly or holding unbounded output.
 
     Returns the CommandResult, and whether the command was killed for producing more than
-    _OUTPUT_LIMIT_BYTES of output (see _OutputGuard).
+    _OUTPUT_LIMIT_BYTES of output (see _OutputGuard). ``started`` is appended to once the sandbox
+    has confirmed the start (see _StartedOnce).
 
     Sandbox.exec waits on the output stream with no local limit, so a stream that stalls (on a
     half-open connection, say) would hang the tool call for good. Tenki stops the command at
@@ -396,7 +457,8 @@ def _run_process(session, argv, timeout: int):
         process.close_stdin()
     except TimeoutError as e:
         process.kill()
-        raise CommandTimeoutError('the sandbox did not start the command in time, so it was cancelled') from e
+        raise CommandNotStartedError('the sandbox did not start the command in time, so it was cancelled') from e
+    started.append(True)
     guard = _OutputGuard(process, _OUTPUT_LIMIT_BYTES)
     try:
         result = process.wait(timeout=limit)
@@ -496,14 +558,15 @@ class IInstance(IInstanceBase):
             # guest's startup files first, and a cd in them would win over exec's cwd.
             command = f'cd {shlex.quote(_normalize_path(cwd))} && {command}'
 
+        def run(session, started):
+            return _run_process(session, ('bash', '-lc', command), self.IGlobal.exec_timeout_secs, started)
+
         recoveries = []
+        once = _StartedOnce(run, recoveries)
         try:
-            result, killed = self.IGlobal.call_with_session(
-                lambda session: _run_process(session, ('bash', '-lc', command), self.IGlobal.exec_timeout_secs),
-                on_recovery=recoveries.append,
-            )
+            result, killed = self.IGlobal.call_with_session(once, on_recovery=recoveries.append)
         except SandboxError as e:
-            return _with_session_event(_exec_error(e), recoveries)
+            return _with_session_event(_exec_error(once.reported(e)), recoveries)
         return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars, killed=killed), recoveries)
 
     @tenki_tool(
@@ -546,14 +609,14 @@ class IInstance(IInstanceBase):
         # one call overwrite the file another is about to run.
         path = f'{_HOME}/.tenki-run-{uuid.uuid4().hex}{extension}'
 
-        def run(session):
+        def run(session, started):
             # Tenki has no code-run primitive. The code goes in through the file API instead of a
             # shell heredoc, whose escaping would mangle multi-line code.
             session.fs.write_text(path, code)
             try:
                 # "$@" hands the interpreter and path to exec as separate arguments, unquoted.
                 argv = ('bash', '-lc', 'exec "$@"', 'bash', interpreter, path)
-                return _run_process(session, argv, self.IGlobal.exec_timeout_secs)
+                return _run_process(session, argv, self.IGlobal.exec_timeout_secs, started)
             finally:
                 try:
                     session.fs.remove(path)
@@ -563,18 +626,20 @@ class IInstance(IInstanceBase):
                     pass
 
         recoveries = []
+        once = _StartedOnce(run, recoveries)
         try:
-            result, killed = self.IGlobal.call_with_session(run, on_recovery=recoveries.append)
+            result, killed = self.IGlobal.call_with_session(once, on_recovery=recoveries.append)
         except SandboxError as e:
-            return _with_session_event(_exec_error(e), recoveries)
+            return _with_session_event(_exec_error(once.reported(e)), recoveries)
         return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars, killed=killed), recoveries)
 
     # -----------------------------------------------------------------------
     # Group: filesystem
     #
     # Every path goes through _normalize_path before any call. Reads, listings and deletes pass
-    # replace=False: if the session has ended, a fresh, empty one cannot contain what they look
-    # for, so creating one would only add cost.
+    # replace=False: the call that finds the session ended is not answered from a fresh, empty one,
+    # which could not contain what it looks for. It says the session ended instead. The call after
+    # that starts a session like any first call does, whichever tool it is.
     # -----------------------------------------------------------------------
 
     @tenki_tool(

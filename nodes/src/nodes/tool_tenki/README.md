@@ -96,18 +96,28 @@ the default, so a typo surfaces immediately instead of widening access.
 
 ### Max Duration (minutes)
 
-The one setting that bounds cost. Tenki enforces it, so it holds regardless of what the pipeline or
-the engine does: when it elapses the session ends for good, and the next call starts a fresh, empty
-one. Tenki has **no idle timeout**. An unused session keeps billing compute until it is closed or
-this lifetime ends; nothing pauses it. (Tenki's changelog of 2026-09-18 removed the idle-timeout
+The one setting that bounds compute cost. Tenki enforces it, so it holds regardless of what the
+pipeline or the engine does: when it elapses, Tenki pauses the session. It does not delete it
+(Tenki's changelog of 2026-09-11: sessions are paused at their maximum duration "so their state is
+preserved"). A paused session runs nothing and keeps its memory and its files under `/home/tenki`.
+Its preserved state counts against the workspace's storage until the session is closed; Tenki
+reported a pause expiry seven days out for the sessions measured for this node. The next tool call
+resumes the session, and the resumed session gets a new period of the same length.
+
+Tenki has **no idle timeout**. An unused session keeps billing compute until it is closed or this
+period runs out; nothing pauses it sooner. (Tenki's changelog of 2026-09-18 removed the idle-timeout
 option as having "never had any effect", and the SDK ignores it.)
 
-Size it as the only guaranteed cleanup, because it is: the node closes the session on teardown, but
+Size it as the only guaranteed stop, because it is: the node closes the session on teardown, but
 teardown is not reached when the engine crashes, and engines before the fix in #2396 skip it for
-chat- and webhook-sourced pipelines (see [Teardown](#teardown)). The default of 15 minutes caps what
-an orphaned session can bill. Raise it for work that genuinely runs longer, and remember it bounds a
-single session rather than total spend: a long-running pipeline that keeps working simply starts
-another session once one ends, and the agent is told when that happens.
+chat- and webhook-sourced pipelines (see [Teardown](#teardown)). The default of 15 minutes caps the
+compute an orphaned session can bill. It bounds one stretch of running rather than total spend: a
+pipeline that keeps working is paused when the period runs out and resumed by its next call, and
+the agent is told when that happens. Raise it for work that genuinely runs longer, because the
+pause is not free for the agent: Tenki starts it 15 seconds to over two minutes after the period
+ends (measured), a command running at that moment is cut off part-way and has to be run again by
+the agent, and the first call afterwards waits while the session comes back, which took up to a
+minute.
 
 ### Execution Timeout (seconds)
 
@@ -153,14 +163,25 @@ inside the VM for every later command, and every later caller, to read.
 
 ### Session lifecycle
 
-A session persists, with its files and installed packages, until its lifetime ends, and it can be
+A session persists, with its files and installed packages, until it is terminated, and it can be
 paused and resumed. The node handles both:
 
-- **Paused** - by hand in Tenki's console or CLI, or by Tenki when the workspace runs out of credit.
-  Memory and files under `/home/tenki` survive, but `/tmp` is cleared and open network connections
-  drop. The next tool call resumes the session and retries automatically.
-- **Ended** - past its max duration, or terminated. The next call starts a fresh, empty session, and
-  earlier files and installed packages are gone.
+- **Paused** - by Tenki when the session reaches its max duration or the workspace runs out of
+  credit, or by hand in Tenki's console or CLI. Memory and files under `/home/tenki` survive, but
+  `/tmp` is cleared and open network connections drop. The next tool call resumes the session and
+  retries automatically, however the pause shows up. For about a minute after a pause Tenki answers
+  calls with errors that do not name it (an HTTP 502, a failed connection to the VM, a command that
+  never starts) and can refuse the resume itself, so the node looks at the session's state after
+  any failure that could hide a pause, and keeps asking for the resume for up to 90 seconds. That
+  first call can take a minute. A command that was already running when the pause came is the
+  exception. The pause cuts it off: when measured, its process was gone within two seconds of the
+  resume and did no more work. Part of its work may be done, so the node never starts it a second
+  time. Its call returns an error saying so, and the agent checks what the command did before
+  running it again. Any other call that loses the sandbox after its command has started is reported
+  with the same care.
+- **Ended** - terminated, from Tenki's console, CLI or API. The next command or file write starts a
+  fresh, empty session, and earlier files and installed packages are gone. A read that finds the
+  session ended says so instead of answering from an empty one.
 
 Recovery follows the session's real state rather than the error that surfaced: a paused session is
 resumed, an ended one is replaced, and anything else is reported to the agent unchanged. Because a
@@ -174,12 +195,12 @@ engine runs node teardown. Engines before the fix in #2396 (merged to `develop` 
 not for a pipeline sourced from `chat` or `webhook`: on terminate and on idle-TTL expiry the task was
 force-killed first, and measured on engine 3.3.0 with a probe node, both paths recorded `beginGlobal`
 and never `endGlobal` (#2300). With that fix, both paths run teardown and the session is closed. No
-engine runs teardown after a crash. In every case the VM that is not closed runs until max duration
-ends it, since nothing pauses an idle session. That is why that field, rather than teardown, is the
-cleanup to size.
+engine runs teardown after a crash. In every case the VM that is not closed keeps running, and
+billing compute, until max duration pauses it, since nothing pauses an idle session sooner. That is
+why that field, rather than teardown, is the backstop to size.
 
-Sessions are named `rocketride-tool-tenki-<suffix>` and tagged `rocketride`, so anything orphaned is
-recognisable in the Tenki console and can be closed there.
+Sessions are named `rocketride-tool-tenki-<suffix>` and tagged `rocketride`, so anything orphaned,
+running or paused, is recognisable in the Tenki console and can be closed there.
 
 ### Running the tests
 

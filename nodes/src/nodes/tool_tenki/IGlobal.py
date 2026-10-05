@@ -38,12 +38,13 @@ Three things differ from tool_daytona and shape this file:
 
 * Tenki has no ephemeral flag and no idle timeout: the SDK's idle-timeout
   option never paused anything (Tenki's changelog of 2026-09-18 removed it as
-  having "never had any effect"), so an unused session bills until it is
-  closed or ``max_duration`` ends it. ``endGlobal`` closes a session
-  promptly, but teardown is not reached after an engine crash, and engines
-  before the fix in #2396 skipped it for chat- and webhook-sourced tasks
-  (measured on engine 3.3.0, #2300). ``max_duration`` is the backstop for
-  both, which is why its default is short.
+  having "never had any effect"), so an unused session bills compute until
+  it is closed or ``max_duration`` runs out. Tenki then pauses it and keeps
+  its state (changelog of 2026-09-11) rather than ending it. ``endGlobal``
+  closes a session promptly, but teardown is not reached after an engine
+  crash, and engines before the fix in #2396 skipped it for chat- and
+  webhook-sourced tasks (measured on engine 3.3.0, #2300). ``max_duration``
+  is the backstop for both, which is why its default is short.
 * A create whose readiness wait fails can leave a live, billing sandbox that
   nothing references, so the create path closes it explicitly.
 * Recovery follows the session's actual state, not the exception alone: a
@@ -60,6 +61,7 @@ from reading it.
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from contextlib import nullcontext
 
@@ -68,6 +70,7 @@ from rocketlib import IGlobalBase, OPEN_MODE, debug, warning
 
 from tenki import (
     Client,
+    CommandTimeoutError,
     InvalidStateError,
     Sandbox,
     SandboxError,
@@ -86,6 +89,12 @@ _MIN_RPC_TIMEOUT_SECS = 60
 
 # How long recovery waits for a resumed session to run again: the SDK's own readiness budget.
 _READY_WAIT_SECS = 180
+
+# How long recovery keeps asking for a resume that Tenki refuses with its catch-all "not yet", and the
+# pause between asks. Measured after a pause at max_duration: one to three refusals ("paused source is
+# still being torn down, retry shortly") over 18 to 48 seconds, each taking about 10 seconds itself.
+_RESUME_RETRY_SECS = 90
+_RESUME_RETRY_PAUSE_SECS = 5
 
 # Given an empty endpoint the SDK resolves one from TENKI_API_ENDPOINT / TENKI_API_URL,
 # so the public default is passed explicitly rather than left to the host's environment.
@@ -120,6 +129,25 @@ class SessionUnavailableError(SandboxError):
     own errors. This is a SandboxError, so each tool's error handling returns it to the agent as an
     error result, as it does every other sandbox failure, instead of letting it out of the tool.
     """
+
+
+class CommandNotStartedError(CommandTimeoutError):
+    """The sandbox never confirmed that a command had started, so the command was cancelled.
+
+    Nothing ran. That is what a command sent to a paused session looks like when no error names the
+    pause, so it is one of the failures that prompt a look at the session's state.
+    """
+
+
+def _may_hide_a_pause(error: SandboxError) -> bool:
+    """Whether a failed call says too little about the session to be reported without a look at it.
+
+    Tenki does not always name a pause. Measured on real sessions it had paused: a file read came
+    back as an infrastructure error the SDK has no class for ("dial guest-agent stream ... failed to
+    connect to vsock"), and a command simply never started. An error the SDK did classify, such as
+    a missing file, is an answer in its own right and costs no extra call.
+    """
+    return type(error) is SandboxError or isinstance(error, CommandNotStartedError)
 
 
 def _int_or(value, default: int, *, lo: int, hi: int) -> int:
@@ -241,9 +269,10 @@ class IGlobal(IGlobalBase):
             'memory_mb': self.memory_mb,
             'disk_size_gb': self.disk_size_gb,
             # Tenki has no ephemeral flag and no idle timeout, so this is the one thing that
-            # ends a session whose pipeline never reached endGlobal (a crashed engine, or one
-            # that skips teardown). The SDK takes seconds. sticky stays at its default of
-            # False: a sticky session discards max_duration.
+            # stops the compute of a session whose pipeline never reached endGlobal (a crashed
+            # engine, or one that skips teardown): Tenki pauses it when this runs out. The SDK
+            # takes seconds. sticky stays at its default of False: a sticky session discards
+            # max_duration.
             'max_duration': self.max_duration_minutes * 60,
             # Inbound exposure can only be set at create time, and no tool this node
             # publishes uses it, so sessions are created closed to inbound traffic.
@@ -276,7 +305,7 @@ class IGlobal(IGlobalBase):
         ``TemplateRuntimeFailedError`` raised by the create call itself carries only the
         session's info record (or nothing), so the handle is fetched by id first. A close
         that fails is only logged: the create error is what the caller needs, and
-        max_duration still ends the session.
+        max_duration still stops the session's compute.
         """
         carried = getattr(error, 'sandbox', None)
         if carried is None:
@@ -293,8 +322,9 @@ class IGlobal(IGlobalBase):
         """Return ``call(session)``, recovering the session once if it stopped being usable.
 
         A lifecycle error only prompts a look at the session's state (see
-        ``recover_session``). The call is retried once, on the recovered session, when that
-        state explains the failure; every other error propagates unchanged.
+        ``recover_session``), and so does a failure that says too little to rule a pause out (see
+        ``_may_hide_a_pause``). The call is retried once, on the recovered session, when that state
+        explains the failure; every other error propagates unchanged.
 
         ``replace=False`` is for calls that only look at existing state (reading, listing or
         deleting files). If the session turns out to have ended, a fresh, empty one could not
@@ -309,6 +339,12 @@ class IGlobal(IGlobalBase):
             try:
                 return call(session)
             except _LIFECYCLE_ERRORS:
+                recovery = self.recover_session(session, epoch, replace=replace)
+                if not recovery:
+                    raise
+            except SandboxError as e:
+                if not _may_hide_a_pause(e):
+                    raise
                 recovery = self.recover_session(session, epoch, replace=replace)
                 if not recovery:
                     raise
@@ -334,9 +370,9 @@ class IGlobal(IGlobalBase):
           service already did), so the next ``get_session`` creates a fresh one. Its files
           are lost either way. With ``replace=False`` the caller is not retried on that fresh
           session: ``SessionEndedError`` is raised instead.
-        * Paused (by hand in Tenki's console or CLI, or by Tenki when the workspace runs out
-          of credit): resume it and wait until it runs. Never replace it, since a pause
-          preserves the agent's memory and files.
+        * Paused (by Tenki when the session reaches max_duration or the workspace runs out of
+          credit, or by hand in Tenki's console or CLI): resume it and wait until it runs.
+          Never replace it, since a pause preserves the agent's memory and files.
         * Any other state (running, starting, pausing): the failure had another cause, so
           it is surfaced.
         """
@@ -358,13 +394,13 @@ class IGlobal(IGlobalBase):
             if state is None or state in _GONE_STATES:
                 return self._drop_session(session, state, replace=replace)
             if state == 'PAUSED':
-                session.resume()
+                self._resume(session)
                 try:
                     session.wait_ready(timeout=_READY_WAIT_SECS)
                 except (RuntimeError, TimeoutError) as e:
                     # The SDK's plain errors for "went terminal while waiting" and "never got to
-                    # RUNNING". Its max_duration can run out mid-resume, and that session is as gone
-                    # as any other. One merely slow to come up keeps its files, so it is not dropped.
+                    # RUNNING". A session terminated mid-resume is as gone as any other. One merely
+                    # slow to come up keeps its files, so it is not dropped.
                     if session.state in _GONE_STATES:
                         return self._drop_session(session, session.state, replace=replace)
                     raise SessionUnavailableError(f'session {session.id} did not finish resuming: {e}') from e
@@ -373,6 +409,27 @@ class IGlobal(IGlobalBase):
                 debug(f'tool_tenki: resumed paused session {session.id}')
                 return 'resumed'
             return None
+
+    def _resume(self, session: Sandbox) -> None:
+        """Ask Tenki to resume ``session``, again for as long as it only answers "not yet".
+
+        For up to a minute after a pause Tenki refuses a resume while it is still tearing the paused
+        VM down, with an error the SDK has no class for. That is a wait, not a failure, and it comes
+        at the moment every long-running pipeline reaches every max_duration. An error with a class
+        of its own means something else and is raised at once; so is the catch-all once
+        ``_RESUME_RETRY_SECS`` have passed, so that a call never waits on Tenki without bound.
+        Called with the session lock held, as a resume must be: parallel calls wait for this one.
+        """
+        deadline = time.monotonic() + _RESUME_RETRY_SECS
+        while True:
+            try:
+                session.resume()
+                return
+            except SandboxError as e:
+                if type(e) is not SandboxError or time.monotonic() >= deadline:
+                    raise
+                debug(f'tool_tenki: resume of {session.id} not accepted yet ({e}); asking again')
+                time.sleep(_RESUME_RETRY_PAUSE_SECS)
 
     def _drop_session(self, session: Sandbox, state: str | None, *, replace: bool) -> str:
         """Forget a session that has ended, so the next ``get_session`` creates a fresh one.
@@ -450,8 +507,8 @@ class IGlobal(IGlobalBase):
     def endGlobal(self) -> None:
         # First, so that no tool call can create a session after the close below.
         self._ending = True
-        # Load-bearing for Tenki: a session left open keeps billing until max_duration ends
-        # it, since nothing pauses an idle session. Taking the lock lets a
+        # Load-bearing for Tenki: a session left open keeps billing compute until max_duration
+        # pauses it, since nothing pauses an idle session sooner. Taking the lock lets a
         # create still in flight finish first, so the session it produces is closed too.
         with self._session_lock or nullcontext():
             if self.session is not None:
