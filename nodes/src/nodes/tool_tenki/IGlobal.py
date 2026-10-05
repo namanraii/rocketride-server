@@ -156,6 +156,9 @@ class IGlobal(IGlobalBase):
     # A tag unique to this pipeline run, set in beginGlobal. Every session created here carries it,
     # so endGlobal can find and close any this run left running, without touching another run's.
     _run_tag: str = ''
+    # Set once this run asks Tenki for a session, whether or not the create succeeds: only then can a
+    # session carrying the run's tag exist for endGlobal to look for.
+    _create_attempted: bool = False
 
     rpc_timeout_secs: int = 120
     image: str = ''
@@ -173,6 +176,7 @@ class IGlobal(IGlobalBase):
 
         self._session_lock = threading.Lock()
         self._ending = False
+        self._create_attempted = False
         self._run_tag = f'run-{uuid.uuid4().hex[:12]}'
 
         cfg = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
@@ -252,6 +256,7 @@ class IGlobal(IGlobalBase):
         }
         if self.image:
             create_kwargs['image'] = self.image
+        self._create_attempted = True
         try:
             return self.client.create(**create_kwargs)
         except (WaitReadyFailedError, TemplateRuntimeFailedError) as e:
@@ -420,6 +425,9 @@ class IGlobal(IGlobalBase):
         final backstop.
         """
         if not self._run_tag:
+            return
+        if not self._create_attempted:
+            # Nothing can carry the tag, and an unused node then shuts down without the network.
             return
         try:
             leftover = self.client.list(tags=[self._run_tag])

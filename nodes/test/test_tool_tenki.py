@@ -2430,10 +2430,30 @@ def test_shutdown_before_the_pipeline_ever_started_is_harmless(monkeypatch, logs
     assert logs == []
 
 
+def test_shutdown_of_a_run_that_never_created_a_session_stays_off_the_network(monkeypatch, logs):
+    # Only a create can leave a session carrying this run's tag, and a pipeline that never needed the
+    # sandbox should not need the network to shut down; a placeholder-key smoke test, for one.
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'))
+    glb.endGlobal()
+    assert client.list_calls == []
+    assert client.closed is True
+
+
+def test_shutdown_still_sweeps_after_a_create_that_failed(monkeypatch, logs):
+    # A create can fail after Tenki admitted the VM, so an attempt is what counts, not a success.
+    glb, client = _started(monkeypatch, create_error=mod.SandboxError('deadline exceeded'))
+    with pytest.raises(mod.SandboxError):
+        glb.get_session()
+    run_tag = glb._run_tag
+    glb.endGlobal()
+    assert client.list_calls == [[run_tag]]
+
+
 def test_the_shutdown_sweep_never_runs_without_this_runs_tag(monkeypatch, logs):
     # Not reachable today, since beginGlobal sets the tag before it creates the client. Kept as an
     # interlock: listing by an empty tag could match other runs' sessions, and close their work.
     glb, client = _started(monkeypatch, _FakeSession('sb-1'), leftover=[_FakeSession('sb-other')])
+    glb.get_session()  # so the sweep would otherwise run: only the missing tag may stop it
     glb._run_tag = ''
     glb.endGlobal()
     assert client.list_calls == []
