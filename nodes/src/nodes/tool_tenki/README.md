@@ -75,9 +75,9 @@ a chatty command that finishes, such as a large `apt-get install`, is only trunc
 comes back with `truncated` set and a note on `stderr` saying why.
 
 A call that had to recover the session first also carries a `session` field: `"resumed"` when the VM
-had been paused and its files survived, or `"replaced"` when the old session had ended and this call
-ran on a fresh, empty one. An agent that ignores that field can wrongly assume its earlier files are
-still there.
+had been paused and its files survived, or `"replaced"` when the old session had ended, so its files
+are gone and work continues on a fresh, empty one. An agent that ignores that field can wrongly
+assume its earlier files are still there.
 
 ## Configuration
 
@@ -116,8 +116,8 @@ pipeline that keeps working is paused when the period runs out and resumed by it
 the agent is told when that happens. Raise it for work that genuinely runs longer, because the
 pause is not free for the agent: Tenki starts it 15 seconds to over two minutes after the period
 ends (measured), a command running at that moment is cut off part-way and has to be run again by
-the agent, and the first call afterwards waits while the session comes back, which took up to a
-minute.
+the agent, and the first call afterwards waits while the session comes back, which took 40 to 63
+seconds when measured.
 
 ### Execution Timeout (seconds)
 
@@ -125,6 +125,14 @@ The longest a single `run_command` or `run_code` may take. Tenki stops the comma
 reports it as a normal result with `timed_out` set. It also acts as the floor for the deadline on
 calls to the Tenki API, which is never below 60 seconds, so raising it for a genuinely long build
 also gives operations like `git_clone` more room.
+
+Every file call carries that deadline too. The Tenki SDK sends a session's file calls with none
+(1.0.6 and 1.4.0), so the node adds it, and a stalled connection ends in an error instead of a tool
+call that never returns. One step is not covered. When a file call is the first call after a
+resume, the SDK first checks the session's data connection with a request of its own, which has no
+deadline. If that request stalls, the call waits on it, and so does every later call on the
+session, including the close at shutdown; the VM then runs until max duration pauses it. A command
+does not go through that check.
 
 ## Authentication
 
@@ -169,19 +177,30 @@ paused and resumed. The node handles both:
 - **Paused** - by Tenki when the session reaches its max duration or the workspace runs out of
   credit, or by hand in Tenki's console or CLI. Memory and files under `/home/tenki` survive, but
   `/tmp` is cleared and open network connections drop. The next tool call resumes the session and
-  retries automatically, however the pause shows up. For about a minute after a pause Tenki answers
-  calls with errors that do not name it (an HTTP 502, a failed connection to the VM, a command that
-  never starts) and can refuse the resume itself, so the node looks at the session's state after
-  any failure that could hide a pause, and keeps asking for the resume for up to 90 seconds. That
-  first call can take a minute. A command that was already running when the pause came is the
-  exception. The pause cuts it off: when measured, its process was gone within two seconds of the
-  resume and did no more work. Part of its work may be done, so the node never starts it a second
-  time. Its call returns an error saying so, and the agent checks what the command did before
+  retries automatically. For about a minute after a pause Tenki answers calls with errors that do
+  not name it (seen so far: an HTTP 502, a failed connection to the VM, a "no such file" about the
+  VM's own socket, a command that never starts) and can refuse the resume itself. The node looks at
+  the session's state after each of those, and keeps asking for a refused resume for about 90
+  seconds, a budget shared by the calls waiting on the same resume. That first call took 40 to 63
+  seconds when measured. An error of any other kind is reported as it is. A command that was
+  already running when the pause came is the exception to the retry. The pause cuts it off: when
+  measured, its process was gone within two seconds of the resume and did no more work. Part of its
+  work may be done, so once the sandbox has confirmed a command's start the node does not start it
+  again. Its call returns an error saying so, and the agent checks what the command did before
   running it again. Any other call that loses the sandbox after its command has started is reported
-  with the same care.
-- **Ended** - terminated, from Tenki's console, CLI or API. The next command or file write starts a
-  fresh, empty session, and earlier files and installed packages are gone. A read that finds the
-  session ended says so instead of answering from an empty one.
+  with the same care. A command whose start was never confirmed is treated as not run and is sent
+  after the resume; in the two runs that counted, it ran exactly once. File and git calls are
+  different: by the retry's design, one that was in flight when the pause came is sent again after
+  the resume, so a clone, a checkout that creates a branch, or a delete can then report a failure
+  for something the first attempt did. That case has not been produced on a real VM.
+- **Ended** - terminated, from Tenki's console, CLI or API. Its files and installed packages are
+  gone, and what the agent is told depends on the call that finds out. A command, file write,
+  `make_directory` or `git_clone` that had not started runs on a fresh, empty session and carries
+  `session: "replaced"`. A read, listing, delete, or git call on an existing repository returns an
+  error saying the session ended, and creates nothing. So does a command that was running when the
+  session ended: it is not run again, because whatever it did outside the sandbox is already done.
+  After either error the next call starts the fresh session, whichever tool it is, and its result
+  carries no `session` field: the agent was told by the call before.
 
 Recovery follows the session's real state rather than the error that surfaced: a paused session is
 resumed, an ended one is replaced, and anything else is reported to the agent unchanged. Because a

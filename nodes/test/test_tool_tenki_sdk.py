@@ -33,7 +33,9 @@ written against, so run this module against any new version before bumping the p
 
 from __future__ import annotations
 
+import importlib.util
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -42,14 +44,21 @@ tenki = pytest.importorskip('tenki')
 
 from tenki_sandbox import errors as sdk_errors
 from tenki_sandbox._pb import pb
-from tenki_sandbox._transport import _STREAMING_OUT
+from tenki_sandbox._transport import _STREAMING_OUT, GrpcConfig, GrpcSandboxRPC
 from tenki_sandbox.client import build_create_session_request
+from tenki_sandbox.data_plane import GrpcDataPlaneRPC
 from tenki_sandbox.errors import map_rpc_error
 from tenki_sandbox.fs import SandboxFS
 from tenki_sandbox.git import SandboxGit
 from tenki_sandbox.process import Process, ProcessStream
 
 _REQUIRED = inspect.Parameter.empty
+
+# The node's own module, loaded from source: it has no engine imports, so it runs against the real SDK.
+_SOURCE = Path(__file__).resolve().parents[1] / 'src' / 'nodes' / 'tool_tenki' / 'file_deadline.py'
+_spec = importlib.util.spec_from_file_location('tool_tenki_file_deadline', _SOURCE)
+file_deadline = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(file_deadline)
 
 
 def _parameters(function):
@@ -152,12 +161,124 @@ def test_the_client_refuses_a_key_without_the_tk_prefix_before_any_request():
         tenki.Client(auth_token='mock-tenki-placeholder-for-tests', rpc=object())
 
 
-def test_the_client_deadline_covers_every_unary_call_the_node_makes():
-    # The deadline IGlobal passes, and the clone limit git_clone describes, apply only to unary calls.
-    # read_file uses stat and read_file for that reason: read_file_stream gets no deadline at all.
+def test_the_client_deadline_covers_every_control_plane_call_the_node_makes():
+    # The deadline IGlobal passes, and the clone limit git_clone describes, apply only to unary calls
+    # on the control plane. Git has no data-plane call, so it always goes there.
     unary = {'create_session', 'get_session', 'resume_session', 'terminate_session', 'git_operation'}
-    unary |= {'stat', 'read_file', 'write_file', 'list', 'mkdir', 'remove'}
     assert not unary & _STREAMING_OUT
+    assert 'git_operation' not in GrpcDataPlaneRPC._methods
+
+
+class _RecordingStub:
+    """In place of a gRPC stub: notes the deadline each call arrived with, and has no network."""
+
+    def __init__(self):
+        self.deadlines = {}
+
+    def __getattr__(self, name):
+        def method(request, *args, **kwargs):
+            self.deadlines[name] = kwargs.get('timeout', 'none sent')
+            raise ConnectionError('no network in contract tests')
+
+        return method
+
+
+_FILE_RPCS = {'Stat', 'ReadFile', 'WriteFile', 'List', 'Mkdir', 'Remove'}
+
+
+def _session_with_stubbed_planes():
+    """A real Sandbox whose control plane and data plane are the SDK's own, over recording stubs."""
+    control = GrpcSandboxRPC(
+        GrpcConfig(base_url='https://127.0.0.1:9', auth_token='tk_mock-tenki-placeholder-for-tests', timeout=60)
+    )
+    control_stub = _RecordingStub()
+    object.__setattr__(control, '_stub', control_stub)
+    session = tenki.Sandbox(SimpleNamespace(_rpc=control), tenki.SandboxInfo(id='sb-contract'))
+    data = GrpcDataPlaneRPC('https://127.0.0.1:9', SimpleNamespace(current=lambda: ''))
+    data_stub = data._stub = _RecordingStub()
+    # As after the session's first exec or file call, which is when the SDK sets its data plane up.
+    session._data_plane_rpc, session._data_plane_verified = data, True
+    assert session._session_rpc is data
+    return session, control_stub, data_stub
+
+
+def _make_every_file_call_the_node_makes(session):
+    files = session.fs
+    for call in (
+        lambda: files.stat('/home/tenki/a.txt'),
+        lambda: files.read_bytes('/home/tenki/a.txt'),
+        lambda: files.write_text('/home/tenki/a.txt', 'x'),
+        lambda: files.list('/home/tenki', include_hidden=False),
+        lambda: files.mkdir('/home/tenki/d'),
+        lambda: files.remove('/home/tenki/d'),
+    ):
+        with pytest.raises(tenki.SandboxError):
+            call()
+
+
+def test_the_sdk_sends_a_sessions_file_calls_to_its_data_plane_with_no_deadline():
+    # Why the node adds one. If this fails because the SDK started sending its own, file_deadline
+    # can go; until then a stalled connection would hang these calls for good.
+    session, control_stub, data_stub = _session_with_stubbed_planes()
+    _make_every_file_call_the_node_makes(session)
+    assert data_stub.deadlines == dict.fromkeys(_FILE_RPCS, 'none sent')
+    assert control_stub.deadlines == {}
+
+
+def test_the_nodes_deadline_reaches_grpc_on_every_file_call_of_a_real_session():
+    session, control_stub, data_stub = _session_with_stubbed_planes()
+    assert isinstance(session.fs, SandboxFS) and hasattr(session.fs, '_rpc')  # what bound_file_calls reaches into
+    file_deadline.bound_file_calls(session, 75)
+    _make_every_file_call_the_node_makes(session)
+    assert data_stub.deadlines == dict.fromkeys(_FILE_RPCS, 75)
+    assert control_stub.deadlines == {}
+
+
+def test_the_nodes_deadline_also_applies_when_file_calls_fall_back_to_the_control_plane():
+    # A session with no data plane sends file calls through the client; the node's deadline is the
+    # one used there too, in place of the client's own.
+    session, control_stub, data_stub = _session_with_stubbed_planes()
+    file_deadline.bound_file_calls(session, 75)
+    session._data_plane_rpc = None
+    session._ensure_data_plane = lambda **kwargs: None
+    _make_every_file_call_the_node_makes(session)
+    assert control_stub.deadlines == dict.fromkeys(_FILE_RPCS, 75)
+    assert data_stub.deadlines == {}
+
+
+def test_the_deadline_survives_the_data_plane_being_set_up_again_after_a_resume():
+    # resume() drops the session's data plane and the next call sets up a new one. The deadline sits
+    # on the file API itself, not on the plane, so the calls that follow still carry it.
+    session, _, _ = _session_with_stubbed_planes()
+    file_deadline.bound_file_calls(session, 75)
+    session._reset_data_plane()
+    fresh = GrpcDataPlaneRPC('https://127.0.0.1:9', SimpleNamespace(current=lambda: ''))
+    fresh_stub = fresh._stub = _RecordingStub()
+    session._data_plane_rpc, session._data_plane_verified = fresh, True
+    _make_every_file_call_the_node_makes(session)
+    assert fresh_stub.deadlines == dict.fromkeys(_FILE_RPCS, 75)
+
+
+def test_the_deadline_is_added_to_the_unary_file_calls_only():
+    assert file_deadline.UNARY_FILE_CALLS <= set(GrpcDataPlaneRPC._methods)
+    assert {GrpcDataPlaneRPC._methods[name] for name in file_deadline.UNARY_FILE_CALLS} == _FILE_RPCS
+    seen = {}
+    streaming = SimpleNamespace(read_file_stream=lambda request, **kwargs: seen.update(kwargs) or iter(()))
+    assert list(file_deadline.FileCallDeadline(streaming, 75).read_file_stream(object())) == []
+    assert seen == {}
+
+
+def test_a_call_that_reaches_its_deadline_is_the_sdks_timeout_error():
+    # What a file call that runs past the node's deadline raises: an error result with a class of
+    # its own, so it is reported as it is and prompts no look at the session.
+    class _DeadlineExceeded(Exception):
+        def code(self):
+            return SimpleNamespace(name='DEADLINE_EXCEEDED')
+
+        def details(self):
+            return 'Deadline Exceeded'
+
+    assert type(map_rpc_error(_DeadlineExceeded())) is tenki.CommandTimeoutError
 
 
 def test_create_accepts_every_option_the_node_sends():

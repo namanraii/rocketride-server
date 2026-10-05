@@ -400,12 +400,31 @@ class _FakeProcess:
         self._killed.set()
 
 
+class _FakeFileCalls:
+    """Stand-in for the object SandboxFS sends every call through, which is where a deadline is passed.
+
+    The real one is the session's RPC handle, called as ``rpc.stat(request)``. This records the
+    ``timeout`` each call was given, under the RPC's name, and then runs the operation.
+    """
+
+    def __init__(self, deadlines):
+        self._deadlines = deadlines
+
+    def __getattr__(self, name):
+        def call(operation, timeout=None):
+            self._deadlines.append((name, timeout))
+            return operation()
+
+        return call
+
+
 class _FakeFS:
     """Stand-in for tenki's SandboxFS over an in-memory tree, with the SDK's signatures.
 
     Calls are logged into the session's call log, a paused session refuses them like the fake
     exec does, and ``fail`` maps an operation name to the error it raises. There is deliberately
-    no ``read_stream``: it has no deadline, so the node must never call it.
+    no ``read_stream``: it has no deadline, so the node must never call it. As in the SDK, every
+    operation goes out through ``_rpc``; ``deadlines`` lists the timeout each one was sent with.
     """
 
     def __init__(self, session, *, files=None, dirs=None, fail=None):
@@ -414,6 +433,8 @@ class _FakeFS:
         self.files = dict(files or {})
         self.dirs = {'/home/tenki', *(dirs or ())}
         self.written = {}
+        self.deadlines = []
+        self._rpc = _FakeFileCalls(self.deadlines)
 
     def _enter(self, operation):
         if self._session.state == 'PAUSED':
@@ -426,6 +447,9 @@ class _FakeFS:
         return inst_mod.TenkiFileNotFoundError('no such file or directory')
 
     def write_text(self, path, text, *, encoding='utf-8'):
+        return self._rpc.write_file(lambda: self._write_text(path, text))
+
+    def _write_text(self, path, text):
         self._session.calls.append(('write_text', path))
         self._enter('write_text')
         if posixpath.dirname(path) not in self.dirs:
@@ -434,6 +458,9 @@ class _FakeFS:
         self.written[path] = text
 
     def stat(self, path):
+        return self._rpc.stat(lambda: self._stat(path))
+
+    def _stat(self, path):
         self._session.calls.append(('stat', path))
         self._enter('stat')
         if path in self.dirs:
@@ -443,6 +470,9 @@ class _FakeFS:
         return _FileInfo(path=path, size=len(self.files[path].encode()), mode=0o644, is_dir=False, modified_unix_ns=0)
 
     def read_bytes(self, path):
+        return self._rpc.read_file(lambda: self._read_bytes(path))
+
+    def _read_bytes(self, path):
         self._session.calls.append(('read_bytes', path))
         self._enter('read_bytes')
         if path not in self.files:
@@ -450,6 +480,9 @@ class _FakeFS:
         return self.files[path].encode()
 
     def list(self, path, *, include_hidden=False):
+        return self._rpc.list(lambda: self._list(path, include_hidden))
+
+    def _list(self, path, include_hidden):
         self._session.calls.append(('list', path, include_hidden))
         self._enter('list')
         if path not in self.dirs:
@@ -468,6 +501,9 @@ class _FakeFS:
         return [info for name, info in children.items() if include_hidden or not name.startswith('.')]
 
     def mkdir(self, path, *, recursive=True, mode=0o755):
+        return self._rpc.mkdir(lambda: self._mkdir(path, recursive))
+
+    def _mkdir(self, path, recursive):
         self._session.calls.append(('mkdir', path))
         self._enter('mkdir')
         if not recursive and posixpath.dirname(path) not in self.dirs:
@@ -477,6 +513,9 @@ class _FakeFS:
             path = posixpath.dirname(path)
 
     def remove(self, path, *, recursive=True):
+        return self._rpc.remove(lambda: self._remove(path, recursive))
+
+    def _remove(self, path, recursive):
         self._session.calls.append(('remove', path, recursive))
         self._enter('remove')
         inside = [p for p in (*self.files, *self.dirs) if p.startswith(path + '/')]
@@ -1557,9 +1596,9 @@ def test_read_file_returns_the_file_text(monkeypatch, logs):
     }
 
 
-def test_read_file_checks_the_size_then_reads_through_calls_that_carry_the_client_deadline(monkeypatch, logs):
-    # The SDK's streaming read has no deadline, so a half-open connection would hang it for good.
-    # stat and read_bytes are unary calls, bounded by the deadline IGlobal gives the client.
+def test_read_file_checks_the_size_then_reads_through_unary_calls_sent_with_a_deadline(monkeypatch, logs):
+    # The SDK's streaming read cannot be given a deadline, so a half-open connection would hang it
+    # for good. stat and read_bytes are unary calls, and the node sends each with one.
     session = _FakeSession('sb-1', files={'/home/tenki/notes.md': 'x'})
     inst, _ = _instance(monkeypatch, session)
     inst.read_file({'path': 'notes.md'})
@@ -1567,6 +1606,7 @@ def test_read_file_checks_the_size_then_reads_through_calls_that_carry_the_clien
         ('stat', '/home/tenki/notes.md'),
         ('read_bytes', '/home/tenki/notes.md'),
     ]
+    assert session.fs.deadlines == [('stat', 120), ('read_file', 120)]  # the default execution timeout
 
 
 def test_read_file_refuses_a_file_over_the_read_limit_without_fetching_it(monkeypatch, logs):
@@ -2098,6 +2138,46 @@ def test_every_control_plane_call_gets_a_deadline(monkeypatch, logs, exec_timeou
     assert constructed[0]['timeout'] == deadline
 
 
+@pytest.mark.parametrize(('exec_timeout', 'deadline'), [(45, 60), (300, 300)])
+def test_every_file_call_is_sent_with_a_deadline(monkeypatch, logs, exec_timeout, deadline):
+    # The SDK applies the client's deadline to control-plane calls only. A session's file calls go
+    # to its data plane, where the SDK passes none (tenki 1.0.6 and 1.4.0), and its file API takes
+    # no timeout: left alone, one stalled connection hangs the tool call for good.
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.md': 'x'})
+    inst, _ = _instance(monkeypatch, session, cfg={'exec_timeout_secs': exec_timeout})
+    assert inst.write_file({'path': 'new/deep/a.txt', 'content': 'a'})['success'] is True
+    assert inst.read_file({'path': 'notes.md'})['content'] == 'x'
+    assert 'error' not in inst.list_files({'path': '.'})
+    assert inst.make_directory({'path': 'made'})['success'] is True
+    assert inst.delete_path({'path': 'made'})['success'] is True
+    assert inst.run_code({'code': 'print(1)'})['exit_code'] == 0
+    sent = session.fs.deadlines
+    assert {name for name, _ in sent} == {'write_file', 'mkdir', 'stat', 'read_file', 'list', 'remove'}
+    assert {timeout for _, timeout in sent} == {deadline}
+
+
+def test_a_session_whose_file_calls_cannot_be_given_a_deadline_is_closed_instead_of_used(monkeypatch, logs):
+    # The deadline goes on a private part of the SDK. If a release moves it, the node must not carry
+    # on with file calls that can hang for good, and must not leave the VM it just created billing.
+    session = _FakeSession('sb-1')
+    del session.fs._rpc
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.run_command({'command': 'true'})
+    assert 'deadline on file calls' in result['error']
+    assert session.calls == ['close']
+    assert inst.IGlobal.session is None
+    assert any('deadline on file calls' in line for line in logs)
+
+
+def test_a_session_that_could_not_be_bounded_and_will_not_close_is_still_not_used(monkeypatch, logs):
+    session = _FakeSession('sb-1', close_error=mod.SandboxError('close refused'))
+    del session.fs._rpc
+    inst, _ = _instance(monkeypatch, session)
+    assert 'deadline on file calls' in inst.run_command({'command': 'true'})['error']
+    assert inst.IGlobal.session is None
+    assert any('close refused' in line for line in logs)
+
+
 @pytest.mark.parametrize(('tool', 'args'), [('run_command', {'command': 'sleep 999'}), ('run_code', {'code': 'x'})])
 def test_a_stalled_command_stream_is_cut_off_and_reported_as_a_timeout(monkeypatch, logs, tool, args):
     # Sandbox.exec waits on the output stream with no local limit, so a stream that stalls would
@@ -2349,6 +2429,99 @@ def test_an_error_the_sdk_did_classify_costs_no_look_at_the_session(monkeypatch,
     assert 'refresh' not in session.calls
 
 
+# What one read on a session Tenki had paused raised on SDK 1.4.0 (measured 2026-10-05, 2 seconds after
+# PAUSED). The text is about the VM's socket on Tenki's host, but it ends in "no such file or directory",
+# which is all the SDK goes by, so it arrives as the SDK's file-not-found error.
+_VSOCK_AS_A_MISSING_FILE = (
+    'read file failed: failed to read vsock CONNECT response: EOF (fallback exec: failed to connect to '
+    'vsock at /opt/cloud-hypervisor/data/instances/sandbox/sb-1/rootfs.img.vsock: dial unix /opt/'
+    'cloud-hypervisor/data/instances/sandbox/sb-1/rootfs.img.vsock: connect: no such file or directory)'
+)
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args', 'key', 'expected'),
+    [
+        ('read_file', {'path': 'notes.txt'}, 'content', 'kept'),
+        ('write_file', {'path': 'new.txt', 'content': 'x'}, 'success', True),
+        ('list_files', {'path': '.'}, 'truncated', False),
+        ('make_directory', {'path': 'made'}, 'success', True),
+        ('delete_path', {'path': 'notes.txt'}, 'success', True),
+    ],
+)
+def test_a_pause_the_sdk_reports_as_a_missing_file_is_still_resumed(monkeypatch, logs, tool, args, key, expected):
+    # Telling the agent "no such file" about a file that is there, on a session left paused, is the
+    # worst answer available: it would recreate work that was never lost.
+    session = _FakeSession(
+        'sb-1',
+        state='PAUSED',
+        paused_error=inst_mod.TenkiFileNotFoundError(_VSOCK_AS_A_MISSING_FILE),
+        files={'/home/tenki/notes.txt': 'kept'},
+    )
+    inst, client = _instance(monkeypatch, session)
+    result = getattr(inst, tool)(args)
+    assert 'error' not in result, result
+    assert result[key] == expected and result['session'] == 'resumed'
+    assert session.calls.count('resume') == 1 and len(client.create_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args', 'operation'),
+    [
+        ('read_file', {'path': 'notes.txt'}, 'stat'),
+        ('list_files', {'path': '.'}, 'list'),
+        ('delete_path', {'path': 'notes.txt'}, 'remove'),
+        ('make_directory', {'path': 'made'}, 'mkdir'),
+    ],
+)
+def test_a_missing_file_error_about_the_vm_link_is_not_reported_as_a_missing_path(
+    monkeypatch, logs, tool, args, operation
+):
+    # On a session that turns out to be running there is nothing to recover, and the error is still
+    # not about the agent's path: it gets the real text, once, and the call is not repeated.
+    session = _FakeSession(
+        'sb-1',
+        files={'/home/tenki/notes.txt': 'kept'},
+        fail={operation: inst_mod.TenkiFileNotFoundError(_VSOCK_AS_A_MISSING_FILE)},
+    )
+    inst, _ = _instance(monkeypatch, session)
+    error = getattr(inst, tool)(args)['error']
+    assert 'vsock' in error and not error.startswith('no such file or directory: ')
+    assert session.calls.count('refresh') == 1 and 'resume' not in session.calls
+    assert sum(1 for call in session.calls if call[0] == operation) == 1
+
+
+def test_a_missing_file_whose_own_path_contains_vsock_is_still_just_a_missing_file(monkeypatch, logs):
+    # The SDK builds stat's message from the path it was asked for. A file that really is missing
+    # must not cost a look at the session because of what the agent called it.
+    missing = inst_mod.TenkiFileNotFoundError('no such file or directory: /home/tenki/vsock_test.py')
+    session = _FakeSession('sb-1', fail={'stat': missing})
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.read_file({'path': 'vsock_test.py'})['error'] == 'no such file or directory: /home/tenki/vsock_test.py'
+    assert 'refresh' not in session.calls
+
+
+def test_write_file_still_creates_a_missing_parent_whose_name_contains_vsock(monkeypatch, logs):
+    # A guest that names the path in its error must not turn the agent's own folder name into
+    # "the VM link is down": the parent is created and the file written, as for any other name.
+    session = _FakeSession('sb-1')
+    session.fs._missing = lambda path: inst_mod.TenkiFileNotFoundError(f'open {path}: no such file or directory')
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.write_file({'path': 'vsock-notes/rootfs.img.vsock.txt', 'content': 'x'})
+    assert result == {'success': True, 'path': '/home/tenki/vsock-notes/rootfs.img.vsock.txt'}
+    assert 'refresh' not in session.calls
+
+
+def test_write_file_does_not_take_an_error_about_the_vm_link_for_a_missing_parent_directory(monkeypatch, logs):
+    # A missing parent is answered by creating it and writing again. This error only looks like one.
+    session = _FakeSession('sb-1', fail={'write_text': inst_mod.TenkiFileNotFoundError(_VSOCK_AS_A_MISSING_FILE)})
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.write_file({'path': 'new.txt', 'content': 'x'})
+    assert result['success'] is False and 'vsock' in result['error']
+    assert not [call for call in session.calls if call[0] == 'mkdir']
+    assert sum(1 for call in session.calls if call[0] == 'write_text') == 1
+
+
 def test_a_resume_tenki_refuses_at_first_is_asked_again_until_it_takes(monkeypatch, logs):
     # "Not yet" is not a failure. Reporting it would hand the agent an error for a session that is
     # about to be fine, at the moment every long-running pipeline reaches every max_duration.
@@ -2371,6 +2544,220 @@ def test_a_resume_that_keeps_being_refused_is_reported_and_the_session_kept(monk
     assert result['exit_code'] == -1 and 'still being torn down' in result['error']
     assert session.calls.count('resume') == 1 and len(client.create_calls) == 1
     assert inst.IGlobal.session is session
+
+
+class _Clock:
+    """In place of the time module in IGlobal: a clock that only moves when told to, or slept on."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _refusing(session, clock, seconds_per_ask=10):
+    """Make each resume of ``session`` take ``seconds_per_ask`` on ``clock``, as a refusal does (measured: about 10)."""
+    resume = session.resume
+
+    def slow_resume():
+        clock.now += seconds_per_ask
+        resume()
+
+    session.resume = slow_resume
+
+
+def test_the_resume_budget_runs_from_the_first_ask_and_is_not_renewed_by_each_one(monkeypatch, logs):
+    # 90 seconds in all, asking every 5: with refusals that take 10 seconds each, the asks end at
+    # 10, 25, 40, 55, 70, 85 and 100 seconds, and the seventh is the last.
+    clock = _Clock()
+    monkeypatch.setattr(mod, 'time', clock)
+    session = _FakeSession('sb-1', state='PAUSED', resume_refusals=1000)
+    _refusing(session, clock)
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.read_file({'path': 'notes.txt'})
+    assert 'still being torn down' in result['error']
+    assert session.calls.count('resume') == 7
+    assert clock.sleeps == [5] * 6
+    assert clock.now - 1000.0 == 100
+
+
+def test_calls_queued_behind_a_refused_resume_share_its_budget(monkeypatch, logs):
+    # Parallel calls wait on the session lock while one of them resumes. If each then started a
+    # budget of its own, six calls would take nine minutes to fail, with shutdown waiting behind them.
+    clock = _Clock()
+    monkeypatch.setattr(mod, 'time', clock)
+    session = _FakeSession('sb-1', state='PAUSED', resume_refusals=1000, files={'/home/tenki/notes.txt': 'kept'})
+    _refusing(session, clock)
+    inst, _ = _instance(monkeypatch, session)
+    assert 'still being torn down' in inst.read_file({'path': 'notes.txt'})['error']
+    spent = session.calls.count('resume')
+    # The next call still asks, once: Tenki may have finished in the meantime.
+    assert 'still being torn down' in inst.read_file({'path': 'notes.txt'})['error']
+    assert session.calls.count('resume') == spent + 1
+    session._resume_refusals = 0
+    assert inst.read_file({'path': 'notes.txt'})['session'] == 'resumed'
+
+
+def test_the_next_pause_gets_a_resume_budget_of_its_own(monkeypatch, logs):
+    clock = _Clock()
+    monkeypatch.setattr(mod, 'time', clock)
+    session = _FakeSession('sb-1', state='PAUSED', resume_refusals=1000, files={'/home/tenki/notes.txt': 'kept'})
+    _refusing(session, clock)
+    inst, _ = _instance(monkeypatch, session)
+    assert 'still being torn down' in inst.read_file({'path': 'notes.txt'})['error']
+    session._resume_refusals = 0
+    assert inst.read_file({'path': 'notes.txt'})['session'] == 'resumed'
+    # Hours later the session reaches its lifetime again, and Tenki refuses twice before it resumes.
+    clock.now += 7200
+    session.state, session._resume_refusals = 'PAUSED', 2
+    asked = session.calls.count('resume')
+    result = inst.read_file({'path': 'notes.txt'})
+    assert result.get('content') == 'kept' and result['session'] == 'resumed', result
+    assert session.calls.count('resume') == asked + 3
+
+
+def test_a_resume_that_took_ends_its_budget_so_a_pause_soon_after_starts_a_new_one(monkeypatch, logs):
+    # With a one minute lifetime the next pause comes about a minute after the last resume, well
+    # within a budget's length of the old one. It must not inherit what is left of that.
+    clock = _Clock()
+    monkeypatch.setattr(mod, 'time', clock)
+    session = _FakeSession('sb-1', state='PAUSED', resume_refusals=5, files={'/home/tenki/notes.txt': 'kept'})
+    _refusing(session, clock)
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.read_file({'path': 'notes.txt'})['session'] == 'resumed'  # after 85 of the 90 seconds
+    clock.now += 60
+    session.state, session._resume_refusals = 'PAUSED', 3
+    result = inst.read_file({'path': 'notes.txt'})
+    assert result.get('content') == 'kept' and result['session'] == 'resumed', result
+
+
+def test_a_call_long_after_a_spent_budget_gets_a_budget_of_its_own(monkeypatch, logs):
+    # Sharing is for the calls that were waiting behind the one that gave up. A call that comes later
+    # is a new attempt, and waits like the first did.
+    clock = _Clock()
+    monkeypatch.setattr(mod, 'time', clock)
+    session = _FakeSession('sb-1', state='PAUSED', resume_refusals=1000)
+    _refusing(session, clock)
+    inst, _ = _instance(monkeypatch, session)
+    assert 'still being torn down' in inst.read_file({'path': 'notes.txt'})['error']
+    spent = session.calls.count('resume')
+    clock.now += 70  # the budget ran out 80 seconds ago by now: still within a budget's length of it
+    assert 'still being torn down' in inst.read_file({'path': 'notes.txt'})['error']
+    assert session.calls.count('resume') == spent + 1
+    clock.now += 90
+    assert 'still being torn down' in inst.read_file({'path': 'notes.txt'})['error']
+    assert session.calls.count('resume') == spent + 1 + 7
+
+
+def test_a_resume_refused_for_a_named_reason_ends_the_budget_too(monkeypatch, logs):
+    # Otherwise what is left of it would be all the next pause gets: one ask, where three refusals
+    # are normal.
+    clock = _Clock()
+    monkeypatch.setattr(mod, 'time', clock)
+    session = _FakeSession('sb-1', state='PAUSED', files={'/home/tenki/notes.txt': 'kept'})
+    answers = [mod.SandboxError(_NOT_YET), inst_mod.PermissionDeniedError('workspace suspended')]
+    resume = session.resume
+
+    def refused_then_named():
+        clock.now += 10
+        if answers:
+            session.calls.append('resume')
+            raise answers.pop(0)
+        resume()
+
+    session.resume = refused_then_named
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.run_command({'command': 'ls'})['error'] == 'workspace suspended'
+    # The workspace is restored and the session resumed from Tenki's console, not through the node.
+    session.state = 'RUNNING'
+    assert 'session' not in inst.read_file({'path': 'notes.txt'})
+    # 100 seconds after the first ask it pauses again.
+    clock.now = 1100.0
+    session.state, session._resume_refusals = 'PAUSED', 3
+    result = inst.read_file({'path': 'notes.txt'})
+    assert result.get('content') == 'kept' and result['session'] == 'resumed', result
+
+
+def test_a_replacement_session_does_not_inherit_a_spent_resume_budget(monkeypatch, logs):
+    clock = _Clock()
+    monkeypatch.setattr(mod, 'time', clock)
+    old = _FakeSession('sb-old', state='PAUSED', resume_refusals=1000)
+    _refusing(old, clock)
+    fresh = _FakeSession('sb-fresh', exec_result=_CommandResult(argv=['bash'], exit_code=0, stdout=b'ok\n'))
+    _refusing(fresh, clock)
+    inst, _ = _instance(monkeypatch, old, fresh)
+    assert 'still being torn down' in inst.run_command({'command': 'ls'})['error']
+    old.state, old._exec_error = 'TERMINATED', mod.SessionTerminatedError('session_terminated')
+    assert inst.run_command({'command': 'ls'})['session'] == 'replaced'
+    # The new session is paused by hand moments later, and Tenki refuses its resume three times.
+    fresh.state, fresh._resume_refusals = 'PAUSED', 3
+    result = inst.run_command({'command': 'ls'})
+    assert result.get('stdout') == 'ok\n' and result['session'] == 'resumed', result
+
+
+def test_a_pipeline_that_is_started_again_starts_with_no_resume_budget_left_over(monkeypatch, logs):
+    clock = _Clock()
+    monkeypatch.setattr(mod, 'time', clock)
+    session = _FakeSession('sb-1', state='PAUSED', resume_refusals=1000)
+    _refusing(session, clock)
+    inst, _ = _instance(monkeypatch, session)
+    assert 'still being torn down' in inst.run_command({'command': 'ls'})['error']
+    assert inst.IGlobal._resume_retry_until is not None
+    inst.IGlobal.beginGlobal()
+    assert inst.IGlobal._resume_retry_until is None
+
+
+def test_a_resume_that_takes_during_shutdown_is_not_waited_on(monkeypatch, logs):
+    # The ask was already on its way when shutdown began. Waiting up to three minutes for the VM to
+    # come up would hold the lock endGlobal needs in order to close that same VM.
+    session = _FakeSession('sb-1', state='PAUSED')
+    inst, _ = _instance(monkeypatch, session)
+    resume = session.resume
+
+    def resume_as_shutdown_begins():
+        inst.IGlobal._ending = True
+        resume()
+
+    session.resume = resume_as_shutdown_begins
+    result = inst.run_command({'command': 'ls'})
+    assert 'shutting down' in result['error']
+    assert 'wait_ready' not in session.calls and inst.IGlobal.session is session
+
+
+def test_a_paused_session_is_not_resumed_once_the_pipeline_is_shutting_down(monkeypatch, logs):
+    # endGlobal is about to close the session. Resuming it first would restart a VM only to end it,
+    # and the wait would hold the session lock that shutdown is waiting for.
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.read_file({'path': 'notes.txt'})['content'] == 'kept'
+    session.state = 'PAUSED'
+    inst.IGlobal._ending = True
+    result = inst.read_file({'path': 'notes.txt'})
+    assert 'shutting down' in result['error'] and 'resume' not in session.calls
+
+
+def test_resume_retries_stop_when_the_pipeline_starts_shutting_down(monkeypatch, logs):
+    clock = _Clock()
+    monkeypatch.setattr(mod, 'time', clock)
+    session = _FakeSession('sb-1', state='PAUSED', resume_refusals=1000)
+    _refusing(session, clock)
+    inst, _ = _instance(monkeypatch, session)
+    sleep = clock.sleep
+
+    def sleep_until_shutdown_begins(seconds):
+        sleep(seconds)
+        inst.IGlobal._ending = True
+
+    clock.sleep = sleep_until_shutdown_begins
+    result = inst.run_command({'command': 'ls'})
+    assert 'shutting down' in result['error']
+    assert session.calls.count('resume') == 1 and inst.IGlobal.session is session
 
 
 def test_a_resume_refused_for_a_reason_tenki_names_is_not_asked_again(monkeypatch, logs):
@@ -2532,13 +2919,14 @@ def test_a_command_started_by_the_retry_and_cut_again_is_reported_the_same_way(m
     assert result['session'] == 'resumed' and len(session.processes) == 1
 
 
-def test_a_command_the_node_stopped_at_its_deadline_is_reported_as_timed_out(monkeypatch, logs):
-    # The one failure after a start that is not "cut off, check what it did": the wait ran out and
-    # the process was killed.
+def test_a_command_with_no_result_by_the_nodes_own_deadline_is_reported_as_timed_out(monkeypatch, logs):
+    # The one failure after a start that is not "cut off, check what it did": no result arrived by
+    # the node's own limit, which lies past the execution timeout at which Tenki stops a command.
     session = _FakeSession('sb-1', stalls='result')
     inst, _ = _instance(monkeypatch, session)
     result = inst.run_command({'command': 'sleep 999'})
     assert result['timed_out'] is True and 'not run again' not in result['error']
+    assert 'no result within 150s' in result['error'] and 'kill' in result['error']
     assert ('kill',) in session.calls
 
 
@@ -2554,17 +2942,36 @@ def test_the_command_after_an_interrupted_one_runs_normally(monkeypatch, logs):
 @pytest.mark.parametrize(
     ('tool', 'args'), [('run_command', {'command': 'make deploy'}), ('run_code', {'code': 'print(1)'})]
 )
-def test_a_command_cut_off_by_a_terminated_session_is_run_again_on_the_fresh_one(monkeypatch, logs, tool, args):
-    # Nothing of the first run survives a terminated session, so starting over repeats nothing inside
-    # the sandbox. (What a command did outside it, a deploy say, is the agent's to judge either way.)
+def test_a_command_cut_off_by_a_terminated_session_is_not_run_again_either(monkeypatch, logs, tool, args):
+    # Nothing of the first run is left inside a terminated sandbox, but what it did outside (a deploy,
+    # a request to some service) is done, and a second run would do it twice. The node never starts a
+    # command a second time on its own: the agent is told, and decides.
     ended = mod.SessionTerminatedError('session_terminated')
     dead = _FakeSession('sb-dead', run_error=ended)
     dead.refresh = lambda: SimpleNamespace(id=dead.id, state='TERMINATED')
     fresh = _FakeSession('sb-fresh', exec_result=_CommandResult(argv=['bash'], exit_code=0, stdout=b'ok\n'))
-    inst, _ = _instance(monkeypatch, dead, fresh)
+    inst, client = _instance(monkeypatch, dead, fresh)
     result = getattr(inst, tool)(args)
-    assert result['session'] == 'replaced' and result['stdout'] == 'ok\n'
-    assert len(_execs(dead)) == 1 and len(_execs(fresh)) == 1
+    assert result['exit_code'] == -1 and result['timed_out'] is False and result['session'] == 'replaced'
+    assert 'ended while this command was running' in result['error'] and 'not run again' in result['error']
+    assert 'outside the sandbox' in result['error'] and 'paused' not in result['error']
+    assert len(_execs(dead)) == 1 and len(_execs(fresh)) == 0
+    # No VM is created for a call that will not use it. The next command starts the fresh one.
+    assert len(client.create_calls) == 1
+    after = inst.run_command({'command': 'ls'})
+    assert after['stdout'] == 'ok\n' and 'session' not in after and len(client.create_calls) == 2
+
+
+def test_a_started_command_whose_recovery_ran_past_the_deadline_is_not_reported_as_a_plain_timeout(monkeypatch, logs):
+    # The look at the session after a cut-off command is a network call too, and can hit the client
+    # deadline. That is a timeout of the look, not of the command, which had started all the same.
+    cut = mod.SessionTerminatedError('session_terminated:terminate_requested: termination requested')
+    session = _FakeSession('sb-1', run_error=cut, refresh_error=mod.CommandTimeoutError('Deadline Exceeded'))
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.run_command({'command': 'make deploy'})
+    assert result['timed_out'] is False
+    assert 'Deadline Exceeded' in result['error'] and 'not run again' in result['error'], result['error']
+    assert 'part of its work may be done' in result['error']
 
 
 @pytest.mark.parametrize(

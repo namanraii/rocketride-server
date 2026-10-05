@@ -30,7 +30,8 @@ Exposes the agent tools, all operating on one shared, lazily created Tenki sessi
 Every tool is tagged with a tool group (see tool_groups.py), and only the groups named
 in the ``tenki.toolGroups`` config field are published. Each tool reaches the session
 through ``IGlobal.call_with_session``, which resumes a paused session and replaces a
-terminated one.
+terminated one. A command whose start the sandbox has confirmed is the exception: the node does
+not start it again (see ``_StartedOnce``).
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ from ai.common.utils import normalize_tool_input, optional_bool, optional_int
 from tenki import CommandTimeoutError, PermissionDeniedError, SandboxError
 from tenki import FileNotFoundError as TenkiFileNotFoundError  # also subclasses the builtin it shadows
 
-from .IGlobal import CommandNotStartedError, IGlobal, SessionEndedError
+from .IGlobal import CommandNotStartedError, IGlobal, SessionEndedError, about_the_vm_link
 from .tool_groups import tenki_tool
 
 #: The session's home and default working directory, and the only root Tenki's file API accepts.
@@ -91,8 +92,9 @@ _RESULT_GRACE_SECS = 30
 # apt-get install, pytest -v, a build) runs to completion and is merely truncated. It sits above the
 # most the agent can ever be shown (1M characters, at most 4 MB of UTF-8), so it never cuts into that.
 _OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024
-# The largest file read_file fetches. It reads through the SDK's unary ReadFile call, which carries
-# the client deadline; the streaming read does not, so a half-open connection could hang it for good.
+# The largest file read_file fetches. It reads through the SDK's unary ReadFile call, which the node
+# sends with a deadline (see file_deadline); the streaming read has none, so a half-open connection
+# could hang it for good.
 # ReadFile takes no length and returns the whole file, so the size is checked with stat first and a
 # larger file is refused without being fetched. The limit sits just under gRPC's default 4 MiB receive
 # limit, which the SDK's channels keep, so a file that grows between the two calls fails there rather
@@ -110,7 +112,7 @@ _SESSION_EVENT = {
     'description': (
         'Present only when the sandbox session had to be recovered during this call. "resumed": it had '
         'been paused, and memory and /home/tenki survived but /tmp was cleared. "replaced": it had ended, '
-        'so this call ran on a fresh, empty session and earlier files and installed packages are gone.'
+        'so earlier files and installed packages are gone and work continues on a fresh, empty session.'
     ),
 }
 
@@ -184,7 +186,7 @@ def _normalize_path(path) -> str:
 
 def _fs_error(error: Exception, path: str) -> str:
     """A readable message for a failed file operation."""
-    if isinstance(error, TenkiFileNotFoundError):
+    if isinstance(error, TenkiFileNotFoundError) and not about_the_vm_link(error):
         return f'no such file or directory: {path}'
     if isinstance(error, PermissionDeniedError):
         return f'{error} (file operations are limited to paths under /home/tenki)'
@@ -377,17 +379,31 @@ class _OutputGuard:
             reader.join()
 
 
-class CommandInterruptedError(SandboxError):
-    """A command had started when its call lost the session, and it was not started again."""
+class ResultTimeoutError(CommandTimeoutError):
+    """No result arrived for a command within the node's own limit (see ``_run_process``)."""
 
-    def __init__(self, reason: str | None = None) -> None:
-        if reason is None:
+
+class CommandInterruptedError(SandboxError):
+    """A command had started when its call lost the session, and it was not started again.
+
+    ``recovery`` is how the session came back, if it did; ``reason`` is what ended the call otherwise.
+    """
+
+    def __init__(self, recovery: str | None = None, reason: str | None = None) -> None:
+        if recovery == 'resumed':
             # Measured on real sessions paused at max_duration: the command's process was gone within two
             # seconds of the resume and did no further work, so this says "cut off", not "still running".
             message = (
                 'the sandbox was paused while this command was running, and has been resumed. The command was '
                 'cut off part-way and was not run again, so part of its work may be done. Check what it did '
                 'before running it again.'
+            )
+        elif recovery == 'replaced':
+            message = (
+                'the sandbox session ended while this command was running, so its files are gone, along with '
+                'whatever the command had done inside the sandbox. The command was not run again: the next '
+                'command or file write starts a fresh, empty sandbox. Anything the command did outside the '
+                'sandbox is still done, so check that before running it again.'
             )
         else:
             message = (
@@ -401,13 +417,19 @@ class CommandInterruptedError(SandboxError):
 class _StartedOnce:
     """Runs ``run(session, started)`` for ``call_with_session`` without ever starting one command twice.
 
-    ``call_with_session`` calls again after it recovers the session. That is right when the
-    command never started, and when the session was replaced: nothing of the first run exists on
-    a fresh VM. On a resumed session it is wrong once the command had started: the files are still
-    there, and so is whatever the command did before the pause cut it off. Measured on real VMs,
-    the cut-off process was still listed for about a second after the resume, did no further work
-    and was gone after that, so running the command again repeats the part already done. ``run``
-    appends to ``started`` once its command has.
+    ``call_with_session`` calls again after it recovers the session. That is right when the command
+    never started. Once it had, running it again repeats work. On a resumed session the files are
+    still there, and so is whatever the command did before the pause cut it off: measured on real
+    VMs, the cut-off process was still listed for about a second after the resume, did no further
+    work and was gone after that. On a replaced session nothing of the first run is left inside the
+    sandbox, but whatever it did outside (a deploy, a request to some service) is done. So once a
+    command's start is confirmed, the node does not start it again. ``run`` appends to ``started``
+    when that happens, and ``recovered``, passed as ``on_recovery``, stops the retry from then on.
+
+    Two things this does not cover. A start the sandbox never confirmed is treated as not run and is
+    sent again after a resume (see ``CommandNotStartedError``). And the SDK itself sends a start
+    again when the first got no answer at all (``Process._pump`` in the SDK), below anything the node
+    sees.
 
     The same fact shapes what the agent is told when the call fails for good (see ``reported``).
     """
@@ -418,22 +440,30 @@ class _StartedOnce:
         self.started = []
 
     def __call__(self, session):
-        if self.started and self._recoveries and self._recoveries[-1] == 'resumed':
-            raise CommandInterruptedError()
         return self._run(session, self.started)
+
+    def recovered(self, recovery: str) -> None:
+        """Note how the session was recovered, and stop the retry if the command had started.
+
+        Raised here, before the retry asks for a session, so that a session that ended is not
+        replaced by a new VM for a call that will not use it.
+        """
+        self._recoveries.append(recovery)
+        if self.started:
+            raise CommandInterruptedError(recovery)
 
     def reported(self, error: SandboxError) -> SandboxError:
         """The error to hand the agent for a call that failed.
 
-        A command that had started is never reported as simply failed. Whatever ended the call (the
+        A command that had started is not reported as simply failed. Whatever ended the call (the
         session still pausing, a resume Tenki would not take yet, Tenki's own "termination
-        requested"), part of the command's work may be done, and an agent told only the cause
-        repeats it blind. The exception is the node's own deadline, which kills the command before
-        it reports.
+        requested", a look at the session that ran past its deadline), part of the command's work
+        may be done, and an agent told only the cause repeats it blind. The exception is the node's
+        own limit on the wait for a result, which is reported as the timeout it is.
         """
-        if not self.started or isinstance(error, (CommandInterruptedError, CommandTimeoutError)):
+        if not self.started or isinstance(error, (CommandInterruptedError, ResultTimeoutError)):
             return error
-        return CommandInterruptedError(str(error))
+        return CommandInterruptedError(reason=str(error))
 
 
 def _run_process(session, argv, timeout: int, started: list):
@@ -446,10 +476,10 @@ def _run_process(session, argv, timeout: int, started: list):
     Sandbox.exec waits on the output stream with no local limit, so a stream that stalls (on a
     half-open connection, say) would hang the tool call for good. Tenki stops the command at
     ``timeout`` and reports that on the result; the grace period leaves room for the report, so a
-    wait that still runs out means the stream stalled, and it is reported as a timeout. That wait
-    kills the command when it runs out. Waiting for the start does not: the SDK gives up after 30
-    seconds and cancels nothing, so a start that arrived late would still run the command. It is
-    cancelled here instead.
+    wait that still runs out means the stream stalled, and it is reported as a timeout. The SDK
+    sends a kill when that wait runs out, down the same stream, so it may not arrive. Waiting for
+    the start sends nothing: the SDK gives up after 30 seconds and cancels nothing, so a start that
+    arrived late would still run the command. A kill is sent here instead.
     """
     limit = timeout + _RESULT_GRACE_SECS
     process = session.start(*argv, timeout=timeout)
@@ -463,14 +493,18 @@ def _run_process(session, argv, timeout: int, started: list):
     try:
         result = process.wait(timeout=limit)
     except TimeoutError as e:
-        raise CommandTimeoutError(f'the sandbox reported no result within {limit}s, so the command was stopped') from e
+        raise ResultTimeoutError(
+            f'the sandbox reported no result within {limit}s, {_RESULT_GRACE_SECS}s past the execution timeout '
+            'at which Tenki stops a command. A kill was sent as well, but over a stalled connection it may '
+            'not have arrived.'
+        ) from e
     finally:
         guard.stop()
     return result, guard.killed
 
 
 def _with_session_event(output: dict, recoveries: list) -> dict:
-    """Tell the agent when its call ran on a resumed or a replaced session (see _SESSION_EVENT)."""
+    """Tell the agent when the session was resumed or replaced during its call (see _SESSION_EVENT)."""
     if recoveries:
         output['session'] = recoveries[-1]
     return output
@@ -564,7 +598,7 @@ class IInstance(IInstanceBase):
         recoveries = []
         once = _StartedOnce(run, recoveries)
         try:
-            result, killed = self.IGlobal.call_with_session(once, on_recovery=recoveries.append)
+            result, killed = self.IGlobal.call_with_session(once, on_recovery=once.recovered)
         except SandboxError as e:
             return _with_session_event(_exec_error(once.reported(e)), recoveries)
         return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars, killed=killed), recoveries)
@@ -628,7 +662,7 @@ class IInstance(IInstanceBase):
         recoveries = []
         once = _StartedOnce(run, recoveries)
         try:
-            result, killed = self.IGlobal.call_with_session(once, on_recovery=recoveries.append)
+            result, killed = self.IGlobal.call_with_session(once, on_recovery=once.recovered)
         except SandboxError as e:
             return _with_session_event(_exec_error(once.reported(e)), recoveries)
         return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars, killed=killed), recoveries)
@@ -669,7 +703,9 @@ class IInstance(IInstanceBase):
         def write(session):
             try:
                 session.fs.write_text(path, content)
-            except TenkiFileNotFoundError:
+            except TenkiFileNotFoundError as e:
+                if about_the_vm_link(e):
+                    raise
                 # The parent directory is missing: create it, with its own parents, and write again.
                 session.fs.mkdir(posixpath.dirname(path))
                 session.fs.write_text(path, content)

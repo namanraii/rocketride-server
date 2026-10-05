@@ -60,6 +60,7 @@ from reading it.
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 import uuid
@@ -71,6 +72,7 @@ from rocketlib import IGlobalBase, OPEN_MODE, debug, warning
 from tenki import (
     Client,
     CommandTimeoutError,
+    FileNotFoundError as TenkiFileNotFoundError,
     InvalidStateError,
     Sandbox,
     SandboxError,
@@ -80,11 +82,12 @@ from tenki import (
     WaitReadyFailedError,
 )
 
+from .file_deadline import bound_file_calls
 from .tool_groups import DEFAULT_GROUPS, normalize_groups, unknown_groups
 
-# The deadline for every control-plane call: create, refresh, resume, close, and git operations.
-# Git clones share it, so it never drops below the execution timeout, and the floor keeps a small
-# execution timeout from starving session creation.
+# The deadline for every control-plane call (create, refresh, resume, close, and git operations) and
+# for every file call. Git clones share it, so it never drops below the execution timeout, and the
+# floor keeps a small execution timeout from starving session creation.
 _MIN_RPC_TIMEOUT_SECS = 60
 
 # How long recovery waits for a resumed session to run again: the SDK's own readiness budget.
@@ -93,6 +96,7 @@ _READY_WAIT_SECS = 180
 # How long recovery keeps asking for a resume that Tenki refuses with its catch-all "not yet", and the
 # pause between asks. Measured after a pause at max_duration: one to three refusals ("paused source is
 # still being torn down, retry shortly") over 18 to 48 seconds, each taking about 10 seconds itself.
+# No new ask starts once the budget is spent, so a call can wait about one ask longer than this.
 _RESUME_RETRY_SECS = 90
 _RESUME_RETRY_PAUSE_SECS = 5
 
@@ -134,9 +138,28 @@ class SessionUnavailableError(SandboxError):
 class CommandNotStartedError(CommandTimeoutError):
     """The sandbox never confirmed that a command had started, so the command was cancelled.
 
-    Nothing ran. That is what a command sent to a paused session looks like when no error names the
-    pause, so it is one of the failures that prompt a look at the session's state.
+    That is what a command sent to a paused session looks like when no error names the pause, so it
+    is one of the failures that prompt a look at the session's state. The node treats the command as
+    not run and, if the session turns out to have been paused, runs it after the resume.
     """
+
+
+# How Tenki's host words a failure to reach a VM's socket, in both forms measured. Matched as a phrase
+# rather than as the bare word "vsock", which a file or folder the agent named could contain: the
+# SDK builds stat's own "no such file" message from the path it was asked for.
+_VM_LINK_DOWN = re.compile(r'failed to (?:connect to|read) vsock')
+
+
+def about_the_vm_link(error: Exception) -> bool:
+    """Whether a "no such file" error is about Tenki's own socket to the VM, not a path inside it.
+
+    The SDK classes any error whose text contains "no such file or directory" as a missing file.
+    Measured on a session Tenki had paused, a read failed with "failed to read vsock CONNECT
+    response ... failed to connect to vsock at ... rootfs.img.vsock: connect: no such file or
+    directory": the missing thing is the paused VM's socket on Tenki's host. Passing that on as
+    "no such file: <the agent's path>" would tell the agent a file was gone when it was not.
+    """
+    return isinstance(error, TenkiFileNotFoundError) and _VM_LINK_DOWN.search(str(error)) is not None
 
 
 def _may_hide_a_pause(error: SandboxError) -> bool:
@@ -144,10 +167,11 @@ def _may_hide_a_pause(error: SandboxError) -> bool:
 
     Tenki does not always name a pause. Measured on real sessions it had paused: a file read came
     back as an infrastructure error the SDK has no class for ("dial guest-agent stream ... failed to
-    connect to vsock"), and a command simply never started. An error the SDK did classify, such as
-    a missing file, is an answer in its own right and costs no extra call.
+    connect to vsock"), or as one the SDK mistakes for a missing file (see ``about_the_vm_link``),
+    and a command simply never started. Any other error the SDK did classify, such as a file that
+    really is missing, is an answer in its own right and costs no extra call.
     """
-    return type(error) is SandboxError or isinstance(error, CommandNotStartedError)
+    return type(error) is SandboxError or isinstance(error, CommandNotStartedError) or about_the_vm_link(error)
 
 
 def _int_or(value, default: int, *, lo: int, hi: int) -> int:
@@ -187,6 +211,9 @@ class IGlobal(IGlobalBase):
     # Set once this run asks Tenki for a session, whether or not the create succeeds: only then can a
     # session carrying the run's tag exist for endGlobal to look for.
     _create_attempted: bool = False
+    # When, on time.monotonic(), asking again for a refused resume stops. Read and written under the
+    # session lock. It is one budget for every call waiting on the same resume, not one each: see _resume.
+    _resume_retry_until: float | None = None
 
     rpc_timeout_secs: int = 120
     image: str = ''
@@ -205,6 +232,7 @@ class IGlobal(IGlobalBase):
         self._session_lock = threading.Lock()
         self._ending = False
         self._create_attempted = False
+        self._resume_retry_until = None
         self._run_tag = f'run-{uuid.uuid4().hex[:12]}'
 
         cfg = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
@@ -246,6 +274,7 @@ class IGlobal(IGlobalBase):
         self.rpc_timeout_secs = max(self.exec_timeout_secs, _MIN_RPC_TIMEOUT_SECS)
         # Without a deadline, a half-open connection would hang create, refresh, resume and close,
         # all of which run under the session lock, and endGlobal behind them while the VM bills.
+        # The client applies it to those calls only; each session's file calls get it in _create_session.
         self.client = Client(auth_token=apikey, base_url=base_url, timeout=self.rpc_timeout_secs)
 
     def get_session(self) -> Sandbox:
@@ -287,7 +316,7 @@ class IGlobal(IGlobalBase):
             create_kwargs['image'] = self.image
         self._create_attempted = True
         try:
-            return self.client.create(**create_kwargs)
+            session = self.client.create(**create_kwargs)
         except (WaitReadyFailedError, TemplateRuntimeFailedError) as e:
             self._close_left_running(e)
             raise
@@ -295,6 +324,23 @@ class IGlobal(IGlobalBase):
             # The SDK re-raises its readiness wait's own plain RuntimeError when the new sandbox went
             # straight to a terminal state. There is nothing left running to close.
             raise SessionUnavailableError(f'the new sandbox session did not start: {e}') from e
+        try:
+            # The client's deadline does not reach a session's file calls (see file_deadline).
+            bound_file_calls(session, self.rpc_timeout_secs)
+        except AttributeError as e:
+            # Only an SDK whose file API changed shape gets here. Its file calls could hang for good,
+            # so the session is closed rather than used, and not left billing.
+            message = (
+                'tool_tenki cannot put a deadline on file calls with this version of the Tenki SDK, '
+                'so the new sandbox session was closed without being used'
+            )
+            warning(f'tool_tenki: {message} ({e})')
+            try:
+                session.close()
+            except Exception as close_error:
+                warning(f'tool_tenki: could not close that session: {close_error}')
+            raise SessionUnavailableError(message) from e
+        return session
 
     def _close_left_running(self, error: Exception) -> None:
         """Close the sandbox a failed create left running, so it stops billing.
@@ -395,6 +441,12 @@ class IGlobal(IGlobalBase):
                 return self._drop_session(session, state, replace=replace)
             if state == 'PAUSED':
                 self._resume(session)
+                if self._ending:
+                    # The ask was on its way when shutdown began. endGlobal is waiting on this lock
+                    # to close the session, so it is not made to wait for the VM to come up first.
+                    raise SessionUnavailableError(
+                        'tool_tenki: the pipeline is shutting down, so the resumed sandbox session is not waited for'
+                    )
                 try:
                     session.wait_ready(timeout=_READY_WAIT_SECS)
                 except (RuntimeError, TimeoutError) as e:
@@ -418,18 +470,43 @@ class IGlobal(IGlobalBase):
         at the moment every long-running pipeline reaches every max_duration. An error with a class
         of its own means something else and is raised at once; so is the catch-all once
         ``_RESUME_RETRY_SECS`` have passed, so that a call never waits on Tenki without bound.
+
         Called with the session lock held, as a resume must be: parallel calls wait for this one.
+        They share its budget. A call that reaches this point while a spent budget is still recent
+        asks once and reports, instead of starting a wait of its own behind the last, which would
+        add up to minutes across a wave of calls, with ``endGlobal`` waiting on the same lock. For the
+        same reason no new ask starts once the pipeline is shutting down: ``endGlobal`` closes the
+        session, and a resume would only start a VM for it to end. An ask already on its way is
+        not interrupted.
+
+        The budget belongs to one pause. It ends when the resume takes, when Tenki refuses with a
+        reason of its own, and when the session is dropped. One case is left: a spent budget is
+        still shared for its own length afterwards, so a session resumed from outside the node and
+        paused again within that time gets a single ask.
         """
-        deadline = time.monotonic() + _RESUME_RETRY_SECS
+        now = time.monotonic()
+        if self._resume_retry_until is None or now >= self._resume_retry_until + _RESUME_RETRY_SECS:
+            self._resume_retry_until = now + _RESUME_RETRY_SECS
         while True:
+            if self._ending:
+                raise SessionUnavailableError(
+                    'tool_tenki: the pipeline is shutting down, so the paused sandbox session is not resumed'
+                )
             try:
                 session.resume()
-                return
             except SandboxError as e:
-                if type(e) is not SandboxError or time.monotonic() >= deadline:
+                if type(e) is not SandboxError:
+                    # A refusal with a reason of its own ends this wait. What is left of the budget
+                    # must not be all that a later pause gets.
+                    self._resume_retry_until = None
+                    raise
+                if time.monotonic() >= self._resume_retry_until:
                     raise
                 debug(f'tool_tenki: resume of {session.id} not accepted yet ({e}); asking again')
                 time.sleep(_RESUME_RETRY_PAUSE_SECS)
+            else:
+                self._resume_retry_until = None
+                return
 
     def _drop_session(self, session: Sandbox, state: str | None, *, replace: bool) -> str:
         """Forget a session that has ended, so the next ``get_session`` creates a fresh one.
@@ -448,6 +525,7 @@ class IGlobal(IGlobalBase):
         self.session_epoch += 1
         self.last_replacement_epoch = self.session_epoch
         self.last_recovery = 'replaced'
+        self._resume_retry_until = None
         # A warning rather than debug output: the next call pays for a new VM and starts empty.
         warning(f'tool_tenki: session {session.id} is {state or "gone"}; the next call starts a new, empty session')
         if not replace:
