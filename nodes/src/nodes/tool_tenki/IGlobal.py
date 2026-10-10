@@ -268,6 +268,23 @@ def _secret_settings(cfg) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return policies, domains
 
 
+def _outlives_the_session(exec_timeout_secs: int, max_duration_minutes: int) -> str | None:
+    """The warning for a command allowed to run as long as the session lives, or None.
+
+    Tenki pauses a session at max_duration and the pause cuts a running command off, so such a command
+    can never finish. One that starts late in a session's period can be cut off too; this is the case
+    that holds every time.
+    """
+    if exec_timeout_secs < max_duration_minutes * 60:
+        return None
+    return (
+        f'tool_tenki: exec_timeout_secs ({exec_timeout_secs}s) is not shorter than max_duration_minutes '
+        f'({max_duration_minutes} min). Tenki pauses the session at max_duration and the pause cuts a running '
+        'command off, so a command that needs the full execution timeout can never finish. Raise '
+        'max_duration_minutes or lower exec_timeout_secs.'
+    )
+
+
 def _int_or(value, default: int, *, lo: int, hi: int) -> int:
     try:
         n = int(value)
@@ -319,7 +336,8 @@ class IGlobal(IGlobalBase):
     cpu_cores: int = 2
     memory_mb: int = 4096
     disk_size_gb: int = 5
-    max_duration_minutes: int = 15
+    max_duration_minutes: int = 60
+    pause_retention_hours: int = 24
     exec_timeout_secs: int = 120
     max_output_chars: int = 50000
     tool_groups: frozenset = DEFAULT_GROUPS
@@ -367,10 +385,16 @@ class IGlobal(IGlobalBase):
         self.disk_size_gb = _int_or(cfg.get('disk_size_gb'), 5, lo=5, hi=100)
         # Pipelines saved before the idle-timeout field was retired may still carry it; it is not
         # read, so it never reaches Tenki, which ignored it anyway.
-        self.max_duration_minutes = _int_or(cfg.get('max_duration_minutes'), 15, lo=1, hi=1440)
+        self.max_duration_minutes = _int_or(cfg.get('max_duration_minutes'), 60, lo=1, hi=1440)
+        # How long Tenki keeps a paused session's state. Tenki refuses 0 and accepted every value tried from a
+        # minute to a year (measured 2026-10-09); its own default is seven days.
+        self.pause_retention_hours = _int_or(cfg.get('pause_retention_hours'), 24, lo=1, hi=8760)
         self.exec_timeout_secs = _int_or(cfg.get('exec_timeout_secs'), 120, lo=1, hi=1200)
         self.max_output_chars = _int_or(cfg.get('max_output_chars'), 50000, lo=1000, hi=1000000)
 
+        outlives = _outlives_the_session(self.exec_timeout_secs, self.max_duration_minutes)
+        if outlives:
+            warning(outlives)
         self.rpc_timeout_secs = max(self.exec_timeout_secs, _MIN_RPC_TIMEOUT_SECS)
         # Without a deadline, a half-open connection would hang create, refresh, resume and close,
         # all of which run under the session lock, and endGlobal behind them while the VM bills.
@@ -403,6 +427,9 @@ class IGlobal(IGlobalBase):
             # takes seconds. sticky stays at its default of False: a sticky session discards
             # max_duration.
             'max_duration': self.max_duration_minutes * 60,
+            # Without it, a paused session left behind (an engine crash) holds its code and files for
+            # Tenki's default of seven days. The SDK takes seconds.
+            'pause_retention': self.pause_retention_hours * 3600,
             # Inbound exposure can only be set at create time, and no tool this node
             # publishes uses it, so sessions are created closed to inbound traffic.
             'allow_inbound': False,
@@ -668,6 +695,12 @@ class IGlobal(IGlobalBase):
                 warning('apikey is required')
             elif not apikey.startswith('tk_'):
                 warning('apikey must be a Tenki workspace API key, which starts with tk_')
+            outlives = _outlives_the_session(
+                _int_or(cfg.get('exec_timeout_secs'), 120, lo=1, hi=1200),
+                _int_or(cfg.get('max_duration_minutes'), 60, lo=1, hi=1440),
+            )
+            if outlives:
+                warning(outlives)
             unknown = unknown_groups(cfg.get('toolGroups'))
             if unknown:
                 warning(f'unknown tool group(s): {", ".join(unknown)}')

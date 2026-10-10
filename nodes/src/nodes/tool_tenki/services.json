@@ -66,10 +66,18 @@
 		"tenki.max_duration_minutes": {
 			"type": "integer",
 			"title": "Max Duration (minutes)",
-			"description": "How long a session may run before Tenki pauses it, set when the session is created, and the only thing that stops an unused session from billing compute: Tenki has no idle timeout. Size it as the cost backstop for a session the pipeline never shuts down, for example after an engine crash. A paused session keeps its files and memory, and the next tool call resumes it for another period of the same length, so this limits one stretch of running, not total spend.",
-			"default": 15,
+			"description": "How long a session may run before Tenki pauses it, set when the session is created, and the only thing that stops an unused session from billing compute: Tenki has no idle timeout. Size it as the cost backstop for a session the pipeline never shuts down, for example after an engine crash. A paused session keeps its files and memory, and the next tool call resumes it for another period of the same length, so this limits one stretch of running, not total spend. A pause cuts off any command still running, so keep it longer than the Execution Timeout.",
+			"default": 60,
 			"minimum": 1,
 			"maximum": 1440
+		},
+		"tenki.pause_retention_hours": {
+			"type": "integer",
+			"title": "Pause Retention (hours)",
+			"description": "How long Tenki keeps a paused session's memory and files before discarding them. Tenki's own default is seven days; a session the pipeline left behind should not hold its code that long. A resume within this time continues where the session left off.",
+			"default": 24,
+			"minimum": 1,
+			"maximum": 8760
 		},
 		"tenki.exec_timeout_secs": {
 			"type": "integer",
@@ -146,7 +154,7 @@
 		{
 			"section": "Pipe",
 			"title": "Tenki Sandbox",
-			"properties": ["type", "tenki.apikey", "tenki.base_url", "tenki.cpu_cores", "tenki.memory_mb", "tenki.disk_size_gb", "tenki.max_duration_minutes", "tenki.exec_timeout_secs", "tenki.max_output_chars", "tenki.image", "tenki.secret_policies", "tenki.allow_domains", "tenki.toolGroups"]
+			"properties": ["type", "tenki.apikey", "tenki.base_url", "tenki.cpu_cores", "tenki.memory_mb", "tenki.disk_size_gb", "tenki.max_duration_minutes", "tenki.pause_retention_hours", "tenki.exec_timeout_secs", "tenki.max_output_chars", "tenki.image", "tenki.secret_policies", "tenki.allow_domains", "tenki.toolGroups"]
 		}
 	]
 }

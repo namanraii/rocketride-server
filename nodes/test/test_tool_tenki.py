@@ -771,6 +771,8 @@ def test_config_mode_tolerates_a_missing_key(monkeypatch, logs):
         ('disk_size_gb', 500, 100),
         ('max_duration_minutes', 0, 1),
         ('max_duration_minutes', 100000, 1440),
+        ('pause_retention_hours', 0, 1),  # Tenki refuses a retention of 0 ("must be positive")
+        ('pause_retention_hours', 100000, 8760),  # a year, the longest value measured as accepted
         ('exec_timeout_secs', 0, 1),
         ('exec_timeout_secs', 99999, 1200),
         ('max_output_chars', 10, 1000),
@@ -793,8 +795,9 @@ def test_unset_or_unparseable_integers_fall_back_to_defaults(monkeypatch, logs):
         glb.max_duration_minutes,
         glb.exec_timeout_secs,
         glb.max_output_chars,
+        glb.pause_retention_hours,
     )
-    assert settings == (2, 4096, 5, 15, 120, 50000)
+    assert settings == (2, 4096, 5, 60, 120, 50000, 24)
 
 
 @pytest.mark.parametrize(
@@ -854,19 +857,57 @@ def test_create_sends_sizing_a_lifetime_cap_in_seconds_and_no_inbound(monkeypatc
             'memory_mb': 8192,
             'disk_size_gb': 20,
             'max_duration': 5400,
+            'pause_retention': 24 * 3600,
             'allow_inbound': False,
         }
     ]
 
 
-def test_create_sends_the_default_lifetime_cap_of_fifteen_minutes(monkeypatch, logs):
-    # Tenki's idle timeout never paused anything (its changelog, 2026-09-18), and the engine does not
-    # run teardown for chat or webhook pipelines (#2300), so this cap is the only guaranteed end for
-    # a session an agent stopped using. 15 minutes bounds what an orphaned VM can bill.
+def test_create_sends_the_default_lifetime_cap_of_sixty_minutes(monkeypatch, logs):
+    # Tenki pauses a session at this cap rather than ending it (measured), and since #2396 the engine runs
+    # teardown for chat and webhook pipelines too. So a short cap no longer buys much cost safety, while
+    # every pause cuts off a running command and costs about a minute to resume. 60 minutes is the
+    # backstop for a session the pipeline never shut down (an engine crash).
     glb, client = _started(monkeypatch, _FakeSession('sb-1'))
     glb.get_session()
     [call] = client.create_calls
-    assert call['max_duration'] == 15 * 60
+    assert call['max_duration'] == 60 * 60
+
+
+def test_create_sends_the_default_pause_retention_of_a_day(monkeypatch, logs):
+    # Tenki's default keeps a paused session's state for seven days (measured). A session the pipeline
+    # left behind should not hold its code and files that long.
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'))
+    glb.get_session()
+    [call] = client.create_calls
+    assert call['pause_retention'] == 24 * 3600
+
+
+def test_create_sends_the_configured_pause_retention_in_seconds(monkeypatch, logs):
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'), cfg={'pause_retention_hours': 2})
+    glb.get_session()
+    [call] = client.create_calls
+    assert call['pause_retention'] == 7200
+
+
+@pytest.mark.parametrize(
+    ('exec_timeout', 'minutes', 'warns'), [(120, 60, False), (60, 1, True), (61, 1, True), (59, 1, False)]
+)
+def test_a_command_that_could_outlive_the_session_is_warned_about_at_startup(
+    monkeypatch, logs, exec_timeout, minutes, warns
+):
+    # Tenki pauses the session at max_duration and the pause cuts a running command off. A command allowed
+    # to run that long can never finish, so the operator is told when the pipeline starts.
+    cfg = {'apikey': _KEY, 'exec_timeout_secs': exec_timeout, 'max_duration_minutes': minutes}
+    glb, _ = _make_global(monkeypatch, cfg)
+    glb.beginGlobal()
+    assert any('can never finish' in line for line in logs) is warns
+
+
+def test_validate_config_warns_about_a_command_that_could_outlive_the_session(monkeypatch, logs):
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, 'exec_timeout_secs': 600, 'max_duration_minutes': 5})
+    glb.validateConfig()
+    assert any('can never finish' in line and 'exec_timeout_secs' in line for line in logs)
 
 
 def test_a_pipeline_saved_with_the_retired_idle_timeout_field_still_starts_without_sending_it(monkeypatch, logs):
@@ -968,6 +1009,7 @@ def test_the_create_request_carries_exactly_the_options_the_node_means_to_send(m
             'name',
             'tags',
             'metadata',
+            'pause_retention',
         }
         | extra
     )
@@ -1552,9 +1594,18 @@ def test_tool_descriptions_say_a_session_past_its_lifetime_is_paused_not_replace
 def test_the_max_duration_help_says_tenki_pauses_the_session():
     # The editor's help for the one cost setting: it must not promise that the session ends.
     services = json.loads((_NODES_SRC / 'nodes' / 'tool_tenki' / 'services.json').read_text())
-    description = services['fields']['tenki.max_duration_minutes']['description']
-    assert 'pauses' in description
-    assert 'once a session ends' not in description
+    field = services['fields']['tenki.max_duration_minutes']
+    assert 'pauses' in field['description']
+    assert 'once a session ends' not in field['description']
+    assert field['default'] == 60
+
+
+def test_the_editor_offers_pause_retention_in_hours_with_the_measured_bounds():
+    services = json.loads((_NODES_SRC / 'nodes' / 'tool_tenki' / 'services.json').read_text())
+    field = services['fields']['tenki.pause_retention_hours']
+    assert (field['type'], field['default'], field['minimum'], field['maximum']) == ('integer', 24, 1, 8760)
+    shown = next(shape['properties'] for shape in services['shape'] if shape['section'] == 'Pipe')
+    assert shown.index('tenki.pause_retention_hours') == shown.index('tenki.max_duration_minutes') + 1
 
 
 _DENIED = "fatal: unable to access 'https://github.com/acme/private.git/': 403 secret_injection_denied"

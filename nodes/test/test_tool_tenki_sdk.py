@@ -297,6 +297,7 @@ def test_create_accepts_every_option_the_node_sends():
         'memory_mb',
         'disk_size_gb',
         'max_duration',
+        'pause_retention',
         'allow_inbound',
         'image',
         'name',

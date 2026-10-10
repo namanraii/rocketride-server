@@ -100,24 +100,36 @@ The one setting that bounds compute cost. Tenki enforces it, so it holds regardl
 pipeline or the engine does: when it elapses, Tenki pauses the session. It does not delete it
 (Tenki's changelog of 2026-09-11: sessions are paused at their maximum duration "so their state is
 preserved"). A paused session runs nothing and keeps its memory and its files under `/home/tenki`.
-Its preserved state counts against the workspace's storage until the session is closed; Tenki
-reported a pause expiry seven days out for the sessions measured for this node. The next tool call
-resumes the session, and the resumed session gets a new period of the same length.
+The next tool call resumes the session, and the resumed session gets a new period of the same
+length.
 
 Tenki has **no idle timeout**. An unused session keeps billing compute until it is closed or this
 period runs out; nothing pauses it sooner. (Tenki's changelog of 2026-09-18 removed the idle-timeout
 option as having "never had any effect", and the SDK ignores it.)
 
-Size it as the only guaranteed stop, because it is: the node closes the session on teardown, but
-teardown is not reached when the engine crashes, and engines before the fix in #2396 skip it for
-chat- and webhook-sourced pipelines (see [Teardown](#teardown)). The default of 15 minutes caps the
-compute an orphaned session can bill. It bounds one stretch of running rather than total spend: a
-pipeline that keeps working is paused when the period runs out and resumed by its next call, and
-the agent is told when that happens. Raise it for work that genuinely runs longer, because the
-pause is not free for the agent: Tenki starts it 15 seconds to over two minutes after the period
-ends (measured), a command running at that moment is cut off part-way and has to be run again by
-the agent, and the first call afterwards waits while the session comes back, which took 40 to 63
-seconds when measured.
+Size it as the backstop for a session the pipeline never shut down. The node closes the session on
+teardown, which every engine with #2396 (merged to `develop` on 2026-09-22) runs for every source,
+but no engine runs teardown after a crash (see [Teardown](#teardown)). The default is 60 minutes.
+It bounds one stretch of running rather than total spend: a pipeline that keeps working is paused
+when the period runs out and resumed by its next call, and the agent is told when that happens.
+A pause is not free for the agent, which is why the default is not shorter: Tenki starts it 15
+seconds to over two minutes after the period ends (measured), a command running at that moment is
+cut off part-way and has to be run again by the agent, and the first call afterwards waits while
+the session comes back, which took 40 to 63 seconds when measured.
+
+**A command allowed to run as long as the session lives can never finish.** If the
+[Execution Timeout](#execution-timeout-seconds) is not shorter than this period, the pause will
+always cut such a command off, and the node logs a warning when the pipeline starts. Even a shorter
+command is cut off if it is still running when the period ends.
+
+### Pause Retention (hours)
+
+How long Tenki keeps a paused session's memory and files before discarding them. The default is 24
+hours. Without this setting Tenki keeps them for seven days (measured: a pause expiry seven days out),
+and a paused session's state counts against the workspace's storage until the session is closed or
+discarded. A session the pipeline left behind, after an engine crash say, should not hold its code
+that long. A resume within the retention continues where the session left off. Tenki refuses 0, and
+accepted every value tried from one minute to a year; the field takes 1 to 8,760 hours.
 
 ### Execution Timeout (seconds)
 
