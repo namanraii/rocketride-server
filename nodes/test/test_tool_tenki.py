@@ -1250,6 +1250,38 @@ def test_the_refusal_names_tenkis_rule(monkeypatch, logs):
     assert 'Tenki refuses' in str(refused.value) and 'example.com:443' in str(refused.value)
 
 
+def _what_the_engine_shows(message):
+    # A node that fails at startup reaches the client as '>EXIT*<code>*<message>' on the engine's stdio protocol,
+    # and the engine's parser (packages/ai/src/ai/common/dap/transport_stdio.py, split('*', 3)) keeps the message
+    # only up to its first asterisk. Measured 2026-10-09 on the PR-base engine (3.3.0) and on one built from
+    # develop f6537c86: the client received this refusal cut off right before "*.*.example.com".
+    return ('>EXIT*1*' + message).split('*', 3)[2]
+
+
+def test_the_refusal_keeps_what_matters_ahead_of_any_asterisk(monkeypatch, logs):
+    glb, _ = _make_global(
+        monkeypatch, {'apikey': _KEY, 'allow_domains': ['pypi.org', 'https://example.com', '*.*.example.com']}
+    )
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    shown = _what_the_engine_shows(str(refused.value))
+    assert 'entries 2 and 3' in shown
+    assert 'Use bare hostnames' in shown and 'no scheme, path or port' in shown
+    assert 'https://example.com' in shown
+    # The whole message still names every refused entry, for anything that does not cut it.
+    assert str(refused.value).endswith('https://example.com, *.*.example.com')
+
+
+@pytest.mark.parametrize(
+    ('raw', 'positions'), [(['a_b.example'], 'entry 1'), (['ok.example', 'x:1', 'y/z', 'w_v'], 'entries 2, 3 and 4')]
+)
+def test_the_refusal_says_which_entries_by_position(monkeypatch, logs, raw, positions):
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, 'allow_domains': raw})
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert f'({positions})' in str(refused.value)
+
+
 def test_validate_config_warns_about_an_outbound_domain_the_node_does_not_accept(monkeypatch, logs):
     glb, _ = _make_global(monkeypatch, {'apikey': _KEY, 'allow_domains': ['https://pypi.org']})
     glb.validateConfig()

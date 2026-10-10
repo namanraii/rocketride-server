@@ -228,21 +228,32 @@ def _allowed_domains(raw) -> list[str]:
     dropped: had every entry been dropped, the empty list left would mean no allowlist at all, opening
     outbound traffic wider than the operator asked for.
 
+    The message says which entries by position and how to fix them before it quotes any entry: the
+    engine passes a startup failure to the client as ``>EXIT*code*message`` and keeps the message only
+    up to its first asterisk, which a wildcard entry would put early (measured on 3.3.0 and develop).
+
     Raises:
         ValueError: Naming every entry Tenki refuses, or for more entries than Tenki takes.
     """
-    domains, refused = [], []
+    domains, refused, positions = [], [], []
     for position, name in enumerate(_names(raw, 'allow_domains'), 1):
         domain = name.lower().rstrip('.')
         if len(domain) > _MAX_DOMAIN_CHARS or not _DOMAIN.match(domain):
             # An entry with an "@" may be a URL that carries credentials: say where it is, not what it says.
             refused.append(f'entry {position}' if '@' in name else name)
+            positions.append(str(position))
         elif domain not in domains:
             domains.append(domain)
     if refused:
+        which = (
+            f'entry {positions[0]}'
+            if len(positions) == 1
+            else f'entries {", ".join(positions[:-1])} and {positions[-1]}'
+        )
         raise ValueError(
-            f'tenki.allow_domains has entries Tenki refuses: {", ".join(refused)}. Use bare '
-            'hostnames such as pypi.org, optionally with one leading "*." wildcard, and no scheme, path or port.'
+            f'tenki.allow_domains has {"an entry" if len(positions) == 1 else "entries"} Tenki refuses ({which}). Use '
+            'bare hostnames such as pypi.org, optionally starting with one wildcard label (an asterisk and a dot), '
+            f'with no scheme, path or port. Refused: {", ".join(refused)}'
         )
     if len(domains) > _MAX_DOMAINS:
         raise ValueError(f'tenki.allow_domains lists {len(domains)} hosts, and Tenki accepts up to {_MAX_DOMAINS}')
