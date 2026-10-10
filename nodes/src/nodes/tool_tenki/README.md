@@ -114,8 +114,9 @@ period runs out; nothing pauses it sooner. (Tenki's changelog of 2026-09-18 remo
 option as having "never had any effect", and the SDK ignores it.)
 
 Size it as the backstop for a session the pipeline never shut down. The node closes the session on
-teardown, which every engine with #2396 (merged to `develop` on 2026-09-22) runs for every source,
-but no engine runs teardown after a crash (see [Teardown](#teardown)). The default is 60 minutes.
+teardown, which engines with #2396 (merged to `develop` on 2026-09-22) run when a chat- or
+webhook-sourced pipeline is terminated or reaches its idle TTL (measured), but no engine runs
+teardown after a crash (see [Teardown](#teardown)). The default is 60 minutes.
 It bounds one stretch of running rather than total spend: a pipeline that keeps working is paused
 when the period runs out and resumed by its next call, and the agent is told when that happens.
 A pause is not free for the agent, which is why the default is not shorter: Tenki starts it 15
