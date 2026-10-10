@@ -1212,6 +1212,8 @@ def test_unset_secret_policies_and_domains_leave_the_create_request_as_before(mo
         'a.*.example.com',
         '*',
         'trailing-.example.com',
+        # Not ASCII, though lowercasing makes it so: the Kelvin sign becomes "k".
+        '\u212aexample.com',
     ],
 )
 def test_an_outbound_domain_the_node_does_not_accept_stops_the_pipeline_at_startup(monkeypatch, logs, domain):

@@ -238,7 +238,8 @@ def _allowed_domains(raw) -> list[str]:
     domains, refused, positions = [], [], []
     for position, name in enumerate(_names(raw, 'allow_domains'), 1):
         domain = name.lower().rstrip('.')
-        if len(domain) > _MAX_DOMAIN_CHARS or not _DOMAIN.match(domain):
+        # ASCII is checked before lowercasing could make it so (the Kelvin sign lowercases to "k").
+        if not name.isascii() or len(domain) > _MAX_DOMAIN_CHARS or not _DOMAIN.match(domain):
             # An entry with an "@" may be a URL that carries credentials: say where it is, not what it says.
             refused.append(f'entry {position}' if '@' in name else name)
             positions.append(str(position))
