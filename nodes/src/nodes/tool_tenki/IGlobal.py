@@ -101,6 +101,11 @@ _READY_WAIT_SECS = 180
 _RESUME_RETRY_SECS = 90
 _RESUME_RETRY_PAUSE_SECS = 5
 
+# The no-op command run on a session before its first use after a create or a resume (see _warm_up): its own
+# execution timeout, and how long the node waits for its result after the start.
+_WARM_UP_TIMEOUT_SECS = 10
+_WARM_UP_WAIT_SECS = 40
+
 # Given an empty endpoint the SDK resolves one from TENKI_API_ENDPOINT / TENKI_API_URL,
 # so the public default is passed explicitly rather than left to the host's environment.
 _DEFAULT_BASE_URL = 'https://api.tenki.cloud'
@@ -325,6 +330,9 @@ class IGlobal(IGlobalBase):
     # When, on time.monotonic(), asking again for a refused resume stops. Read and written under the
     # session lock. It is one budget for every call waiting on the same resume, not one each: see _resume.
     _resume_retry_until: float | None = None
+    # The id of the session the node has run its no-op command on since that session was created or last
+    # resumed (see _warm_up). Read without the lock as a fast path; written under it.
+    _warm: str | None = None
 
     rpc_timeout_secs: int = 120
     image: str = ''
@@ -350,6 +358,7 @@ class IGlobal(IGlobalBase):
         self._ending = False
         self._create_attempted = False
         self._resume_retry_until = None
+        self._warm = None
         self._run_tag = f'run-{uuid.uuid4().hex[:12]}'
 
         cfg = Config.getNodeConfig(self.glb.logicalType, self.glb.connConfig)
@@ -401,8 +410,11 @@ class IGlobal(IGlobalBase):
         # The client applies it to those calls only; each session's file calls get it in _create_session.
         self.client = Client(auth_token=apikey, base_url=base_url, timeout=self.rpc_timeout_secs)
 
-    def get_session(self) -> Sandbox:
-        """Return the shared session, creating it on first use."""
+    def get_session(self, on_event=None) -> Sandbox:
+        """Return the shared session, creating it on first use.
+
+        ``on_event``, if given, is called with 'created' when this call is the one that created it.
+        """
         session = self.session
         if session is None:
             with self._session_lock:
@@ -413,8 +425,51 @@ class IGlobal(IGlobalBase):
                 if self.session is None:
                     self.session = self._create_session()
                     debug(f'tool_tenki: created session {getattr(self.session, "id", "?")}')
+                    if on_event is not None:
+                        on_event('created')
                 session = self.session
         return session
+
+    def _ensure_warm(self, session: Sandbox) -> None:
+        """Run the no-op command on ``session`` if it has not run since the session was created or resumed."""
+        if self._warm == session.id:
+            return
+        with self._session_lock:
+            if self._warm == session.id:
+                return
+            if self._ending:
+                raise SessionUnavailableError(
+                    'tool_tenki: the pipeline is shutting down, so the sandbox session is not used'
+                )
+            self._warm_up(session)
+            self._warm = session.id
+
+    def _warm_up(self, session: Sandbox) -> None:
+        """Run one bounded no-op command, so the SDK's unbounded check of the data plane never runs.
+
+        Before a file call the SDK checks a session's data plane with a request of its own that has no
+        deadline (``ensure_serving``), unless the plane is already marked as serving. Tenki usually marks
+        it at create and on the credential renewal after a resume (measured), but not always, and a
+        command's first answer marks it in every case, without that check. So the node runs ``true``
+        first, with a start the SDK bounds at 30 seconds and a result it waits for at most
+        ``_WARM_UP_WAIT_SECS``. Called with the session lock held.
+        """
+        process = session.start('true', timeout=_WARM_UP_TIMEOUT_SECS)
+        try:
+            process.close_stdin()
+        except SandboxError:
+            raise
+        except TimeoutError as e:
+            process.kill()
+            raise CommandNotStartedError(
+                "the sandbox did not start the node's first command in time, so it was cancelled"
+            ) from e
+        try:
+            process.wait(timeout=_WARM_UP_WAIT_SECS)
+        except SandboxError:
+            raise
+        except TimeoutError as e:
+            raise SandboxError("the sandbox did not finish the node's first command in time") from e
 
     def _create_session(self) -> Sandbox:
         create_kwargs = {
@@ -513,39 +568,44 @@ class IGlobal(IGlobalBase):
         except Exception as e:
             warning(f'tool_tenki: could not close the sandbox a failed create left running: {e}')
 
-    def call_with_session(self, call, *, replace: bool = True, on_recovery=None):
+    def call_with_session(self, call, *, replace: bool = True, on_event=None):
         """Return ``call(session)``, recovering the session once if it stopped being usable.
 
         A lifecycle error only prompts a look at the session's state (see
         ``recover_session``), and so does a failure that says too little to rule a pause out (see
         ``_may_hide_a_pause``). The call is retried once, on the recovered session, when that state
-        explains the failure; every other error propagates unchanged.
+        explains the failure; every other error propagates unchanged. Whether a retry may repeat the
+        call is the tool's to decide: ``on_event`` may raise to stop it.
 
         ``replace=False`` is for calls that only look at existing state (reading, listing or
         deleting files). If the session turns out to have ended, a fresh, empty one could not
         serve them, so ``SessionEndedError`` is raised instead of creating a session for nothing.
 
-        ``on_recovery``, if given, is called with 'resumed' or 'replaced' before the retry, so the tool
-        can tell the agent that its call ran on a resumed session, or on a fresh and empty one.
+        ``on_event``, if given, is told how the session changed during the call, so the tool can say so in
+        its result: 'created' (this call started the session), 'resumed' or 'replaced' (before the retry),
+        or 'ended' (just before ``SessionEndedError``).
         """
         epoch = self.session_epoch
         try:
-            session = self.get_session()
+            session = self.get_session(on_event)
             try:
+                self._ensure_warm(session)
                 return call(session)
             except _LIFECYCLE_ERRORS:
-                recovery = self.recover_session(session, epoch, replace=replace)
+                recovery = self._recover(session, epoch, replace, on_event)
                 if not recovery:
                     raise
             except SandboxError as e:
                 if not _may_hide_a_pause(e):
                     raise
-                recovery = self.recover_session(session, epoch, replace=replace)
+                recovery = self._recover(session, epoch, replace, on_event)
                 if not recovery:
                     raise
-            if on_recovery is not None:
-                on_recovery(recovery)
-            return call(self.get_session())
+            if on_event is not None:
+                on_event(recovery)
+            session = self.get_session()
+            self._ensure_warm(session)
+            return call(session)
         except SandboxError:
             # An SDK error is reported as itself, including the two that are also a plain RuntimeError or
             # TimeoutError since tenki 1.4.1. Only a plain one is wrapped below.
@@ -556,6 +616,23 @@ class IGlobal(IGlobalBase):
             # out of the tool. Logged as well: these are rare, and worth an operator's attention.
             warning(f'tool_tenki: sandbox call failed with {type(e).__name__}: {e}')
             raise SessionUnavailableError(str(e)) from e
+
+    def _recover(self, session: Sandbox, epoch: int, replace: bool, on_event) -> str | None:
+        """``recover_session``, telling ``on_event`` when the session turned out to have ended.
+
+        The look at the session is itself a call with a deadline. Running past it says nothing about the
+        call that failed, so it is reported for what it is, not as that call's timeout.
+        """
+        try:
+            return self.recover_session(session, epoch, replace=replace)
+        except SessionEndedError:
+            if on_event is not None:
+                on_event('ended')
+            raise
+        except CommandTimeoutError as e:
+            raise SessionUnavailableError(
+                f"the call failed, and checking the sandbox's state ran past the deadline: {e}"
+            ) from e
 
     def recover_session(self, session: Sandbox, epoch: int, *, replace: bool = True) -> str | None:
         """Bring a session that failed a call back to a usable state.
@@ -578,7 +655,7 @@ class IGlobal(IGlobalBase):
         with self._session_lock:
             if self.session is not session or self.session_epoch != epoch:
                 # A concurrent call already dealt with this session. If it dropped it, retrying
-                # would create a fresh session, which a caller passing replace=False cannot use —
+                # would create a fresh session, which a caller passing replace=False cannot use,
                 # and which the replacement may already have been created for, so the test is the
                 # epoch rather than self.session still being None.
                 if self.session is None or self.last_replacement_epoch > epoch:
@@ -594,6 +671,8 @@ class IGlobal(IGlobalBase):
                 return self._drop_session(session, state, replace=replace)
             if state == 'PAUSED':
                 self._resume(session)
+                # A resume drops the SDK's data-plane connection, so the no-op command runs again first.
+                self._warm = None
                 if self._ending:
                     # The ask was on its way when shutdown began. endGlobal is waiting on this lock
                     # to close the session, so it is not made to wait for the VM to come up first.

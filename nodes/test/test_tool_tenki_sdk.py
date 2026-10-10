@@ -46,6 +46,7 @@ from tenki_sandbox import errors as sdk_errors
 from tenki_sandbox._pb import pb
 from tenki_sandbox._transport import _STREAMING_OUT, GrpcConfig, GrpcSandboxRPC
 from tenki_sandbox.client import build_create_session_request
+from tenki_sandbox import data_plane as data_plane_module
 from tenki_sandbox.data_plane import GrpcDataPlaneRPC
 from tenki_sandbox.errors import map_rpc_error
 from tenki_sandbox.fs import SandboxFS
@@ -476,3 +477,66 @@ def test_the_git_api_signatures():
     assert _parameters(SandboxGit.checkout) == {'ref': _REQUIRED, 'create': False, 'directory': None}
     assert _parameters(SandboxGit.diff) == {'range': None, 'base': None, 'head': None, 'path': None, 'directory': None}
     assert _parameters(SandboxGit.log) == {'max_count': None, 'range': None, 'path': None, 'directory': None}
+
+
+# ---------------------------------------------------------------------------
+# The data plane's unbounded check, and the no-op command that keeps it from running (IGlobal._warm_up)
+# ---------------------------------------------------------------------------
+
+
+class _DataPlane:
+    """In place of a session's data plane: answers a command and a Stat, and counts the SDK's own check."""
+
+    endpoint = 'https://127.0.0.1:9'
+
+    def __init__(self):
+        self.checks = 0
+
+    def ensure_serving(self, session_id, **kwargs):
+        self.checks += 1
+
+    def run(self, requests, **kwargs):
+        next(iter(requests))  # the start
+        yield pb.RunResponse(started=pb.RunStarted(pid=7))
+        yield pb.RunResponse(exit=pb.RunExit(exit_code=0))
+
+    def stat(self, request, **kwargs):
+        return pb.StatResponse(exists=True)
+
+    def close(self):
+        pass
+
+
+def _session_on_an_unverified_route():
+    """A real Sandbox whose data plane Tenki has not reported verified: the one case in which the SDK checks it."""
+    session = tenki.Sandbox(SimpleNamespace(_rpc=object()), tenki.SandboxInfo(id='sb-contract'))
+    plane = _DataPlane()
+    session._data_plane_rpc, session._data_plane_verified = plane, False
+    return session, plane
+
+
+def test_a_file_call_on_an_unverified_route_runs_the_sdks_check_which_has_no_deadline():
+    # Why the node runs a no-op command first. If this starts failing, the SDK no longer checks before a file call.
+    session, plane = _session_on_an_unverified_route()
+    session.fs.stat('/home/tenki')
+    assert plane.checks == 1
+    assert 'timeout' not in inspect.getsource(data_plane_module.GrpcDataPlaneRPC.ensure_serving)
+
+
+def test_a_commands_first_answer_spares_the_file_calls_after_it_that_check():
+    # The no-op command's start goes out without the check, and its first answer marks the route as serving.
+    session, plane = _session_on_an_unverified_route()
+    process = session.start('true', timeout=10)
+    process.close_stdin()
+    assert process.wait(timeout=10).exit_code == 0
+    session.fs.stat('/home/tenki')
+    session.fs.stat('/home/tenki')
+    assert plane.checks == 0
+
+
+def test_a_resume_drops_the_routes_verification_so_the_no_op_command_runs_again():
+    session, plane = _session_on_an_unverified_route()
+    session._data_plane_verified = True
+    assert 'self._reset_data_plane()' in inspect.getsource(tenki.Sandbox.resume)
+    session._reset_data_plane()
+    assert session._data_plane_verified is False

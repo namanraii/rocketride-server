@@ -234,6 +234,7 @@ class _FakeSession:
         ready_error=None,
         paused_error=None,
         resume_refusals=0,
+        warm_up_faults=False,
     ):
         self.id = session_id
         # How many times resume is refused first, as Tenki does while it is still tearing the paused VM down.
@@ -252,7 +253,11 @@ class _FakeSession:
         self._run_error = run_error
         self._ready_state = ready_state
         self._ready_error = ready_error
+        # The faults above (exec_error, stalls, flood, run_error) are aimed at the tools' commands. The node's
+        # no-op command meets them too only when warm_up_faults is set; a pause (state PAUSED) it always meets.
+        self.warm_up_faults = warm_up_faults
         self.processes = []
+        self.warm_up_processes = []
         self.calls = []
         self.ready_timeouts = []
         self.fs = _FakeFS(self, files=files, dirs=dirs, fail=fail)
@@ -263,11 +268,19 @@ class _FakeSession:
         self.calls.append(('start', argv, kwargs))
         if self.state == 'PAUSED':
             raise self.paused_error
-        if self._exec_error is not None:
+        warm_up = argv == _WARM_UP and not self.warm_up_faults
+        if self._exec_error is not None and not warm_up:
             raise self._exec_error
+        if warm_up:
+            process = _FakeProcess(self, _CommandResult(argv=list(argv), exit_code=0))
+            self.warm_up_processes.append(process)
+            return process
         result = self._exec_result if self._exec_result is not None else _CommandResult(argv=list(argv), exit_code=0)
         process = _FakeProcess(self, result, stalls=self._stalls, flood=self._flood, run_error=self._run_error)
-        self.processes.append(process)
+        if argv == _WARM_UP:
+            self.warm_up_processes.append(process)
+        else:
+            self.processes.append(process)
         return process
 
     def refresh(self):
@@ -695,9 +708,50 @@ def _instance(monkeypatch, *sessions, cfg=None, **client_kwargs):
     return inst, client
 
 
+# The bounded no-op command the node runs on a session before its first use after a create or a resume (see
+# IGlobal._warm_up). Kept out of _execs, which counts the commands the tools themselves ran.
+_WARM_UP = ('true',)
+
+
 def _execs(session):
-    """The (argv, kwargs) of every process started on a fake session."""
-    return [(call[1], call[2]) for call in session.calls if isinstance(call, tuple) and call[0] == 'start']
+    """The (argv, kwargs) of every process a tool started on a fake session (the node's warm-up excluded)."""
+    return [
+        (call[1], call[2])
+        for call in session.calls
+        if isinstance(call, tuple) and call[0] == 'start' and call[1] != _WARM_UP
+    ]
+
+
+def _warm_ups(session):
+    """How many times the node ran its no-op command on a fake session."""
+    return sum(1 for call in session.calls if isinstance(call, tuple) and call[0] == 'start' and call[1] == _WARM_UP)
+
+
+def _without_warm_ups(calls):
+    """A fake session's call log without the node's no-op commands (their start, close_stdin and wait)."""
+    kept, skipping = [], 0
+    for call in calls:
+        if isinstance(call, tuple) and call[0] == 'start' and call[1] == _WARM_UP:
+            skipping = 2
+            continue
+        if skipping and isinstance(call, tuple) and call[0] in ('close_stdin', 'wait', 'kill'):
+            skipping -= call[0] != 'kill'
+            continue
+        skipping = 0
+        kept.append(call)
+    return kept
+
+
+def _first_data_call(session):
+    """The first call on a fake session that is not part of the warm-up or the lifecycle."""
+    for call in session.calls:
+        if (
+            isinstance(call, tuple)
+            and not (call[0] == 'start' and call[1] == _WARM_UP)
+            and call[0] not in ('close_stdin', 'wait', 'kill')
+        ):
+            return call
+    return None
 
 
 def _git_calls(session, operation):
@@ -1267,10 +1321,10 @@ def test_an_ended_session_whose_close_fails_is_still_replaced(monkeypatch, logs)
     reported = []
     outcome = glb.call_with_session(
         lambda session: _raise(mod.SessionTerminatedError('session_terminated')) if session is ended else 'ok',
-        on_recovery=reported.append,
+        on_event=reported.append,
     )
     assert outcome == 'ok'
-    assert reported == ['replaced']
+    assert reported == ['created', 'replaced']
     assert len(client.create_calls) == 2
 
 
@@ -1289,8 +1343,10 @@ def test_session_shut_down_from_inside_is_closed_before_it_is_replaced(monkeypat
 
 def test_paused_session_is_resumed_and_never_replaced(monkeypatch, logs):
     # A pause keeps the agent's memory and files; recreating would silently destroy its work.
-    paused = _FakeSession('sb-1', state='PAUSED')
+    paused = _FakeSession('sb-1')
     glb, client = _started(monkeypatch, paused)
+    glb.call_with_session(lambda session: None)  # first use: the session is created and warmed
+    paused.state = 'PAUSED'
     seen_states = []
 
     def call(session):
@@ -1365,7 +1421,8 @@ def test_an_sdk_error_that_is_also_a_timeout_is_not_taken_for_a_command_that_nev
 
     def start_then_fail(*argv, **kwargs):
         process = start(*argv, **kwargs)
-        process.close_stdin = lambda: _raise(error)
+        if argv != _WARM_UP:
+            process.close_stdin = lambda: _raise(error)
         return process
 
     session.start = start_then_fail
@@ -1386,7 +1443,7 @@ def test_other_errors_propagate_without_a_state_check(monkeypatch, logs):
     glb, _ = _started(monkeypatch, running)
     with pytest.raises(ValueError):
         glb.call_with_session(lambda session: _raise(ValueError('empty command')))
-    assert running.calls == []
+    assert _without_warm_ups(running.calls) == []
 
 
 def test_recovery_happens_once_then_the_error_surfaces(monkeypatch, logs):
@@ -1663,6 +1720,7 @@ def test_run_command_runs_bash_as_a_login_shell_with_the_configured_timeout(monk
         'stderr': '',
         'timed_out': False,
         'truncated': False,
+        'session': 'created',
     }
     assert _execs(session) == [
         (
@@ -1722,6 +1780,7 @@ def test_run_command_reports_a_deadline_error_as_timed_out(monkeypatch, logs):
         'stderr': '',
         'timed_out': True,
         'truncated': False,
+        'session': 'created',
     }
 
 
@@ -1784,7 +1843,9 @@ def test_run_code_writes_the_code_to_a_file_then_runs_the_interpreter_on_it(
     inst, _ = _instance(monkeypatch, session, cfg={'exec_timeout_secs': 45})
     args = {'code': code} if language is None else {'code': code, 'language': language}
     assert inst.run_code(args)['exit_code'] == 0
-    written, executed, removed = [call for call in session.calls if call[0] in ('write_text', 'start', 'remove')]
+    written, executed, removed = [
+        call for call in _without_warm_ups(session.calls) if call[0] in ('write_text', 'start', 'remove')
+    ]
     path = written[1]
     assert written == ('write_text', path)
     assert path.startswith('/home/tenki/') and path.endswith(extension)
@@ -1903,6 +1964,7 @@ def test_write_file_writes_the_content_verbatim(monkeypatch, logs, content):
     assert inst.write_file({'path': 'notes.md', 'content': content}) == {
         'success': True,
         'path': '/home/tenki/notes.md',
+        'session': 'created',
     }
     assert session.fs.files['/home/tenki/notes.md'] == content
 
@@ -1935,7 +1997,11 @@ def test_make_directory_rejects_invalid_input_without_touching_the_sandbox(monke
 def test_make_directory_creates_the_directory_and_its_parents(monkeypatch, logs):
     session = _FakeSession('sb-1')
     inst, _ = _instance(monkeypatch, session)
-    assert inst.make_directory({'path': 'data/raw'}) == {'success': True, 'path': '/home/tenki/data/raw'}
+    assert inst.make_directory({'path': 'data/raw'}) == {
+        'success': True,
+        'path': '/home/tenki/data/raw',
+        'session': 'created',
+    }
     assert {'/home/tenki/data', '/home/tenki/data/raw'} <= session.fs.dirs
 
 
@@ -1979,6 +2045,7 @@ def test_read_file_returns_the_file_text(monkeypatch, logs):
         'path': '/home/tenki/notes.md',
         'content': 'h\u00e9llo\n',
         'truncated': False,
+        'session': 'created',
     }
 
 
@@ -2086,6 +2153,7 @@ def test_list_files_lists_home_by_name_without_hidden_entries(monkeypatch, logs)
         'path': '/home/tenki',
         'entries': [{'name': 'app', 'is_dir': True, 'size': 0}, {'name': 'zeta.txt', 'is_dir': False, 'size': 2}],
         'truncated': False,
+        'session': 'created',
     }
 
 
@@ -2138,7 +2206,7 @@ def test_delete_path_removes_a_directory_with_everything_in_it(monkeypatch, logs
         dirs={'/home/tenki/build', '/home/tenki/build/out'},
     )
     inst, _ = _instance(monkeypatch, session)
-    assert inst.delete_path({'path': 'build'}) == {'success': True, 'path': '/home/tenki/build'}
+    assert inst.delete_path({'path': 'build'}) == {'success': True, 'path': '/home/tenki/build', 'session': 'created'}
     assert session.fs.files == {'/home/tenki/keep.txt': 'y'}
     assert session.fs.dirs == {'/home/tenki'}
 
@@ -2233,9 +2301,9 @@ def test_a_replaced_session_is_never_reported_to_the_agent_as_merely_resumed(mon
         glb.recover_session(replacement, glb.session_epoch, replace=True)
         raise mod.SessionTerminatedError('session_terminated')
 
-    recoveries = []
-    assert glb.call_with_session(call, on_recovery=recoveries.append) == 'ok'
-    assert recoveries == ['replaced'], recoveries
+    events = []
+    assert glb.call_with_session(call, on_event=events.append) == 'ok'
+    assert events == ['created', 'replaced'], events
 
 
 # ---------------------------------------------------------------------------
@@ -2326,6 +2394,7 @@ def test_git_clone_passes_its_arguments_through(monkeypatch, logs):
         'directory': '/home/tenki/src/hello',
         'output': "Cloning into '/home/tenki/src/hello'...\n",
         'truncated': False,
+        'session': 'created',
     }
     assert _git_calls(session, 'clone') == [
         {'repo': _REPO, 'branch': 'main', 'depth': 1, 'directory': '/home/tenki/src/hello'}
@@ -2432,7 +2501,11 @@ def test_git_checkout_rejects_invalid_input_without_touching_the_sandbox(monkeyp
 def test_git_checkout_passes_its_arguments_through(monkeypatch, logs, args, passed):
     session = _FakeSession('sb-1', git_outputs={'checkout': "Switched to branch 'main'\n"})
     inst, _ = _instance(monkeypatch, session)
-    assert inst.git_checkout(args) == {'output': "Switched to branch 'main'\n", 'truncated': False}
+    assert inst.git_checkout(args) == {
+        'output': "Switched to branch 'main'\n",
+        'truncated': False,
+        'session': 'created',
+    }
     assert _git_calls(session, 'checkout') == [passed]
 
 
@@ -2478,7 +2551,7 @@ def test_git_diff_passes_its_arguments_through(monkeypatch, logs, args, passed):
 def test_git_diff_output_is_truncated_at_the_cap(monkeypatch, logs):
     session = _FakeSession('sb-1', git_outputs={'diff': '+' * 5000})
     inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
-    assert inst.git_diff({}) == {'output': '+' * 1000, 'truncated': True}
+    assert inst.git_diff({}) == {'output': '+' * 1000, 'truncated': True, 'session': 'created'}
 
 
 @pytest.mark.parametrize('args', [{'max_count': 0}, {'max_count': 1001}, {'max_count': 'ten'}, {'range': '--all'}])
@@ -2503,7 +2576,7 @@ def test_git_log_passes_its_arguments_through(monkeypatch, logs):
     session = _FakeSession('sb-1', git_outputs={'log': 'commit abc123\n'})
     inst, _ = _instance(monkeypatch, session)
     args = {'max_count': 5, 'range': 'main..fix', 'path': 'README.md', 'directory': 'repo'}
-    assert inst.git_log(args) == {'output': 'commit abc123\n', 'truncated': False}
+    assert inst.git_log(args) == {'output': 'commit abc123\n', 'truncated': False, 'session': 'created'}
     assert _git_calls(session, 'log') == [
         {'max_count': 5, 'range': 'main..fix', 'path': 'README.md', 'directory': '/home/tenki/repo'}
     ]
@@ -2583,7 +2656,7 @@ def test_a_stalled_command_stream_is_cut_off_and_reported_as_a_timeout(monkeypat
     result = getattr(inst, tool)(args)
     assert result['timed_out'] is True
     assert result['exit_code'] == -1
-    [(_, waited)] = [call for call in session.calls if call[0] == 'wait']
+    [(_, waited)] = [call for call in _without_warm_ups(session.calls) if call[0] == 'wait']
     assert 45 < waited <= 105
     assert f'no result within {waited}s' in result['error']
 
@@ -2904,7 +2977,7 @@ def test_write_file_still_creates_a_missing_parent_whose_name_contains_vsock(mon
     session.fs._missing = lambda path: inst_mod.TenkiFileNotFoundError(f'open {path}: no such file or directory')
     inst, _ = _instance(monkeypatch, session)
     result = inst.write_file({'path': 'vsock-notes/rootfs.img.vsock.txt', 'content': 'x'})
-    assert result == {'success': True, 'path': '/home/tenki/vsock-notes/rootfs.img.vsock.txt'}
+    assert result == {'success': True, 'path': '/home/tenki/vsock-notes/rootfs.img.vsock.txt', 'session': 'created'}
     assert 'refresh' not in session.calls
 
 
@@ -3227,7 +3300,7 @@ class _PausedMidCommand(_FakeSession):
 
     def start(self, *argv, **kwargs):
         process = super().start(*argv, **kwargs)
-        if self._run_error is not None:
+        if self._run_error is not None and argv != _WARM_UP:
             self.state = 'PAUSED'
         return process
 
@@ -3348,14 +3421,15 @@ def test_a_command_cut_off_by_a_terminated_session_is_not_run_again_either(monke
     fresh = _FakeSession('sb-fresh', exec_result=_CommandResult(argv=['bash'], exit_code=0, stdout=b'ok\n'))
     inst, client = _instance(monkeypatch, dead, fresh)
     result = getattr(inst, tool)(args)
-    assert result['exit_code'] == -1 and result['timed_out'] is False and result['session'] == 'replaced'
+    # "ended", not "replaced": the call stops there, and no new sandbox exists until the next call.
+    assert result['exit_code'] == -1 and result['timed_out'] is False and result['session'] == 'ended'
     assert 'ended while this command was running' in result['error'] and 'not run again' in result['error']
     assert 'outside the sandbox' in result['error'] and 'paused' not in result['error']
     assert len(_execs(dead)) == 1 and len(_execs(fresh)) == 0
     # No VM is created for a call that will not use it. The next command starts the fresh one.
     assert len(client.create_calls) == 1
     after = inst.run_command({'command': 'ls'})
-    assert after['stdout'] == 'ok\n' and 'session' not in after and len(client.create_calls) == 2
+    assert after['stdout'] == 'ok\n' and after['session'] == 'created' and len(client.create_calls) == 2
 
 
 def test_a_started_command_whose_recovery_ran_past_the_deadline_is_not_reported_as_a_plain_timeout(monkeypatch, logs):
@@ -3402,8 +3476,8 @@ def test_a_recovery_done_by_a_concurrent_call_is_reported_too(monkeypatch, logs)
             raise mod.InvalidStateError('session is paused')
         return 'done'
 
-    assert glb.call_with_session(call, on_recovery=reported.append) == 'done'
-    assert reported == ['resumed']
+    assert glb.call_with_session(call, on_event=reported.append) == 'done'
+    assert reported == ['created', 'resumed']
 
 
 def test_replacing_an_ended_session_is_logged_for_the_operator(monkeypatch, logs):
@@ -3593,3 +3667,241 @@ def test_a_failed_shutdown_sweep_is_logged_and_the_client_still_closes(monkeypat
     glb.endGlobal()
     assert client.closed is True
     assert any('connection reset' in message for message in logs)
+
+
+# ---------------------------------------------------------------------------
+# Loop 2: the no-op command after a create or a resume (1b), retrying only what is safe to repeat (1c),
+# and one session-status contract on every result (1d)
+# ---------------------------------------------------------------------------
+
+
+def test_a_new_session_runs_the_no_op_command_before_its_first_call(monkeypatch, logs):
+    # The SDK checks a session's data plane with a request that has no deadline before a file call, unless a
+    # command has already been answered on it. A bounded no-op command first means that check never runs.
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.read_file({'path': 'notes.txt'})['content'] == 'kept'
+    starts = [call for call in session.calls if isinstance(call, tuple) and call[0] == 'start']
+    assert starts[0][1] == _WARM_UP
+    assert session.calls.index(starts[0]) < session.calls.index(('stat', '/home/tenki/notes.txt'))
+    inst.read_file({'path': 'notes.txt'})
+    inst.list_files({'path': '.'})
+    assert _warm_ups(session) == 1
+
+
+def test_the_no_op_command_is_bounded(monkeypatch, logs):
+    session = _FakeSession('sb-1')
+    inst, _ = _instance(monkeypatch, session)
+    inst.list_files({'path': '.'})
+    [(argv, kwargs)] = [(call[1], call[2]) for call in session.calls if isinstance(call, tuple) and call[0] == 'start']
+    assert argv == _WARM_UP and kwargs['timeout'] == mod._WARM_UP_TIMEOUT_SECS
+    waits = [call[1] for call in session.calls if isinstance(call, tuple) and call[0] == 'wait']
+    assert waits == [mod._WARM_UP_WAIT_SECS]
+
+
+def test_a_resumed_session_runs_the_no_op_command_again_before_the_retry(monkeypatch, logs):
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    inst.read_file({'path': 'notes.txt'})
+    session.state = 'PAUSED'
+    result = inst.read_file({'path': 'notes.txt'})
+    assert result['content'] == 'kept' and result['session'] == 'resumed'
+    assert _warm_ups(session) == 2
+    resumed_at = session.calls.index('resume')
+    second_warm_up = [
+        i
+        for i, call in enumerate(session.calls)
+        if isinstance(call, tuple) and call[0] == 'start' and call[1] == _WARM_UP
+    ][1]
+    assert second_warm_up > resumed_at
+
+
+def test_a_no_op_command_that_never_starts_is_reported_and_tried_again_on_the_next_call(monkeypatch, logs):
+    session = _FakeSession('sb-1', stalls='start', warm_up_faults=True, files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.read_file({'path': 'notes.txt'})
+    assert 'did not start' in result['error'] and _first_data_call(session) is None
+    assert ('kill',) in session.calls  # a start that arrives late must not run it after all
+    session._stalls = None
+    assert inst.read_file({'path': 'notes.txt'})['content'] == 'kept'
+    assert _warm_ups(session) == 2
+
+
+def test_the_no_op_command_is_not_run_once_the_pipeline_is_shutting_down(monkeypatch, logs):
+    session = _FakeSession('sb-1')
+    inst, _ = _instance(monkeypatch, session)
+    inst.IGlobal.get_session()
+    inst.IGlobal._ending = True
+    assert 'shutting down' in inst.list_files({'path': '.'})['error']
+    assert _warm_ups(session) == 0
+
+
+def _paused_after_first_use(session_kwargs=None):
+    """A session that served one call (so it is warm), then was paused by Tenki."""
+    return _FakeSession('sb-1', **(session_kwargs or {}))
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args', 'operation'),
+    [
+        ('write_file', {'path': 'a.txt', 'content': 'x'}, 'write_text'),
+        ('make_directory', {'path': 'made'}, 'mkdir'),
+        ('delete_path', {'path': 'notes.txt'}, 'remove'),
+        ('git_clone', {'repo': _REPO}, 'clone'),
+        ('git_checkout', {'ref': 'feature', 'create': True}, 'checkout'),
+    ],
+)
+def test_a_change_in_flight_when_the_session_was_paused_is_not_sent_again(monkeypatch, logs, tool, args, operation):
+    # The request went out and the pause came; whether it took effect is unknown. Sending it again could do it
+    # twice (a branch created twice, a delete of what was put back), so the agent is told and checks.
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    inst.list_files({'path': '.'})
+    session.state = 'PAUSED'
+    result = getattr(inst, tool)(args)
+    assert result['session'] == 'resumed'
+    assert 'not sent again' in result['error'] and 'Check' in result['error'], result
+    sent = [call for call in session.calls if isinstance(call, tuple) and call[0] == operation]
+    assert len(sent) == 1
+    assert session.calls.count('resume') == 1
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args', 'operation', 'key'),
+    [
+        ('read_file', {'path': 'notes.txt'}, 'read_bytes', 'content'),
+        ('list_files', {'path': '.'}, 'list', 'entries'),
+        ('git_diff', {}, 'diff', 'output'),
+        ('git_log', {}, 'log', 'output'),
+    ],
+)
+def test_a_read_in_flight_when_the_session_was_paused_is_sent_again(monkeypatch, logs, tool, args, operation, key):
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    inst.list_files({'path': '.'})
+    session.state = 'PAUSED'
+    result = getattr(inst, tool)(args)
+    assert 'error' not in result and key in result and result['session'] == 'resumed', result
+
+
+def test_a_change_that_failed_before_it_was_sent_is_sent_after_the_resume(monkeypatch, logs):
+    # Here the pause surfaced in the no-op command, before the write went out: nothing to be unsure about.
+    session = _FakeSession('sb-1', state='PAUSED')
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.write_file({'path': 'a.txt', 'content': 'x'})
+    assert result == {'success': True, 'path': '/home/tenki/a.txt', 'session': 'resumed'}
+    assert session.fs.files['/home/tenki/a.txt'] == 'x'
+
+
+def test_a_change_on_a_session_that_ended_runs_on_the_fresh_one(monkeypatch, logs):
+    # Nothing of the first attempt survives a terminated sandbox, and a file write has no effect outside it.
+    ended = mod.SessionTerminatedError('session_terminated')
+    dead = _FakeSession('sb-dead', fail={'write_text': ended})
+    fresh = _FakeSession('sb-fresh')
+    inst, client = _instance(monkeypatch, dead, fresh)
+    inst.list_files({'path': '.'})
+    dead.refresh = lambda: SimpleNamespace(id=dead.id, state='TERMINATED')
+    result = inst.write_file({'path': 'a.txt', 'content': 'x'})
+    assert result == {'success': True, 'path': '/home/tenki/a.txt', 'session': 'replaced'}
+    assert fresh.fs.files['/home/tenki/a.txt'] == 'x'
+
+
+def test_the_first_call_says_it_created_the_session_and_later_calls_say_nothing(monkeypatch, logs):
+    session = _FakeSession('sb-1')
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.list_files({'path': '.'})['session'] == 'created'
+    assert 'session' not in inst.list_files({'path': '.'})
+    assert 'session' not in inst.run_command({'command': 'ls'})
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args', 'operation'),
+    [
+        ('read_file', {'path': 'notes.txt'}, 'stat'),
+        ('list_files', {'path': '.'}, 'list'),
+        ('delete_path', {'path': 'notes.txt'}, 'remove'),
+        ('git_diff', {}, 'diff'),
+        ('git_log', {}, 'log'),
+        ('git_checkout', {'ref': 'main'}, 'checkout'),
+    ],
+)
+def test_a_call_that_finds_the_session_ended_says_so_in_its_session_field(monkeypatch, logs, tool, args, operation):
+    ended = mod.SessionTerminatedError('session_terminated')
+    dead = _FakeSession('sb-dead', files={'/home/tenki/notes.txt': 'kept'}, fail={operation: ended})
+    inst, client = _instance(monkeypatch, dead, _FakeSession('sb-fresh'))
+    inst.run_command({'command': 'ls'})
+    dead.refresh = lambda: SimpleNamespace(id=dead.id, state='TERMINATED')
+    result = getattr(inst, tool)(args)
+    assert result['session'] == 'ended' and 'ended' in result['error']
+    assert len(client.create_calls) == 1
+    # The call after it starts the fresh sandbox, and says so.
+    assert inst.run_command({'command': 'ls'})['session'] == 'created'
+    assert len(client.create_calls) == 2
+
+
+def test_a_command_cut_off_by_a_terminated_session_says_the_session_ended(monkeypatch, logs):
+    ended = mod.SessionTerminatedError('session_terminated')
+    dead = _FakeSession('sb-dead')
+    inst, client = _instance(monkeypatch, dead, _FakeSession('sb-fresh'))
+    inst.list_files({'path': '.'})
+    dead._run_error = ended
+    dead.refresh = lambda: SimpleNamespace(id=dead.id, state='TERMINATED')
+    result = inst.run_command({'command': 'make deploy'})
+    assert result['session'] == 'ended' and 'not run again' in result['error']
+    assert len(client.create_calls) == 1
+
+
+def test_the_session_field_schema_lists_every_value_the_node_reports():
+    assert inst_mod._SESSION_EVENT['enum'] == ['created', 'resumed', 'replaced', 'ended']
+    for value in ('created', 'resumed', 'replaced', 'ended'):
+        assert f'"{value}"' in inst_mod._SESSION_EVENT['description']
+
+
+def test_a_command_whose_follow_up_look_at_the_session_runs_past_the_deadline_is_not_reported_as_timed_out(
+    monkeypatch, logs
+):
+    # The command never started, and the look at the session that followed hit the client deadline. That is
+    # not the command timing out, and the agent is told what it was.
+    session = _FakeSession('sb-1', stalls='start', refresh_error=mod.CommandTimeoutError('Deadline Exceeded'))
+    inst, _ = _instance(monkeypatch, session)
+    session._stalls = None
+    inst.list_files({'path': '.'})
+    session._stalls = 'start'
+    result = inst.run_command({'command': 'ls'})
+    assert result['timed_out'] is False
+    assert 'Deadline Exceeded' in result['error'] and "checking the sandbox's state" in result['error'], result['error']
+
+
+def test_a_no_op_command_with_no_result_in_time_is_reported_without_touching_the_files(monkeypatch, logs):
+    session = _FakeSession('sb-1', stalls='result', warm_up_faults=True, files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.read_file({'path': 'notes.txt'})
+    assert "did not finish the node's first command" in result['error'] and _first_data_call(session) is None
+    assert session.calls.count('refresh') == 1  # it says nothing about a pause, so the session's state is looked at
+
+
+def test_a_no_op_command_that_finds_the_session_terminated_leads_to_a_replacement(monkeypatch, logs):
+    ended = mod.SessionTerminatedError('session_terminated')
+    dead = _FakeSession('sb-dead', run_error=ended, warm_up_faults=True)
+    dead.refresh = lambda: SimpleNamespace(id=dead.id, state='TERMINATED')
+    fresh = _FakeSession('sb-fresh')
+    inst, client = _instance(monkeypatch, dead, fresh)
+    result = inst.write_file({'path': 'a.txt', 'content': 'x'})
+    assert result == {'success': True, 'path': '/home/tenki/a.txt', 'session': 'replaced'}
+    assert len(client.create_calls) == 2 and fresh.fs.files['/home/tenki/a.txt'] == 'x'
+
+
+def test_an_sdk_error_while_the_no_op_command_starts_is_reported_as_itself(monkeypatch, logs):
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.txt': 'kept'})
+    start = session.start
+
+    def start_then_fail(*argv, **kwargs):
+        process = start(*argv, **kwargs)
+        if argv == _WARM_UP:
+            process.close_stdin = lambda: _raise(mod.SandboxError('quota exceeded'))
+        return process
+
+    session.start = start_then_fail
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.read_file({'path': 'notes.txt'})['error'] == 'quota exceeded'
+    assert _first_data_call(session) is None

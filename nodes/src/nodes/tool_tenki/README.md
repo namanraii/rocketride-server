@@ -2,7 +2,7 @@
 
 A RocketRide tool node that gives an agent a disposable Linux virtual machine to run commands and
 code in, edit files, and work in a git repository. Pick it when an agent needs a real operating
-system — installing packages, building, running a test suite — rather than an interpreter sandboxed
+system, to install packages, build, or run a test suite, rather than an interpreter sandboxed
 inside the engine's own process.
 
 ## About Tenki
@@ -74,10 +74,11 @@ otherwise grow it for as long as the execution timeout allows. The cap and this 
 a chatty command that finishes, such as a large `apt-get install`, is only truncated. A killed one
 comes back with `truncated` set and a note on `stderr` saying why.
 
-A call that had to recover the session first also carries a `session` field: `"resumed"` when the VM
-had been paused and its files survived, or `"replaced"` when the old session had ended, so its files
-are gone and work continues on a fresh, empty one. An agent that ignores that field can wrongly
-assume its earlier files are still there.
+A result also carries a `session` field whenever the session changed during its call: `"created"`
+(a new, empty sandbox), `"resumed"` (it had been paused; its files survived), `"replaced"` (it had
+ended, so its files are gone and this call ran on a new, empty one) or `"ended"` (it had ended and
+this call stopped there). An agent that ignores that field can wrongly assume its earlier files are
+still there. See [Session lifecycle](#session-lifecycle).
 
 ## Configuration
 
@@ -140,11 +141,14 @@ also gives operations like `git_clone` more room.
 
 Every file call carries that deadline too. The Tenki SDK sends a session's file calls with none
 (1.0.6 through 1.4.1), so the node adds it, and a stalled connection ends in an error instead of a tool
-call that never returns. One step is not covered. When a file call is the first call after a
-resume, the SDK first checks the session's data connection with a request of its own, which has no
-deadline. If that request stalls, the call waits on it, and so does every later call on the
-session, including the close at shutdown; the VM then runs until max duration pauses it. A command
-does not go through that check.
+call that never returns. The SDK also checks a session's data connection before a file call, with a
+request of its own that has no deadline, whenever Tenki has not yet reported the connection verified
+(it reports "not ready" first after a create; measured). A stall in that check would block the
+session, the close at shutdown included. A command does not go through it, and a command's first
+answer marks the connection verified. So after every create and every resume the node runs one
+bounded no-op command (`true`) before anything else, and the check never runs. Measured on real VMs
+with the connection forced to "not verified": a file call ran the check once; after the no-op
+command, zero times.
 
 ### Secret policies
 
@@ -302,36 +306,41 @@ paused and resumed. The node handles both:
 
 - **Paused** - by Tenki when the session reaches its max duration or the workspace runs out of
   credit, or by hand in Tenki's console or CLI. Memory and files under `/home/tenki` survive, but
-  `/tmp` is cleared and open network connections drop. The next tool call resumes the session and
-  retries automatically. For about a minute after a pause Tenki answers calls with errors that do
-  not name it (seen so far: an HTTP 502, a failed connection to the VM, a "no such file" about the
-  VM's own socket, a command that never starts) and can refuse the resume itself. The node looks at
-  the session's state after each of those, and keeps asking for a refused resume for about 90
-  seconds, a budget shared by the calls waiting on the same resume. That first call took 40 to 63
-  seconds when measured. An error of any other kind is reported as it is. A command that was
-  already running when the pause came is the exception to the retry. The pause cuts it off: when
-  measured, its process was gone within two seconds of the resume and did no more work. Part of its
-  work may be done, so once the sandbox has confirmed a command's start the node does not start it
-  again. Its call returns an error saying so, and the agent checks what the command did before
-  running it again. Any other call that loses the sandbox after its command has started is reported
-  with the same care. A command whose start was never confirmed is treated as not run and is sent
-  after the resume; in the two runs that counted, it ran exactly once. File and git calls are
-  different: by the retry's design, one that was in flight when the pause came is sent again after
-  the resume, so a clone, a checkout that creates a branch, or a delete can then report a failure
-  for something the first attempt did. That case has not been produced on a real VM.
-- **Ended** - terminated, from Tenki's console, CLI or API. Its files and installed packages are
-  gone, and what the agent is told depends on the call that finds out. A command, file write,
-  `make_directory` or `git_clone` that had not started runs on a fresh, empty session and carries
-  `session: "replaced"`. A read, listing, delete, or git call on an existing repository returns an
-  error saying the session ended, and creates nothing. So does a command that was running when the
-  session ended: it is not run again, because whatever it did outside the sandbox is already done.
-  After either error the next call starts the fresh session, whichever tool it is, and its result
-  carries no `session` field: the agent was told by the call before.
+  `/tmp` is cleared and open network connections drop. The next tool call resumes the session. For
+  about a minute after a pause Tenki answers calls with errors that do not name it (seen so far: an
+  HTTP 502, a failed connection to the VM, a "no such file" about the VM's own socket, a command
+  that never starts) and can refuse the resume itself. The node looks at the session's state after
+  each of those, and keeps asking for a refused resume for about 90 seconds, a budget shared by the
+  calls waiting on the same resume. That first call took 40 to 63 seconds when measured. An error of
+  any other kind is reported as it is.
 
-Recovery follows the session's real state rather than the error that surfaced: a paused session is
-resumed, an ended one is replaced, and anything else is reported to the agent unchanged. Because a
-silent retry would let an agent assume its earlier work survived, a recovered call says what happened
-in its `session` field, and a replacement is also logged as a warning, since it costs a new VM.
+  What happens to the call that met the pause depends on whether repeating it is safe. A read
+  (`read_file`, `list_files`, `git_diff`, `git_log`) is sent again after the resume and answers as
+  usual. A change (`write_file`, `make_directory`, `delete_path`, `git_clone`, `git_checkout`) that
+  had already been sent is not sent again: it may or may not have taken effect,
+  so the call returns an error saying so, and the agent checks before retrying. A change that failed
+  before it went out (in the no-op command, say) is sent after the resume. A command that was already
+  running is cut off by the pause: when measured, its process was gone within two seconds of the
+  resume and did no more work. Part of its work may be done, so once the sandbox has confirmed a
+  command's start the node does not start it again, and its call says so. A command whose start was
+  never confirmed is treated as not run and is sent after the resume; in the runs that counted it,
+  it ran exactly once. Below the node, the SDK itself sends a command's start again when the first
+  got no answer at all.
+- **Ended** - terminated, from Tenki's console, CLI or API. Its files and installed packages are
+  gone. A command or change that had not started runs on a new, empty session and carries
+  `session: "replaced"`; a change that had been sent is also sent there, since nothing of the first
+  attempt is left and a file or git change has no effect outside the sandbox. A read, listing,
+  delete or git call on an existing repository returns an error saying the session ended, carries
+  `session: "ended"`, and creates nothing. So does a command that was running when the session
+  ended: it is not run again, because whatever it did outside the sandbox is already done. The next
+  call, whichever tool it is, starts a new session and carries `session: "created"`.
+
+Every result says how the session changed during its call, when it did, in its `session` field:
+`"created"` (this call started a new, empty sandbox), `"resumed"`, `"replaced"` or `"ended"`. A
+result with no `session` field ran on the same session as the call before it. Recovery follows the
+session's real state rather than the error that surfaced: a paused session is resumed, an ended one
+is replaced or reported, and anything else is reported to the agent unchanged. A replacement is also
+logged as a warning, since it costs a new VM.
 
 ### Teardown
 

@@ -128,11 +128,13 @@ def _explained(text: str) -> str:
 
 _SESSION_EVENT = {
     'type': 'string',
-    'enum': ['resumed', 'replaced'],
+    'enum': ['created', 'resumed', 'replaced', 'ended'],
     'description': (
-        'Present only when the sandbox session had to be recovered during this call. "resumed": it had '
-        'been paused, and memory and /home/tenki survived but /tmp was cleared. "replaced": it had ended, '
-        'so earlier files and installed packages are gone and work continues on a fresh, empty session.'
+        'Present only when the sandbox session changed during this call. "created": this call started a new, '
+        'empty sandbox (the first call, or the first after one ended). "resumed": it had been paused, and memory '
+        'and /home/tenki survived but /tmp was cleared. "replaced": it had ended, so earlier files and installed '
+        'packages are gone and this call ran on a new, empty sandbox. "ended": it had ended and this call did not '
+        'continue: earlier files are gone, and the next call starts a new, empty sandbox.'
     ),
 }
 
@@ -447,7 +449,7 @@ class _StartedOnce:
     work and was gone after that. On a replaced session nothing of the first run is left inside the
     sandbox, but whatever it did outside (a deploy, a request to some service) is done. So once a
     command's start is confirmed, the node does not start it again. ``run`` appends to ``started``
-    when that happens, and ``recovered``, passed as ``on_recovery``, stops the retry from then on.
+    when that happens, and ``recovered``, passed as ``on_event``, stops the retry from then on.
 
     Two things this does not cover. A start the sandbox never confirmed is treated as not run and is
     sent again after a resume (see ``CommandNotStartedError``). And the SDK itself sends a start
@@ -457,23 +459,25 @@ class _StartedOnce:
     The same fact shapes what the agent is told when the call fails for good (see ``reported``).
     """
 
-    def __init__(self, run, recoveries: list):
+    def __init__(self, run, events: list):
         self._run = run
-        self._recoveries = recoveries
+        self._events = events
         self.started = []
 
     def __call__(self, session):
         return self._run(session, self.started)
 
-    def recovered(self, recovery: str) -> None:
-        """Note how the session was recovered, and stop the retry if the command had started.
+    def recovered(self, event: str) -> None:
+        """Note how the session changed, and stop the retry if the command had started.
 
         Raised here, before the retry asks for a session, so that a session that ended is not
-        replaced by a new VM for a call that will not use it.
+        replaced by a new VM for a call that will not use it. The result then says "ended", not
+        "replaced": nothing replaced it yet.
         """
-        self._recoveries.append(recovery)
-        if self.started:
-            raise CommandInterruptedError(recovery)
+        if self.started and event in ('resumed', 'replaced'):
+            self._events.append('resumed' if event == 'resumed' else 'ended')
+            raise CommandInterruptedError(event)
+        self._events.append(event)
 
     def reported(self, error: SandboxError) -> SandboxError:
         """The error to hand the agent for a call that failed.
@@ -487,6 +491,45 @@ class _StartedOnce:
         if not self.started or isinstance(error, (CommandInterruptedError, ResultTimeoutError)):
             return error
         return CommandInterruptedError(reason=str(error))
+
+
+class ChangeInterruptedError(SandboxError):
+    """A change had been sent when its call lost the session to a pause, and it was not sent again."""
+
+    def __init__(self, what: str) -> None:
+        super().__init__(
+            f'the sandbox was paused while this {what} was in flight, and has been resumed. It was not sent again, '
+            'so it may or may not have taken effect. Check before retrying.'
+        )
+
+
+class _ChangeOnce:
+    """Runs ``change(session, sent)`` for ``call_with_session`` without sending one change twice across a pause.
+
+    Reads are safe to send again after a resume; a change is not. A request that went out when the pause
+    came may or may not have been applied, and sending it again could apply it twice: a branch created
+    twice, a directory removed after something else was put in its place. So once ``change`` has appended to
+    ``sent`` (just before the request that changes something goes out), a resume ends the call with
+    ``ChangeInterruptedError`` instead of a retry. A change that failed before it was sent, in the no-op
+    command for example, is sent after the resume as usual. A session that ended is different: nothing of the
+    first attempt is left in a terminated sandbox, and a file or git change has no effect outside it, so the
+    retry runs on the new session.
+    """
+
+    def __init__(self, change, events: list, what: str):
+        self._change = change
+        self._events = events
+        self._what = what
+        self.sent = []
+
+    def __call__(self, session):
+        return self._change(session, self.sent)
+
+    def recovered(self, event: str) -> None:
+        """Note how the session changed, and stop the retry after a resume if the change had been sent."""
+        self._events.append(event)
+        if event == 'resumed' and self.sent:
+            raise ChangeInterruptedError(self._what)
 
 
 def _run_process(session, argv, timeout: int, started: list):
@@ -531,10 +574,10 @@ def _run_process(session, argv, timeout: int, started: list):
     return result, guard.killed
 
 
-def _with_session_event(output: dict, recoveries: list) -> dict:
-    """Tell the agent when the session was resumed or replaced during its call (see _SESSION_EVENT)."""
-    if recoveries:
-        output['session'] = recoveries[-1]
+def _with_session_event(output: dict, events: list) -> dict:
+    """Tell the agent how the session changed during its call, if it did (see _SESSION_EVENT): the last change."""
+    if events:
+        output['session'] = events[-1]
     return output
 
 
@@ -623,13 +666,13 @@ class IInstance(IInstanceBase):
         def run(session, started):
             return _run_process(session, ('bash', '-lc', command), self.IGlobal.exec_timeout_secs, started)
 
-        recoveries = []
-        once = _StartedOnce(run, recoveries)
+        events = []
+        once = _StartedOnce(run, events)
         try:
-            result, killed = self.IGlobal.call_with_session(once, on_recovery=once.recovered)
+            result, killed = self.IGlobal.call_with_session(once, on_event=once.recovered)
         except SandboxError as e:
-            return _with_session_event(_exec_error(once.reported(e)), recoveries)
-        return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars, killed=killed), recoveries)
+            return _with_session_event(_exec_error(once.reported(e)), events)
+        return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars, killed=killed), events)
 
     @tenki_tool(
         group='execution',
@@ -687,13 +730,13 @@ class IInstance(IInstanceBase):
                     # here would hide the result (or the real error) of the run itself.
                     pass
 
-        recoveries = []
-        once = _StartedOnce(run, recoveries)
+        events = []
+        once = _StartedOnce(run, events)
         try:
-            result, killed = self.IGlobal.call_with_session(once, on_recovery=once.recovered)
+            result, killed = self.IGlobal.call_with_session(once, on_event=once.recovered)
         except SandboxError as e:
-            return _with_session_event(_exec_error(once.reported(e)), recoveries)
-        return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars, killed=killed), recoveries)
+            return _with_session_event(_exec_error(once.reported(e)), events)
+        return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars, killed=killed), events)
 
     # -----------------------------------------------------------------------
     # Group: filesystem
@@ -728,7 +771,8 @@ class IInstance(IInstanceBase):
         if not isinstance(content, str):
             raise ValueError('"content" is required and must be a string')
 
-        def write(session):
+        def write(session, sent):
+            sent.append(True)
             try:
                 session.fs.write_text(path, content)
             except TenkiFileNotFoundError as e:
@@ -738,12 +782,13 @@ class IInstance(IInstanceBase):
                 session.fs.mkdir(posixpath.dirname(path))
                 session.fs.write_text(path, content)
 
-        recoveries = []
+        events = []
+        once = _ChangeOnce(write, events, 'file write')
         try:
-            self.IGlobal.call_with_session(write, on_recovery=recoveries.append)
+            self.IGlobal.call_with_session(once, on_event=once.recovered)
         except SandboxError as e:
-            return _with_session_event({'success': False, 'path': path, 'error': _fs_error(e, path)}, recoveries)
-        return _with_session_event({'success': True, 'path': path}, recoveries)
+            return _with_session_event({'success': False, 'path': path, 'error': _fs_error(e, path)}, events)
+        return _with_session_event({'success': True, 'path': path}, events)
 
     @tenki_tool(
         group='filesystem',
@@ -781,12 +826,12 @@ class IInstance(IInstanceBase):
                 return info, None
             return info, session.fs.read_bytes(path)
 
-        recoveries = []
+        events = []
         try:
-            info, data = self.IGlobal.call_with_session(read, replace=False, on_recovery=recoveries.append)
+            info, data = self.IGlobal.call_with_session(read, replace=False, on_event=events.append)
         except (SandboxError, SessionEndedError) as e:
             failed = {'path': path, 'content': '', 'truncated': False, 'error': _fs_error(e, path)}
-            return _with_session_event(failed, recoveries)
+            return _with_session_event(failed, events)
         if data is None:
             if info.is_dir:
                 error = f'{path} is a directory; use list_files to see what is in it'
@@ -795,9 +840,9 @@ class IInstance(IInstanceBase):
                     f'{path} is {info.size:,} bytes, more than the {_READ_LIMIT_BYTES:,} read_file fetches; '
                     'read the part you need with run_command (head, tail or sed -n)'
                 )
-            return _with_session_event({'path': path, 'content': '', 'truncated': False, 'error': error}, recoveries)
+            return _with_session_event({'path': path, 'content': '', 'truncated': False, 'error': error}, events)
         content, truncated = _truncate(data.decode('utf-8', errors='replace'), self.IGlobal.max_output_chars)
-        return _with_session_event({'path': path, 'content': content, 'truncated': truncated}, recoveries)
+        return _with_session_event({'path': path, 'content': content, 'truncated': truncated}, events)
 
     @tenki_tool(
         group='filesystem',
@@ -842,18 +887,18 @@ class IInstance(IInstanceBase):
         path = _normalize_path(args.get('path') or '.')
         include_hidden = optional_bool(args, 'include_hidden', default=False, tool_name='tenki')
 
-        recoveries = []
+        events = []
         try:
             entries = self.IGlobal.call_with_session(
                 lambda session: session.fs.list(path, include_hidden=include_hidden),
                 replace=False,
-                on_recovery=recoveries.append,
+                on_event=events.append,
             )
         except (SandboxError, SessionEndedError) as e:
             failed = {'path': path, 'entries': [], 'truncated': False, 'error': _fs_error(e, path)}
-            return _with_session_event(failed, recoveries)
+            return _with_session_event(failed, events)
         shaped, truncated = _listing(entries, self.IGlobal.max_output_chars)
-        return _with_session_event({'path': path, 'entries': shaped, 'truncated': truncated}, recoveries)
+        return _with_session_event({'path': path, 'entries': shaped, 'truncated': truncated}, events)
 
     @tenki_tool(
         group='filesystem',
@@ -875,12 +920,17 @@ class IInstance(IInstanceBase):
         args = normalize_tool_input(args, tool_name='tenki')
         path = _normalize_path(args.get('path'))
 
-        recoveries = []
+        def mkdir(session, sent):
+            sent.append(True)
+            session.fs.mkdir(path)
+
+        events = []
+        once = _ChangeOnce(mkdir, events, 'directory creation')
         try:
-            self.IGlobal.call_with_session(lambda session: session.fs.mkdir(path), on_recovery=recoveries.append)
+            self.IGlobal.call_with_session(once, on_event=once.recovered)
         except SandboxError as e:
-            return _with_session_event({'success': False, 'path': path, 'error': _fs_error(e, path)}, recoveries)
-        return _with_session_event({'success': True, 'path': path}, recoveries)
+            return _with_session_event({'success': False, 'path': path, 'error': _fs_error(e, path)}, events)
+        return _with_session_event({'success': True, 'path': path}, events)
 
     @tenki_tool(
         group='filesystem',
@@ -906,14 +956,17 @@ class IInstance(IInstanceBase):
             # The agent's whole workspace: never a sensible target for one tool call.
             raise ValueError('refusing to delete /home/tenki itself; name a file or directory inside it')
 
-        recoveries = []
+        def remove(session, sent):
+            sent.append(True)
+            session.fs.remove(path)
+
+        events = []
+        once = _ChangeOnce(remove, events, 'delete')
         try:
-            self.IGlobal.call_with_session(
-                lambda session: session.fs.remove(path), replace=False, on_recovery=recoveries.append
-            )
+            self.IGlobal.call_with_session(once, replace=False, on_event=once.recovered)
         except (SandboxError, SessionEndedError) as e:
-            return _with_session_event({'success': False, 'path': path, 'error': _fs_error(e, path)}, recoveries)
-        return _with_session_event({'success': True, 'path': path}, recoveries)
+            return _with_session_event({'success': False, 'path': path, 'error': _fs_error(e, path)}, events)
+        return _with_session_event({'success': True, 'path': path}, events)
 
     # -----------------------------------------------------------------------
     # Group: git
@@ -975,17 +1028,19 @@ class IInstance(IInstanceBase):
                 raise ValueError('could not derive a folder name from "repo"; pass "directory"')
             directory = _normalize_path(folder)
 
-        recoveries = []
+        def clone(session, sent):
+            sent.append(True)
+            return session.git.clone(repo, branch=branch, depth=depth, directory=directory)
+
+        events = []
+        once = _ChangeOnce(clone, events, 'clone')
         try:
-            output = self.IGlobal.call_with_session(
-                lambda session: session.git.clone(repo, branch=branch, depth=depth, directory=directory),
-                on_recovery=recoveries.append,
-            )
+            output = self.IGlobal.call_with_session(once, on_event=once.recovered)
         except SandboxError as e:
             failed = {'directory': directory, 'output': '', 'truncated': False, 'error': _explained(str(e))}
-            return _with_session_event(failed, recoveries)
+            return _with_session_event(failed, events)
         cloned = {'directory': directory, **_git_result(output, self.IGlobal.max_output_chars)}
-        return _with_session_event(cloned, recoveries)
+        return _with_session_event(cloned, events)
 
     @tenki_tool(
         group='git',
@@ -1014,16 +1069,17 @@ class IInstance(IInstanceBase):
         create = optional_bool(args, 'create', default=False, tool_name='tenki')
         directory = _git_directory(args)
 
-        recoveries = []
+        def checkout(session, sent):
+            sent.append(True)
+            return session.git.checkout(ref, create=create, directory=directory)
+
+        events = []
+        once = _ChangeOnce(checkout, events, 'checkout')
         try:
-            output = self.IGlobal.call_with_session(
-                lambda session: session.git.checkout(ref, create=create, directory=directory),
-                replace=False,
-                on_recovery=recoveries.append,
-            )
+            output = self.IGlobal.call_with_session(once, replace=False, on_event=once.recovered)
         except (SandboxError, SessionEndedError) as e:
-            return _with_session_event({'output': '', 'truncated': False, 'error': _explained(str(e))}, recoveries)
-        return _with_session_event(_git_result(output, self.IGlobal.max_output_chars), recoveries)
+            return _with_session_event({'output': '', 'truncated': False, 'error': _explained(str(e))}, events)
+        return _with_session_event(_git_result(output, self.IGlobal.max_output_chars), events)
 
     @tenki_tool(
         group='git',
@@ -1055,16 +1111,16 @@ class IInstance(IInstanceBase):
         path = _git_arg(args, 'path')
         directory = _git_directory(args)
 
-        recoveries = []
+        events = []
         try:
             output = self.IGlobal.call_with_session(
                 lambda session: session.git.diff(**revisions, path=path, directory=directory),
                 replace=False,
-                on_recovery=recoveries.append,
+                on_event=events.append,
             )
         except (SandboxError, SessionEndedError) as e:
-            return _with_session_event({'output': '', 'truncated': False, 'error': _explained(str(e))}, recoveries)
-        return _with_session_event(_git_result(output, self.IGlobal.max_output_chars), recoveries)
+            return _with_session_event({'output': '', 'truncated': False, 'error': _explained(str(e))}, events)
+        return _with_session_event(_git_result(output, self.IGlobal.max_output_chars), events)
 
     @tenki_tool(
         group='git',
@@ -1101,15 +1157,15 @@ class IInstance(IInstanceBase):
         path = _git_arg(args, 'path')
         directory = _git_directory(args)
 
-        recoveries = []
+        events = []
         try:
             output = self.IGlobal.call_with_session(
                 lambda session: session.git.log(
                     max_count=max_count, range=revision_range, path=path, directory=directory
                 ),
                 replace=False,
-                on_recovery=recoveries.append,
+                on_event=events.append,
             )
         except (SandboxError, SessionEndedError) as e:
-            return _with_session_event({'output': '', 'truncated': False, 'error': _explained(str(e))}, recoveries)
-        return _with_session_event(_git_result(output, self.IGlobal.max_output_chars), recoveries)
+            return _with_session_event({'output': '', 'truncated': False, 'error': _explained(str(e))}, events)
+        return _with_session_event(_git_result(output, self.IGlobal.max_output_chars), events)
