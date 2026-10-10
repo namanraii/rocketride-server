@@ -2888,7 +2888,7 @@ def test_a_resume_that_runs_out_of_time_comes_back_to_the_agent_as_an_error(monk
     [
         (TimeoutError('timeout waiting for sandbox sb-1'), 'did not finish resuming'),
         (mod.SandboxError('readiness check failed'), 'readiness check failed'),
-        (mod.CommandTimeoutError('Deadline Exceeded'), "checking the sandbox's state ran past the deadline"),
+        (mod.CommandTimeoutError('Deadline Exceeded'), 'or waiting for it to run) ran past the deadline'),
     ],
 )
 def test_a_resume_that_does_not_come_up_in_time_is_reported_by_the_next_call(monkeypatch, logs, wait_error, reported):
@@ -3222,8 +3222,9 @@ def _refusing(session, clock, seconds_per_ask=10):
 
 
 def test_the_resume_budget_runs_from_the_first_ask_and_is_not_renewed_by_each_one(monkeypatch, logs):
-    # 90 seconds in all, asking every 5: with refusals that take 10 seconds each, the asks end at
-    # 10, 25, 40, 55, 70, 85 and 100 seconds, and the seventh is the last.
+    # 120 seconds in all, asking every 5: with refusals that take 10 seconds each, the asks end at
+    # 10, 25, 40, 55, 70, 85, 100 and 115 seconds. A ninth would start at 120, so the eighth refusal is the last,
+    # with no pause after it.
     clock = _Clock()
     monkeypatch.setattr(mod, 'time', clock)
     session = _FakeSession('sb-1', state='PAUSED', resume_refusals=1000)
@@ -3231,9 +3232,9 @@ def test_the_resume_budget_runs_from_the_first_ask_and_is_not_renewed_by_each_on
     inst, _ = _instance(monkeypatch, session)
     result = inst.read_file({'path': 'notes.txt'})
     assert 'still being torn down' in result['error']
-    assert session.calls.count('resume') == 7
-    assert clock.sleeps == [5] * 6
-    assert clock.now - 1000.0 == 100
+    assert session.calls.count('resume') == 8
+    assert clock.sleeps == [5] * 7
+    assert clock.now - 1000.0 == 115
 
 
 def test_calls_queued_behind_a_refused_resume_share_its_budget(monkeypatch, logs):
@@ -3279,7 +3280,7 @@ def test_a_resume_that_took_ends_its_budget_so_a_pause_soon_after_starts_a_new_o
     session = _FakeSession('sb-1', state='PAUSED', resume_refusals=5, files={'/home/tenki/notes.txt': 'kept'})
     _refusing(session, clock)
     inst, _ = _instance(monkeypatch, session)
-    assert inst.read_file({'path': 'notes.txt'})['session'] == 'resumed'  # after 85 of the 90 seconds
+    assert inst.read_file({'path': 'notes.txt'})['session'] == 'resumed'  # after 85 of the 120 seconds
     clock.now += 60
     session.state, session._resume_refusals = 'PAUSED', 3
     result = inst.read_file({'path': 'notes.txt'})
@@ -3296,22 +3297,22 @@ def test_a_call_long_after_a_spent_budget_gets_a_budget_of_its_own(monkeypatch, 
     inst, _ = _instance(monkeypatch, session)
     assert 'still being torn down' in inst.read_file({'path': 'notes.txt'})['error']
     spent = session.calls.count('resume')
-    clock.now += 70  # the budget ran out 80 seconds ago by now: still within a budget's length of it
+    clock.now += 70  # the budget ran out 70 seconds ago by now: still within a budget's length of it
     assert 'still being torn down' in inst.read_file({'path': 'notes.txt'})['error']
     assert session.calls.count('resume') == spent + 1
-    clock.now += 90
+    clock.now += 90  # more than a budget's length after it ran out, so a new budget of eight asks
     assert 'still being torn down' in inst.read_file({'path': 'notes.txt'})['error']
-    assert session.calls.count('resume') == spent + 1 + 7
+    assert session.calls.count('resume') == spent + 1 + 8
 
 
-def test_a_resume_refused_for_a_named_reason_ends_the_budget_too(monkeypatch, logs):
+def test_a_refusal_that_ends_the_wait_ends_the_budget_too(monkeypatch, logs):
     # Otherwise what is left of it would be all the next pause gets: one ask, where three refusals
-    # are normal.
+    # are normal. Here the wait ends because the session's state cannot be read after the second refusal.
     clock = _Clock()
     monkeypatch.setattr(mod, 'time', clock)
     session = _FakeSession('sb-1', state='PAUSED', files={'/home/tenki/notes.txt': 'kept'})
     answers = [mod.SandboxError(_NOT_YET), inst_mod.PermissionDeniedError('workspace suspended')]
-    resume = session.resume
+    resume, refresh = session.resume, session.refresh
 
     def refused_then_named():
         clock.now += 10
@@ -3320,7 +3321,14 @@ def test_a_resume_refused_for_a_named_reason_ends_the_budget_too(monkeypatch, lo
             raise answers.pop(0)
         resume()
 
+    def unreadable_after_the_second_refusal():
+        if session.calls.count('resume') == 2 and not getattr(session, '_unreadable_once', False):
+            session._unreadable_once = True
+            raise mod.CommandTimeoutError('Deadline Exceeded')
+        return refresh()
+
     session.resume = refused_then_named
+    session.refresh = unreadable_after_the_second_refusal
     inst, _ = _instance(monkeypatch, session)
     assert inst.run_command({'command': 'ls'})['error'] == 'workspace suspended'
     # The workspace is restored and the session resumed from Tenki's console, not through the node.
@@ -3409,20 +3417,249 @@ def test_resume_retries_stop_when_the_pipeline_starts_shutting_down(monkeypatch,
     assert session.calls.count('resume') == 1 and inst.IGlobal.session is session
 
 
-def test_a_resume_refused_for_a_reason_tenki_names_is_not_asked_again(monkeypatch, logs):
-    # Only the catch-all "not yet" is worth repeating. An error with a class of its own means something.
-    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
-    session = _FakeSession('sb-1', state='PAUSED')
-    refused = inst_mod.PermissionDeniedError('workspace suspended')
+def _refused_then_resumed(session, refusals, *, state_while_refused='PAUSED'):
+    """Make ``session.resume`` raise each error in ``refusals`` in turn, leaving the session in
+    ``state_while_refused``, and then succeed.
+    """
+    pending = list(refusals)
 
     def resume():
         session.calls.append('resume')
-        raise refused
+        if pending:
+            session.state = state_while_refused
+            raise pending.pop(0)
+        session.state = 'RUNNING'
 
     session.resume = resume
-    inst, _ = _instance(monkeypatch, session)
-    assert inst.run_command({'command': 'ls'})['error'] == 'workspace suspended'
+
+
+@pytest.mark.parametrize(
+    'refusal',
+    [
+        # Measured 2026-10-05: the catch-all, for up to a minute after a pause.
+        mod.SandboxError('paused source is still being torn down, retry shortly'),
+        # Seen 2026-10-09 on the PR-base engine, for at least 32.6 s: not the catch-all (the node then in use
+        # did not ask again), but which class it came as was not recorded. InvalidStateError stands in for it.
+        mod.InvalidStateError('snapshot not yet durable on a reachable host'),
+        # Whatever the class or the text: the session's state decides, not the error.
+        inst_mod.PermissionDeniedError('workspace suspended'),
+    ],
+)
+@pytest.mark.parametrize('state_while_refused', ['PAUSED', 'RESUMING'])
+def test_a_refused_resume_is_asked_again_while_the_session_is_still_paused_or_resuming(
+    monkeypatch, logs, refusal, state_while_refused
+):
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    session = _FakeSession('sb-1', state='PAUSED', files={'/home/tenki/notes.txt': 'kept'})
+    _refused_then_resumed(session, [refusal, refusal], state_while_refused=state_while_refused)
+    inst, client = _instance(monkeypatch, session)
+    result = inst.read_file({'path': 'notes.txt'})
+    assert result.get('content') == 'kept' and result['session'] == 'resumed', result
+    assert session.calls.count('resume') == 3 and len(client.create_calls) == 1
+    # The state is asked for after each refusal, not taken from the handle.
+    asks = [n for n, call in enumerate(session.calls) if call == 'resume']
+    assert all(session.calls[n + 1] == 'refresh' for n in asks[:2]), session.calls
+
+
+@pytest.mark.parametrize(
+    'refusal',
+    [
+        mod.SandboxError('paused source is still being torn down, retry shortly'),
+        mod.InvalidStateError('session is being terminated'),
+    ],
+)
+@pytest.mark.parametrize('gone', ['TERMINATED', 'TERMINATING', None])
+def test_a_refused_resume_after_which_the_session_is_gone_drops_it_and_is_not_asked_again(
+    monkeypatch, logs, gone, refusal
+):
+    # None: Tenki no longer knows the session. Whatever the class, even the catch-all that used to be asked again.
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    session = _FakeSession('sb-1', state='PAUSED')
+
+    def resume():
+        session.calls.append('resume')
+        session.state = gone
+        raise refusal
+
+    session.resume = resume
+    if gone is None:
+        looked = session.refresh
+
+        def refresh():
+            if 'resume' in session.calls:  # unknown to Tenki only once the resume was refused
+                raise mod.SessionNotFoundError('session not found')
+            return looked()
+
+        session.refresh = refresh
+    inst, client = _instance(monkeypatch, session)
+    result = inst.read_file({'path': 'notes.txt'})
     assert session.calls.count('resume') == 1
+    # Dropped like any ended session: a read says so and creates nothing; the next call starts a fresh one.
+    assert result.get('content') == '' and result['session'] == 'ended' and 'ended' in result['error'], result
+    assert inst.IGlobal.session is None and len(client.create_calls) == 1
+    # The refusal that ends the wait is in the job log, class and all, not only in the agent's result.
+    assert any(type(refusal).__name__ in message and 'not asked again' in message for message in logs), logs
+
+
+def test_a_refused_resume_after_which_the_session_runs_counts_as_resumed(monkeypatch, logs):
+    # The resume took (an earlier ask Tenki answered with an error, say, or another client), so the
+    # session is treated as resumed: its no-op command runs again and the agent is told.
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    session = _FakeSession('sb-1', state='PAUSED', files={'/home/tenki/notes.txt': 'kept'})
+    _refused_then_resumed(session, [mod.InvalidStateError('session is not paused')], state_while_refused='RUNNING')
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.read_file({'path': 'notes.txt'})
+    assert result.get('content') == 'kept' and result['session'] == 'resumed', result
+    assert session.calls.count('resume') == 1
+    assert _warm_ups(session) == 2  # once for the create, once after the resume
+
+
+def test_a_refusal_followed_by_running_ends_the_budget(monkeypatch, logs):
+    # The resume took, so a pause soon after gets a whole budget, not what was left of this one.
+    clock = _Clock()
+    monkeypatch.setattr(mod, 'time', clock)
+    session = _FakeSession('sb-1', state='PAUSED', files={'/home/tenki/notes.txt': 'kept'})
+    _refused_then_resumed(session, [mod.InvalidStateError('session is not paused')], state_while_refused='RUNNING')
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.read_file({'path': 'notes.txt'})['session'] == 'resumed'
+    assert inst.IGlobal._resume_retry_until is None
+
+
+def test_a_session_still_resuming_when_the_budget_runs_out_is_reported_by_the_next_call(monkeypatch, logs):
+    # A resume is under way (an earlier ask Tenki answered with an error, or another client), but every ask is
+    # refused until the budget is spent. The call reports the refusal; once the session runs, the next call says
+    # "resumed" and its no-op command runs first, as for any resume that came up late.
+    clock = _Clock()
+    monkeypatch.setattr(mod, 'time', clock)
+    session = _FakeSession('sb-1', state='PAUSED', files={'/home/tenki/notes.txt': 'kept'})
+    _refused_then_resumed(
+        session, [mod.InvalidStateError('session is not paused')] * 1000, state_while_refused='RESUMING'
+    )
+    _refusing(session, clock)
+    inst, _ = _instance(monkeypatch, session)
+    first = inst.read_file({'path': 'notes.txt'})
+    assert 'session is not paused' in first['error'] and first.get('session') != 'resumed'
+    assert any('still RESUMING' in message and 'InvalidStateError' in message for message in logs), logs
+    # A resume under way is a new start for this session, so a pause soon after gets a whole budget.
+    assert inst.IGlobal._resume_retry_until is None
+    session.state = 'RUNNING'
+    warm_before = _warm_ups(session)
+    second = inst.read_file({'path': 'notes.txt'})
+    assert second.get('content') == 'kept' and second['session'] == 'resumed', second
+    assert _warm_ups(session) == warm_before + 1
+
+
+def test_a_warm_session_still_resuming_at_the_end_of_the_budget_is_not_told_resumed_while_it_resumes(monkeypatch, logs):
+    # The session had run its no-op command before the pause. When the budget runs out with the session RESUMING,
+    # its no-op command must run again before any call is told "resumed", so a call that still finds it resuming is not.
+    clock = _Clock()
+    monkeypatch.setattr(mod, 'time', clock)
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.read_file({'path': 'notes.txt'})['session'] == 'created'
+    session.state = 'PAUSED'
+    _refused_then_resumed(
+        session, [mod.InvalidStateError('session is not paused')] * 1000, state_while_refused='RESUMING'
+    )
+    _refusing(session, clock)
+    assert 'session is not paused' in inst.read_file({'path': 'notes.txt'})['error']
+    start = session.start
+
+    def start_unless_resuming(*argv, **kwargs):
+        if session.state == 'RESUMING':
+            raise mod.SandboxError('session is resuming')
+        return start(*argv, **kwargs)
+
+    session.start = start_unless_resuming
+    still = inst.read_file({'path': 'notes.txt'})
+    assert still.get('session') != 'resumed', still
+    session.state = 'RUNNING'
+    assert inst.read_file({'path': 'notes.txt'})['session'] == 'resumed'
+
+
+def test_a_late_resume_is_told_only_to_a_call_that_finds_the_session_running(monkeypatch, logs):
+    # The notice is claimed once the session's no-op command has run. A call that still finds it resuming
+    # fails as it would anyway and leaves the notice for the call that does find it running.
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    glb = inst.IGlobal
+    glb.get_session()
+    glb._warm, glb._resume_unreported, session.state = None, session, 'RESUMING'
+    start = session.start
+
+    def start_unless_resuming(*argv, **kwargs):
+        if session.state == 'RESUMING':
+            raise mod.SandboxError('session is resuming')
+        return start(*argv, **kwargs)
+
+    session.start = start_unless_resuming
+    early = inst.read_file({'path': 'notes.txt'})
+    assert 'session is resuming' in early['error'] and early.get('session') != 'resumed', early
+    assert glb._resume_unreported is session
+    session.state = 'RUNNING'
+    late = inst.read_file({'path': 'notes.txt'})
+    assert late.get('content') == 'kept' and late['session'] == 'resumed', late
+    assert 'session' not in inst.read_file({'path': 'notes.txt'})
+
+
+def test_a_refusal_still_there_when_the_budget_runs_out_is_logged_with_its_class(monkeypatch, logs):
+    clock = _Clock()
+    monkeypatch.setattr(mod, 'time', clock)
+    session = _FakeSession('sb-1', state='PAUSED')
+    _refused_then_resumed(session, [mod.InvalidStateError('snapshot not yet durable on a reachable host')] * 1000)
+    _refusing(session, clock)
+    inst, _ = _instance(monkeypatch, session)
+    assert 'not yet durable' in inst.read_file({'path': 'notes.txt'})['error']
+    assert any('InvalidStateError' in m and 'still PAUSED' in m and 'budget' in m for m in logs), logs
+
+
+def test_a_resume_reported_by_the_retry_is_not_reported_again_by_the_next_call(monkeypatch, logs):
+    # A call whose retry follows a resume says "resumed"; if a resume was also left unreported for the same
+    # session, the next call must not say it again.
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    glb = inst.IGlobal
+    glb.get_session()
+    first = [True]
+
+    def call(s):
+        if first:
+            first.pop()
+            # Meanwhile one call resumed the session (the epoch moves), and a later one's resume was accepted
+            # but did not come up within its wait (the notice is left for the next call).
+            glb.session_epoch += 1
+            glb.last_recovery = 'resumed'
+            glb._resume_unreported = s
+            raise mod.SessionTerminatedError('session_terminated:paused')
+        return 'ran'
+
+    events = []
+    assert glb.call_with_session(call, on_event=events.append) == 'ran'
+    assert events == ['resumed']
+    later = []
+    glb.call_with_session(lambda s: 'ran', on_event=later.append)
+    assert later == []
+
+
+def test_a_retry_stopped_by_its_tool_still_claims_the_late_resume(monkeypatch, logs):
+    # A started command or a sent change stops the retry by raising from on_event; the notice is claimed first.
+    session = _FakeSession('sb-1')
+    inst, _ = _instance(monkeypatch, session)
+    glb = inst.IGlobal
+    glb.get_session()
+
+    def call(s):
+        glb.session_epoch += 1
+        glb.last_recovery = 'resumed'
+        glb._resume_unreported = s
+        raise mod.SessionTerminatedError('session_terminated:paused')
+
+    def stop(event):
+        raise inst_mod.CommandInterruptedError(event)
+
+    with pytest.raises(inst_mod.CommandInterruptedError):
+        glb.call_with_session(call, on_event=stop)
+    assert glb._resume_unreported is None
 
 
 class _PausedBeforeStart(_FakeSession):
@@ -4061,7 +4298,7 @@ def test_a_command_whose_follow_up_look_at_the_session_runs_past_the_deadline_is
     session._stalls = 'start'
     result = inst.run_command({'command': 'ls'})
     assert result['timed_out'] is False
-    assert 'Deadline Exceeded' in result['error'] and "checking the sandbox's state" in result['error'], result['error']
+    assert 'Deadline Exceeded' in result['error'] and 'recovering the sandbox' in result['error'], result['error']
 
 
 def test_a_no_op_command_with_no_result_in_time_is_reported_without_touching_the_files(monkeypatch, logs):

@@ -351,9 +351,18 @@ paused and resumed. The node handles both:
   about a minute after a pause Tenki answers calls with errors that do not name it (seen so far: an
   HTTP 502, a failed connection to the VM, a "no such file" about the VM's own socket, a command
   that never starts) and can refuse the resume itself. The node looks at the session's state after
-  each of those, and keeps asking for a refused resume for about 90 seconds, a budget shared by the
-  calls waiting on the same resume. That first call took 41 to 67 seconds when measured on
-  2026-10-05, and 13 to 17 seconds on 2026-10-09. An error of any other kind is reported as it is.
+  each of those. A refused resume is asked again while the session still reads paused or resuming,
+  whatever the refusal says, until a two-minute budget shared by the calls waiting on the same resume
+  is spent; within one call no ask starts after that, and a call that arrives soon after asks once
+  (measured: refusals that ended within 17.7, 32.8 and 48.2 seconds, and one that lasted at least
+  32.6 seconds, end not seen). A refusal that does not go away while the session stays paused, a
+  suspended workspace say, therefore reaches the agent only at the end of those two minutes. If the
+  session reads running after a refusal, the resume took and is treated as one; if it reads ended,
+  it is handled as an ended session (below). That first call took 41 to 67 seconds when measured on
+  2026-10-05, and 13 to 17 seconds on 2026-10-09. `agent_rocketride` (on `develop`) gives one tool
+  call 300 seconds by default, so a first call that meets a long refusal and a slow resume can be
+  reported to the agent as timed out while it finishes; the `session` field of that call's result,
+  "resumed" included, is then lost with it. An error of any other kind is reported as it is.
 
   What happens to the call that met the pause depends on whether repeating it is safe. A read
   (`read_file`, `list_files`, `git_diff`, `git_log`) is sent again after the resume and answers as
@@ -379,9 +388,10 @@ paused and resumed. The node handles both:
 
 Every result says how the session changed during its call, when it did, in its `session` field:
 `"created"` (this call started a new, empty sandbox), `"resumed"`, `"replaced"` or `"ended"`. A
-result with no `session` field ran on the same session as the call before it. One case is reported a
-call late: when Tenki accepts a resume but the session does not run within the node's three-minute
-wait, that call returns its error and the next call carries `"resumed"`. Recovery follows the
+result with no `session` field ran on the same session as the call before it. Two cases are reported
+late: when Tenki accepts a resume but the session does not run within the node's three-minute wait,
+or is still resuming when the two-minute budget ends. That call returns its error, and the first later
+call that finds the session running carries `"resumed"`. Recovery follows the
 session's real state rather than the error that surfaced: a paused session is resumed, an ended one
 is replaced or reported, and anything else is reported to the agent unchanged. A replacement is also
 logged as a warning, since it costs a new VM.

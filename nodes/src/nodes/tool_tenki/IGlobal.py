@@ -94,11 +94,17 @@ _MIN_RPC_TIMEOUT_SECS = 60
 # How long recovery waits for a resumed session to run again: the SDK's own readiness budget.
 _READY_WAIT_SECS = 180
 
-# How long recovery keeps asking for a resume that Tenki refuses with its catch-all "not yet", and the
-# pause between asks. Measured after a pause at max_duration: one to three refusals ("paused source is
-# still being torn down, retry shortly") over 18 to 48 seconds, each taking about 10 seconds itself.
-# No new ask starts once the budget is spent, so a call can wait about one ask longer than this.
-_RESUME_RETRY_SECS = 90
+# How long recovery keeps asking for a resume Tenki refuses while the session still waits to be resumed,
+# and the pause between asks. Measured on 2026-10-05 ("paused source is still being torn down"), from the
+# first ask until the resumed session had run a command: at most 17.7, 32.8 and 48.2 s, so the refusals
+# themselves lasted less. On 2026-10-09 refusals ("snapshot not yet durable on a reachable host") lasted at
+# least 32.6 s; their end was not seen. 120 is more than twice the longest complete window, and on its own
+# under the 300 s that agent_rocketride allows one tool call by default on develop; the whole first call
+# after a pause can still run past that when a long refusal meets a slow readiness wait. Within one call no
+# ask starts that would begin after the budget; a call that queued behind it and arrives soon after the
+# budget is spent asks once more (see _resume). So a call waits about one ask and one look at the state
+# longer than the budget, and a call queued behind it about one of each more.
+_RESUME_RETRY_SECS = 120
 _RESUME_RETRY_PAUSE_SECS = 5
 
 # The no-op command run on a session before its first use after a create or a resume (see _warm_up): its own
@@ -114,6 +120,11 @@ _DEFAULT_BASE_URL = 'https://api.tenki.cloud'
 # not in Tenki's documented lifecycle, but it is in the protocol, and a session that has
 # shut down is handled like a terminated one.
 _GONE_STATES = frozenset({'TERMINATING', 'TERMINATED', 'USER_SHUTDOWN'})
+# A refused resume is a wait, not a failure, while the session still reads one of these: the refusal is
+# temporary by the session's state, whatever the error's class or text.
+_STILL_RESUMABLE_STATES = frozenset({'PAUSED', 'RESUMING'})
+# What _state_after_refusal returns when Tenki no longer knows the session (None means unreadable).
+_NOT_FOUND = 'NOT_FOUND'
 
 # Errors that can mean the session itself stopped being usable. Each is only a hint:
 # the SDK maps every NOT_FOUND it cannot attribute to SessionNotFoundError and every
@@ -344,7 +355,8 @@ class IGlobal(IGlobalBase):
     # resumed (see _warm_up). Read without the lock as a fast path; written under it.
     _warm: str | None = None
     # A session whose resume Tenki accepted but which did not come up within the wait, so the call that
-    # asked could not say "resumed". The next call says it instead (see call_with_session). Under the lock.
+    # asked could not say "resumed". The next call to find the session running says it instead (see
+    # call_with_session). Under the lock.
     _resume_unreported: Sandbox | None = None
     # Set once the job log has said that the key lacks Secrets access, so later refused calls do not repeat it.
     _secrets_refusal_logged: bool = False
@@ -610,9 +622,9 @@ class IGlobal(IGlobalBase):
         epoch = self.session_epoch
         try:
             session = self.get_session(on_event)
-            self._report_late_resume(session, on_event)
             try:
                 self._ensure_warm(session)
+                self._report_late_resume(session, on_event)
                 return call(session)
             except _LIFECYCLE_ERRORS:
                 recovery = self._recover(session, epoch, replace, on_event)
@@ -624,6 +636,10 @@ class IGlobal(IGlobalBase):
                 recovery = self._recover(session, epoch, replace, on_event)
                 if not recovery:
                     raise
+            if recovery == 'resumed':
+                # This result says it (or the tool stops here and its error does); a resume left unreported
+                # must not be said again by the next call. Claimed first, since on_event may raise.
+                self._report_late_resume(session, None)
             if on_event is not None:
                 on_event(recovery)
             session = self.get_session()
@@ -643,7 +659,9 @@ class IGlobal(IGlobalBase):
     def _report_late_resume(self, session: Sandbox, on_event) -> None:
         """Say "resumed" for a resume an earlier call asked for but could not see come up (see recover_session).
 
-        Told to exactly one call, before it does anything, so no tool's retry rule is involved.
+        Told to one call, normally the first whose no-op command has run, so the session does run, and before the
+        call itself does anything, so no tool's retry rule is involved. (A call that passed the no-op check just
+        before another call's recovery recorded the resume can be the one to claim it.)
         """
         if self._resume_unreported is not session:
             return
@@ -668,7 +686,8 @@ class IGlobal(IGlobalBase):
             raise
         except CommandTimeoutError as e:
             raise SessionUnavailableError(
-                f"the call failed, and checking the sandbox's state ran past the deadline: {e}"
+                f'the call failed, and recovering the sandbox (resuming it, checking its state or waiting for it to run) '
+                f'ran past the deadline: {e}'
             ) from e
 
     def recover_session(self, session: Sandbox, epoch: int, *, replace: bool = True) -> str | None:
@@ -691,9 +710,9 @@ class IGlobal(IGlobalBase):
 
         A resume Tenki accepts changes the session (memory and /home/tenki kept, /tmp cleared) even when
         the session then does not come up within the wait. The call that asked keeps its own error, and
-        the session is recorded in ``_resume_unreported`` so that the next call says "resumed". The epoch
-        moves only once the session runs, so calls waiting on this lock look at the session again rather
-        than retrying, one after another, on one that may not run yet.
+        the session is recorded in ``_resume_unreported`` so that the next call to find it running says
+        "resumed". The epoch moves only once the session runs, so calls waiting on this lock look at the
+        session again rather than retrying, one after another, on one that may not run yet.
         """
         with self._session_lock:
             if self.session is not session or self.session_epoch != epoch:
@@ -713,7 +732,10 @@ class IGlobal(IGlobalBase):
             if state is None or state in _GONE_STATES:
                 return self._drop_session(session, state, replace=replace)
             if state == 'PAUSED':
-                self._resume(session)
+                gone = self._resume(session)
+                if gone is not None:
+                    # Refused, and the session turned out to be gone: dropped like any ended session.
+                    return self._drop_session(session, None if gone == _NOT_FOUND else gone, replace=replace)
                 # A resume drops the SDK's data-plane connection, so the no-op command runs again first.
                 self._warm = None
                 self._resume_unreported = session
@@ -742,14 +764,25 @@ class IGlobal(IGlobalBase):
                 return 'resumed'
             return None
 
-    def _resume(self, session: Sandbox) -> None:
-        """Ask Tenki to resume ``session``, again for as long as it only answers "not yet".
+    def _resume(self, session: Sandbox) -> str | None:
+        """Ask Tenki to resume ``session``, again for as long as the session still waits to be resumed.
 
-        For up to a minute after a pause Tenki refuses a resume while it is still tearing the paused
-        VM down, with an error the SDK has no class for. That is a wait, not a failure, and it comes
-        at the moment every long-running pipeline reaches every max_duration. An error with a class
-        of its own means something else and is raised at once; so is the catch-all once
-        ``_RESUME_RETRY_SECS`` have passed, so that a call never waits on Tenki without bound.
+        For a while after a pause Tenki refuses a resume, and the refusal does not say whether it is
+        temporary: measured, "paused source is still being torn down, retry shortly" as the SDK's
+        catch-all class, and "snapshot not yet durable on a reachable host" as one of its specific ones. So
+        after a refusal the node reads the session's state. Still PAUSED or RESUMING, it asks again.
+        RUNNING, the resume took after all (an earlier ask Tenki answered with an error, or another
+        client), so it counts as accepted. Gone (terminated, or unknown to Tenki), the wait ends and
+        the session is returned for dropping. Any other state, or one that cannot be read, ends the
+        wait and the refusal is raised. The error's class and text never decide the outcome. Within one
+        call, no ask starts that would begin after ``_RESUME_RETRY_SECS``, so that a call never waits on
+        Tenki without bound (a call that arrives soon after a spent budget asks once: see below). A
+        refusal that will not go away while the session stays PAUSED (a suspended workspace, say) is
+        therefore reported only at the end of that budget. If the session still reads RESUMING then, a
+        resume is under way that this call cannot wait out: the next call to find the session running
+        is told "resumed" (see ``_resume_unreported``), and the budget ends.
+
+        Returns None when the resume was accepted, or the gone state (``_NOT_FOUND`` for unknown to Tenki).
 
         Called with the session lock held, as a resume must be: parallel calls wait for this one.
         They share its budget. A call that reaches this point while a spent budget is still recent
@@ -759,8 +792,9 @@ class IGlobal(IGlobalBase):
         session, and a resume would only start a VM for it to end. An ask already on its way is
         not interrupted.
 
-        The budget belongs to one pause. It ends when the resume takes, when Tenki refuses with a
-        reason of its own, and when the session is dropped. One case is left: a spent budget is
+        The budget belongs to one pause. It ends when the resume takes, when a refusal is followed by
+        a state that ends the wait or by RESUMING at the end of the budget, and when the session is
+        dropped. One case is left: a spent budget is
         still shared for its own length afterwards, so a session resumed from outside the node and
         paused again within that time gets a single ask.
         """
@@ -775,18 +809,56 @@ class IGlobal(IGlobalBase):
             try:
                 session.resume()
             except SandboxError as e:
-                if type(e) is not SandboxError:
-                    # A refusal with a reason of its own ends this wait. What is left of the budget
-                    # must not be all that a later pause gets.
+                refused = f'{type(e).__name__}: {e}'
+                state = self._state_after_refusal(session)
+                if state == 'RUNNING':
+                    debug(f'tool_tenki: resume of {session.id} refused ({refused}), but it is running')
                     self._resume_retry_until = None
+                    return None
+                if state == _NOT_FOUND or state in _GONE_STATES:
+                    # Not a wait. What is left of the budget must not be all that a later pause gets.
+                    self._resume_retry_until = None
+                    warning(
+                        f'tool_tenki: resume of {session.id} refused ({refused}); the session is '
+                        f'{"unknown to Tenki" if state == _NOT_FOUND else state}, so it is not asked again and is dropped'
+                    )
+                    return state
+                if state not in _STILL_RESUMABLE_STATES:
+                    self._resume_retry_until = None
+                    warning(
+                        f'tool_tenki: resume of {session.id} refused ({refused}); the session is '
+                        f'{state or "unreadable"}, so it is not asked again'
+                    )
                     raise
-                if time.monotonic() >= self._resume_retry_until:
-                    raise
-                debug(f'tool_tenki: resume of {session.id} not accepted yet ({e}); asking again')
-                time.sleep(_RESUME_RETRY_PAUSE_SECS)
+                if time.monotonic() + _RESUME_RETRY_PAUSE_SECS < self._resume_retry_until:
+                    debug(f'tool_tenki: resume of {session.id} refused ({refused}); it is still {state}, asking again')
+                    time.sleep(_RESUME_RETRY_PAUSE_SECS)
+                    continue
+                # The next ask would start after the budget, so this refusal is the last.
+                if state == 'RESUMING':
+                    # A resume under way that this call cannot wait out: a new start for this session, which the
+                    # next call to find it running is told about, and which a later pause gets a whole budget for.
+                    self._warm = None
+                    self._resume_unreported = session
+                    self._resume_retry_until = None
+                warning(
+                    f'tool_tenki: resume of {session.id} refused ({refused}) and still {state} at the end of the '
+                    f'{_RESUME_RETRY_SECS} second budget, so it is not asked again'
+                )
+                raise
             else:
                 self._resume_retry_until = None
-                return
+                return None
+
+    @staticmethod
+    def _state_after_refusal(session: Sandbox) -> str | None:
+        """The session's state after a refused resume: ``_NOT_FOUND`` if Tenki no longer knows it, None if it cannot be read."""
+        try:
+            return session.refresh().state
+        except SessionNotFoundError:
+            return _NOT_FOUND
+        except SandboxError:
+            return None
 
     def _drop_session(self, session: Sandbox, state: str | None, *, replace: bool) -> str:
         """Forget a session that has ended, so the next ``get_session`` creates a fresh one.
