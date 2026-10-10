@@ -27,7 +27,7 @@
 A deadline for a Tenki session's file calls.
 
 The SDK applies the client's ``timeout`` to control-plane calls only. A session's file calls go to
-its data plane, and there the SDK (tenki 1.0.6 and 1.4.0, ``tenki_sandbox/data_plane.py``) sends them
+its data plane, and there the SDK (tenki 1.0.6 through 1.4.1, ``tenki_sandbox/data_plane.py``) sends them
 with no deadline at all, so one stalled or half-open connection would hang ``read_file``,
 ``write_file`` and the rest for good. Its file API takes no timeout either. It does pass keyword
 arguments on to gRPC, so the deadline is added at the one object every file call of a session goes

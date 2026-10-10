@@ -94,6 +94,26 @@
 			"default": "",
 			"optional": true
 		},
+		"tenki.secret_policies": {
+			"type": "array",
+			"title": "Secret policies",
+			"description": "Names of Tenki request policies to attach, for transparent secret injection. The sandbox only ever sees placeholders such as secrets://GITHUB_TOKEN: Tenki substitutes the real value outside the VM, and only into requests a policy allows. Create the secrets and policies in Tenki first; the API key needs Secrets access. Requires Allowed outbound domains: a pipeline with policies and no allowlist does not start. Leave empty to attach none.",
+			"items": {
+				"type": "string"
+			},
+			"default": [],
+			"optional": true
+		},
+		"tenki.allow_domains": {
+			"type": "array",
+			"title": "Allowed outbound domains",
+			"description": "Restricts the sandbox's outbound traffic to these hostnames, such as pypi.org; a leading *. wildcard is accepted. Leave empty for unrestricted outbound access. List every host the agent's work needs (pip needs pypi.org and files.pythonhosted.org, for example). An entry that is not a bare hostname stops the pipeline at startup.",
+			"items": {
+				"type": "string"
+			},
+			"default": [],
+			"optional": true
+		},
 		"tenki.toolGroups": {
 			"type": "array",
 			"title": "Tool groups",
@@ -126,7 +146,7 @@
 		{
 			"section": "Pipe",
 			"title": "Tenki Sandbox",
-			"properties": ["type", "tenki.apikey", "tenki.base_url", "tenki.cpu_cores", "tenki.memory_mb", "tenki.disk_size_gb", "tenki.max_duration_minutes", "tenki.exec_timeout_secs", "tenki.max_output_chars", "tenki.image", "tenki.toolGroups"]
+			"properties": ["type", "tenki.apikey", "tenki.base_url", "tenki.cpu_cores", "tenki.memory_mb", "tenki.disk_size_gb", "tenki.max_duration_minutes", "tenki.exec_timeout_secs", "tenki.max_output_chars", "tenki.image", "tenki.secret_policies", "tenki.allow_domains", "tenki.toolGroups"]
 		}
 	]
 }

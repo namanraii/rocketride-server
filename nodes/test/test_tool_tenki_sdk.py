@@ -91,17 +91,26 @@ def test_the_errors_the_node_handles_are_sandbox_errors(name):
     assert issubclass(getattr(tenki, name), tenki.SandboxError)
 
 
-def test_no_sdk_error_is_also_a_plain_runtime_or_timeout_error():
-    # call_with_session turns a plain RuntimeError or TimeoutError into SessionUnavailableError. An SDK
-    # error that also subclassed either would be swallowed into it and lose its type: a
-    # CommandTimeoutError would stop coming back to the agent as timed_out.
+# The SDK errors that are also a plain RuntimeError or TimeoutError, as of tenki 1.4.1 (both added in that release, both
+# raised only by the snapshot wait, which the node does not use).
+_SDK_ERRORS_THAT_ARE_ALSO_PLAIN = {'SnapshotFailedError', 'SnapshotWaitTimeoutError'}
+
+
+def test_the_sdk_errors_that_are_also_plain_runtime_or_timeout_errors_are_exactly_the_known_ones():
+    # The node turns a PLAIN RuntimeError or TimeoutError into SessionUnavailableError, and lets an SDK error through as
+    # itself (it catches SandboxError first). So every SDK error that is also a plain one must still be a SandboxError,
+    # and a new one must be looked at before the pin moves: this list fails until it is.
     errors = [
         value
         for value in vars(sdk_errors).values()
         if isinstance(value, type) and issubclass(value, Exception) and value.__module__ == sdk_errors.__name__
     ]
     assert len(errors) > 10
-    assert [error.__name__ for error in errors if issubclass(error, (RuntimeError, TimeoutError))] == []
+    plain = [error for error in errors if issubclass(error, (RuntimeError, TimeoutError))]
+    assert {error.__name__ for error in plain} == _SDK_ERRORS_THAT_ARE_ALSO_PLAIN
+    assert all(issubclass(error, tenki.SandboxError) for error in plain)
+    # Neither may be what the node relies on for a timeout of its own, or for a missing file.
+    assert not any(issubclass(error, (tenki.CommandTimeoutError, tenki.FileNotFoundError)) for error in plain)
 
 
 def test_the_sdk_file_not_found_error_still_subclasses_the_builtin():
@@ -293,10 +302,30 @@ def test_create_accepts_every_option_the_node_sends():
         'name',
         'tags',
         'metadata',
+        'secret_policies',
+        'allow_domains',
     ):
         assert name in parameters, name
     assert parameters['sticky'] is False  # relied on: a sticky session would discard max_duration
     assert parameters['allow_inbound'] is True  # so the node has to pass False itself
+
+
+def test_the_sdk_can_deliver_secret_values_into_the_vm_and_the_node_never_asks_it_to():
+    # These options exist in 1.4.0 and put the real value inside the VM. The node's unit tests pin that
+    # it sends none of them; this pins that the names it must never send are still these.
+    parameters = inspect.signature(tenki.Client.create).parameters
+    for name in ('secret_files', 'secret_overrides', 'setup_secrets'):
+        assert name in parameters, name
+        assert parameters[name].default is None, name
+
+
+def test_secret_policies_and_domains_reach_the_create_request():
+    # The names travel as policy references and the domains as a session egress policy; the
+    # node passes neither when unset, and the SDK then sends no egress policy at all.
+    request = build_create_session_request(secret_policies=['github'], allow_domains=['pypi.org'])
+    assert list(request.secret_policies) == ['github']
+    assert list(request.egress.allow_domains) == ['pypi.org']
+    assert not build_create_session_request().HasField('egress')
 
 
 @pytest.mark.parametrize('options', [{'disk_size_gb': 4}, {'memory_mb': 4097}])
@@ -381,6 +410,7 @@ def test_records_and_results_have_the_fields_the_node_reads():
         'reason',
         'errno',
         'timed_out',
+        'disk',
     ]
     assert list(tenki.FileInfo.__dataclass_fields__) == [
         'path',

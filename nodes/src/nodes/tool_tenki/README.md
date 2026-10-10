@@ -127,12 +127,70 @@ calls to the Tenki API, which is never below 60 seconds, so raising it for a gen
 also gives operations like `git_clone` more room.
 
 Every file call carries that deadline too. The Tenki SDK sends a session's file calls with none
-(1.0.6 and 1.4.0), so the node adds it, and a stalled connection ends in an error instead of a tool
+(1.0.6 through 1.4.1), so the node adds it, and a stalled connection ends in an error instead of a tool
 call that never returns. One step is not covered. When a file call is the first call after a
 resume, the SDK first checks the session's data connection with a request of its own, which has no
 deadline. If that request stalls, the call waits on it, and so does every later call on the
 session, including the close at shutdown; the VM then runs until max duration pauses it. A command
 does not go through that check.
+
+### Secret policies
+
+**Status: built, not verified.** The node sends the policy names and Tenki receives them: that much
+was run. Nothing past it was, because the API key available when this was built had no Secrets
+access, so no secret or policy could be created. Whether a request then gets its secret, that the
+value never shows up inside the VM, and what a refusal looks like to `git` or `curl` are all taken
+from Tenki's documentation below, not from a test.
+
+Attaches Tenki request policies to the sandbox, by name, for transparent secret injection. As Tenki
+documents it: code in the sandbox refers to a secret by a placeholder such as
+`secrets://GITHUB_TOKEN`, in a header, query parameter or JSON field of an HTTPS request; Tenki's
+proxy, on the host and outside the VM, substitutes the real value only into requests an attached
+policy allows; and any other request carrying a placeholder is answered with
+`403 secret_injection_denied`. The node passes policy names and nothing else. It never creates,
+reads or stores a secret, RocketRide's own configuration never holds one, and the node puts no value
+into the VM. Tenki's own caveat applies: a service a policy allows can send the credential back in
+its response, and that response does reach the VM. Tenki's other ways of delivering a secret,
+secret files and environment overrides, put the real value inside the VM, where an agent with
+passwordless `sudo` can read it, so the node never uses them.
+
+A pipeline that sets secret policies must also set [allowed outbound domains](#allowed-outbound-domains),
+or it does not start. A policy decides which requests get the credential. It does not decide where
+the sandbox may send what those requests return. The allowlist narrows that; it does not close it,
+because an allowed host is itself somewhere data can be sent (with `github.com` allowed, to any
+repository or gist the credential, or any other one the agent is given, can write to).
+
+Create the secrets and policies in Tenki first (see [Private repositories](#private-repositories)).
+The API key needs Secrets access; without it Tenki refuses the session, and the tool result says so
+(measured). Tenki documents that the image has to carry its managed HTTPS trust. Nothing advertises
+the placeholders to the agent, so name the ones it may use in its instructions. If a command's
+output contains Tenki's documented denial text, the tool result adds a note that repeating the
+request will not help; whether that text ever reaches a command's output has not been measured.
+
+### Allowed outbound domains
+
+Restricts the sandbox's outbound traffic to the listed hostnames. Tenki documents an optional
+leading `*.` wildcard, which the node passes through; no wildcard entry has been sent to a real
+session. Empty, the default, leaves outbound traffic unrestricted. Measured with one entry,
+`github.com`: that host answered and a public clone worked, while the two other names tried did
+not resolve inside the VM and an HTTPS connection straight to an IP address failed its TLS
+handshake. The same held after Tenki had paused the session and the node resumed it, and on the
+session that replaced one terminated from outside. Not measured: other ports and protocols, and a
+listed name pointed at another address.
+
+An allowlist limits where an agent can send what it can read, such as the files in its workspace or
+a cloned repository, so set one whenever the sandbox holds anything sensitive. List every host the
+work needs: pip, for one, needs `pypi.org` and `files.pythonhosted.org`, and a secret policy's
+destinations must be listed too. The node accepts plain hostnames of two or more labels, which is
+its own rule and narrower than Tenki's may be: a single-label name, a non-ASCII name, or one with
+an underscore is refused, and entries in one string are separated by commas only. An
+entry outside that rule, such as a URL or one with a port, stops the pipeline at startup instead
+of being dropped: had every entry been dropped, no allowlist would apply at all. So does a setting
+that is not a list. A wildcard covers every name under it, and the node does not judge how wide
+that is: `*.co.uk` is accepted. Tenki documents a limit of 256 domains, that it has to enable
+session egress policies for the workspace first, and that creating a sandbox fails with a message
+saying so until it has. The list is fixed when the session is created, and a session that replaces
+an ended one is created with the same list.
 
 ## Authentication
 
@@ -141,7 +199,8 @@ console under API Keys, then set it as the node's API Key field or reference it 
 as `${ROCKETRIDE_TENKI_APIKEY}` rather than writing the literal into a pipeline file.
 
 The key authenticates the engine to Tenki and stays on the engine host. It is never placed inside the
-sandbox, so nothing the agent runs can read it.
+sandbox, so nothing the agent runs can read it. Attaching [secret policies](#secret-policies) also
+needs the key to have Secrets access, which is chosen when the key is created.
 
 ## Notes
 
@@ -157,17 +216,72 @@ carries no caller identity, so it has no way to tell two callers apart.
 
 ### No git credentials
 
-`git_clone` reaches public repositories only, by design. Tenki can inject a GitHub token into a
-sandbox, but it arrives as an ordinary environment variable and the sandbox user has passwordless
-`sudo`, so any command the agent runs could read it — and outbound networking is open, because
-package installs need it. Rather than ship a secret that cannot be protected inside the machine it
-is handed to, the node holds no git credentials at all.
+`git_clone` reaches public repositories only, by design. Tenki can place a GitHub token inside a
+sandbox, but there it is an ordinary environment variable or file and the sandbox user has
+passwordless `sudo`, so any command the agent runs could read it. Rather than ship a secret that
+cannot be protected inside the machine it is handed to, the node holds no git credentials at all
+and never asks Tenki to deliver one into the VM.
 
 `git_clone` enforces that rather than trusting the agent to respect it: it accepts public `http(s)`
 URLs only, and refuses one carrying credentials in the URL (`https://token@host/org/repo.git`) along
 with the `ssh`, `git`, `file` and `git@host:path` forms, none of which it could authenticate anyway.
 Git records the URL it cloned from in `.git/config`, so a credential passed that way would be left
 inside the VM for every later command, and every later caller, to read.
+
+### Private repositories
+
+With [secret policies](#secret-policies), Tenki documents that a token can be used from the sandbox
+without being placed in it. What the operator sets up, once, in Tenki:
+
+1. A GitHub token that can do as little as possible: a fine-grained personal access token limited
+   to the one repository, with read-only access to its contents. Nothing in this setup needs write
+   access, so do not grant it.
+2. A Tenki secret holding that token, `GITHUB_TOKEN` in this example.
+3. A Tenki request policy, `github-clone` here, that allows the secret only on the requests a
+   clone or fetch makes:
+
+   ```json
+   [
+     {
+       "origin": "https://github.com",
+       "methods": ["GET"],
+       "pathPrefix": "/acme/private-repo.git/info/refs",
+       "header": "Authorization",
+       "secrets": ["GITHUB_TOKEN"]
+     },
+     {
+       "origin": "https://github.com",
+       "methods": ["POST"],
+       "pathPrefix": "/acme/private-repo.git/git-upload-pack",
+       "header": "Authorization",
+       "secrets": ["GITHUB_TOKEN"]
+     }
+   ]
+   ```
+
+4. On the node: `github-clone` under Secret policies and `github.com` under Allowed outbound
+   domains.
+
+The upload path (`git-receive-pack`) is deliberately absent, so by Tenki's documented rules the
+policy should not put the token into the request that carries a push. The first rule is a path
+prefix, so it also matches the request that opens a push (`info/refs?service=git-receive-pack`):
+the token would be sent on that one, which lists refs and writes nothing. Whether a push is in
+fact refused has not been tested.
+
+**Not verified.** None of this section has been run against a real private repository: the test
+needs a Tenki API key with Secrets access. In particular, how git has to present the placeholder
+so that Tenki's proxy recognises it is unknown (git sends HTTP Basic credentials base64-encoded,
+which may hide a placeholder from the proxy). Until it has been run, treat a private clone through
+this node as unproven, and note that `git_clone` itself still attaches nothing and reaches public
+repositories only.
+
+**What a policy cannot protect against.** Tenki checks where a request goes, not why it was made.
+The credential is available to the sandbox, so it is available to whoever can steer the agent:
+every user of the pipeline, and any text the agent reads and obeys, such as a README in a cloned
+repository or a web page. Any of them can have the agent use the token for anything the policy
+allows, and read what comes back. So keep the policy to one repository and to reading, keep the
+token itself read-only, run one pipeline per trust boundary, and treat everything the token can
+read as readable by everyone who can reach the pipeline.
 
 ### Session lifecycle
 

@@ -74,6 +74,7 @@ from tenki import (
     CommandTimeoutError,
     FileNotFoundError as TenkiFileNotFoundError,
     InvalidStateError,
+    PermissionDeniedError,
     Sandbox,
     SandboxError,
     SessionNotFoundError,
@@ -174,6 +175,99 @@ def _may_hide_a_pause(error: SandboxError) -> bool:
     return type(error) is SandboxError or isinstance(error, CommandNotStartedError) or about_the_vm_link(error)
 
 
+# A hostname Tenki accepts in an outbound allowlist: at least two dot-separated labels of letters,
+# digits and inner hyphens, the last containing a letter (an IP address is a CIDR to Tenki, not a
+# domain), optionally after a single leading "*." wildcard.
+_DOMAIN = re.compile(
+    r'^(\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?=[a-z0-9-]*[a-z])[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
+)
+
+
+#: The most domains Tenki documents that it accepts in one allowlist, and the longest name DNS allows.
+_MAX_DOMAINS = 256
+_MAX_DOMAIN_CHARS = 253
+
+
+def _names(raw, field: str) -> list[str]:
+    """The distinct, non-empty entries of a list setting, given as a list or a comma-separated string.
+
+    Anything else is refused rather than read as "nothing configured" or turned into text: an
+    allowlist typed in the wrong shape would otherwise start the sandbox with every destination
+    open, and an entry such as ``None`` would reach Tenki as a name nobody typed.
+
+    Raises:
+        ValueError: If the setting is not a list or a string, or holds an entry that is not text.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = raw.split(',')
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(
+            f'tenki.{field} must be a list of names, or one comma-separated string, not a {type(raw).__name__}'
+        )
+    names = []
+    for position, entry in enumerate(raw, 1):
+        if not isinstance(entry, str):
+            raise ValueError(f'tenki.{field}: entry {position} is a {type(entry).__name__}, not text')
+        name = entry.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _allowed_domains(raw) -> list[str]:
+    """The configured outbound allowlist, normalized as Tenki does: lowercase, without a trailing dot.
+
+    The node accepts plain DNS hostnames with at least two labels, optionally under one leading
+    ``*.``. That is narrower than Tenki may be (its documentation gives examples, not a grammar), and
+    it is the node's rule, not Tenki's. An entry outside it stops the pipeline instead of being
+    dropped: had every entry been dropped, the empty list left would mean no allowlist at all,
+    opening outbound traffic wider than the operator asked for.
+
+    Raises:
+        ValueError: Naming every entry the node does not accept, or for more entries than Tenki takes.
+    """
+    domains, refused = [], []
+    for position, name in enumerate(_names(raw, 'allow_domains'), 1):
+        domain = name.lower().rstrip('.')
+        if len(domain) > _MAX_DOMAIN_CHARS or not _DOMAIN.match(domain):
+            # An entry with an "@" may be a URL that carries credentials: say where it is, not what it says.
+            refused.append(f'entry {position}' if '@' in name else name)
+        elif domain not in domains:
+            domains.append(domain)
+    if refused:
+        raise ValueError(
+            f'tenki.allow_domains has entries tool_tenki does not accept: {", ".join(refused)}. Use bare '
+            'hostnames such as pypi.org, optionally with one leading "*." wildcard, and no scheme, path or port.'
+        )
+    if len(domains) > _MAX_DOMAINS:
+        raise ValueError(f'tenki.allow_domains lists {len(domains)} hosts, and Tenki accepts up to {_MAX_DOMAINS}')
+    return domains
+
+
+def _secret_settings(cfg) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The secret policies to attach and the outbound allowlist, which are only valid together.
+
+    A policy decides which requests Tenki puts a credential into. It does not decide where the
+    sandbox may send what those requests return, so policies without an allowlist would hand an
+    agent a usable credential and every destination to carry the results to. That combination
+    stops the pipeline rather than starting it open.
+
+    Raises:
+        ValueError: For a setting the node does not accept, or for policies without an allowlist.
+    """
+    policies = tuple(_names(cfg.get('secret_policies'), 'secret_policies'))
+    domains = tuple(_allowed_domains(cfg.get('allow_domains')))
+    if policies and not domains:
+        raise ValueError(
+            'tenki.secret_policies is set but tenki.allow_domains is empty. A sandbox that can use a secret '
+            'must not have unrestricted outbound access: list the hosts it needs in tenki.allow_domains '
+            '(github.com, for example).'
+        )
+    return policies, domains
+
+
 def _int_or(value, default: int, *, lo: int, hi: int) -> int:
     try:
         n = int(value)
@@ -217,6 +311,11 @@ class IGlobal(IGlobalBase):
 
     rpc_timeout_secs: int = 120
     image: str = ''
+    # Tenki request policies to attach, by name. Tenki holds the secret values and substitutes them
+    # outside the VM, into requests a policy allows; the sandbox only ever sees placeholders.
+    secret_policies: tuple[str, ...] = ()
+    # Hostnames the sandbox may reach. Empty means no allowlist: outbound traffic is unrestricted.
+    allow_domains: tuple[str, ...] = ()
     cpu_cores: int = 2
     memory_mb: int = 4096
     disk_size_gb: int = 5
@@ -258,6 +357,7 @@ class IGlobal(IGlobalBase):
 
         base_url = str((cfg.get('base_url') or '')).strip() or _DEFAULT_BASE_URL
         self.image = str((cfg.get('image') or '')).strip()
+        self.secret_policies, self.allow_domains = _secret_settings(cfg)
         self.cpu_cores = _int_or(cfg.get('cpu_cores'), 2, lo=1, hi=16)
         # Tenki rejects odd memory sizes (they must align to 2 MiB). Rounding down stays in
         # range because both bounds are even.
@@ -314,11 +414,33 @@ class IGlobal(IGlobalBase):
         }
         if self.image:
             create_kwargs['image'] = self.image
+        # Sent only when set, so an unconfigured node makes exactly the request it always has. Policy
+        # names are all that is sent about secrets: never a value, and never secret_files or
+        # secret_overrides, which would put the real value inside the VM.
+        if self.secret_policies:
+            create_kwargs['secret_policies'] = list(self.secret_policies)
+        if self.allow_domains:
+            create_kwargs['allow_domains'] = list(self.allow_domains)
         self._create_attempted = True
         try:
             session = self.client.create(**create_kwargs)
+        except PermissionDeniedError as e:
+            if not self.secret_policies or 'Secrets access' not in str(e):
+                raise
+            # What Tenki answers when the API key was created without Secrets access (measured with
+            # tenki 1.4.0: "API key requires Secrets access; ..."). No sandbox is left behind, and
+            # nothing an agent does can change the key. Any other refusal is reported as it is.
+            raise SessionUnavailableError(
+                f'Tenki refused to attach the secret policies named in tenki.secret_policies: {e}. The Tenki '
+                'API key this pipeline uses needs Secrets access, which only its operator can grant; '
+                'repeating the call will not help.'
+            ) from e
         except (WaitReadyFailedError, TemplateRuntimeFailedError) as e:
             self._close_left_running(e)
+            raise
+        except SandboxError:
+            # Before the plain catch below: since tenki 1.4.1 two SDK errors are also a RuntimeError or a
+            # TimeoutError, and an SDK error is reported as itself.
             raise
         except (RuntimeError, TimeoutError) as e:
             # The SDK re-raises its readiness wait's own plain RuntimeError when the new sandbox went
@@ -397,6 +519,10 @@ class IGlobal(IGlobalBase):
             if on_recovery is not None:
                 on_recovery(recovery)
             return call(self.get_session())
+        except SandboxError:
+            # An SDK error is reported as itself, including the two that are also a plain RuntimeError or
+            # TimeoutError since tenki 1.4.1. Only a plain one is wrapped below.
+            raise
         except (RuntimeError, TimeoutError) as e:
             # The SDK raises a few failures as plain exceptions rather than its own errors (Sandbox.start
             # does when the data plane cannot be reached), which a tool's SandboxError handling would let
@@ -449,6 +575,8 @@ class IGlobal(IGlobalBase):
                     )
                 try:
                     session.wait_ready(timeout=_READY_WAIT_SECS)
+                except SandboxError:
+                    raise
                 except (RuntimeError, TimeoutError) as e:
                     # The SDK's plain errors for "went terminal while waiting" and "never got to
                     # RUNNING". A session terminated mid-resume is as gone as any other. One merely
@@ -547,6 +675,10 @@ class IGlobal(IGlobalBase):
                 normalize_groups(cfg.get('toolGroups'))
             except ValueError:
                 warning('toolGroups matches no known group, so the pipeline will fail to start')
+            try:
+                _secret_settings(cfg)
+            except ValueError as e:
+                warning(f'{e} The pipeline will fail to start.')
         except Exception as e:
             warning(str(e))
 

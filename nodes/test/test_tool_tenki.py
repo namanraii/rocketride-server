@@ -89,6 +89,14 @@ class _StubFileNotFoundError(_StubSandboxError, FileNotFoundError):
     """Mirror of the SDK, whose FileNotFoundError also subclasses the builtin."""
 
 
+class _StubSnapshotFailedError(_StubSandboxError, RuntimeError):
+    """Mirror of tenki 1.4.1's SnapshotFailedError: an SDK error that is also a plain RuntimeError."""
+
+
+class _StubSnapshotWaitTimeoutError(_StubSandboxError, TimeoutError):
+    """Mirror of tenki 1.4.1's SnapshotWaitTimeoutError: an SDK error that is also a plain TimeoutError."""
+
+
 class _StubPermissionDeniedError(_StubSandboxError):
     pass
 
@@ -582,6 +590,7 @@ class _CommandResult:
     reason: str | None = None
     errno: int | None = None
     timed_out: bool = False
+    disk: object | None = None  # tenki.DiskUsage; the node never reads it
 
     @property
     def ok(self):
@@ -876,6 +885,250 @@ def test_image_is_sent_when_configured(monkeypatch, logs):
     assert client.create_calls[0]['image'] == 'myworkspace/node-env'
 
 
+def test_create_attaches_the_configured_secret_policies(monkeypatch, logs):
+    # Only policy names go to Tenki. It keeps the secret values and substitutes them outside the VM,
+    # into requests a policy allows, so the sandbox only ever sees placeholders.
+    cfg = {'secret_policies': [' github ', 'internal-api', 'github'], 'allow_domains': ['github.com']}
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'), cfg=cfg)
+    glb.get_session()
+    [kwargs] = client.create_calls
+    assert kwargs['secret_policies'] == ['github', 'internal-api']
+    assert kwargs['allow_domains'] == ['github.com']
+
+
+@pytest.mark.parametrize('domains', [None, [], '', ' , ', ['  ']])
+def test_secret_policies_without_an_outbound_allowlist_stop_the_pipeline_at_startup(monkeypatch, logs, domains):
+    # Fail closed. A policy decides which requests get the credential, not where the sandbox may send
+    # what those requests return, so a sandbox that can use a secret must not have every destination open.
+    cfg = {'apikey': _KEY, 'secret_policies': ['github']}
+    if domains is not None:
+        cfg['allow_domains'] = domains
+    glb, _ = _make_global(monkeypatch, cfg)
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert 'tenki.secret_policies' in str(refused.value) and 'tenki.allow_domains' in str(refused.value)
+
+
+def test_validate_config_warns_about_secret_policies_without_an_allowlist(monkeypatch, logs):
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, 'secret_policies': ['github']})
+    glb.validateConfig()
+    assert any('tenki.allow_domains' in message and 'fail to start' in message for message in logs)
+
+
+def test_an_allowlist_alone_needs_no_secret_policy(monkeypatch, logs):
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'), cfg={'allow_domains': ['pypi.org']})
+    glb.get_session()
+    [kwargs] = client.create_calls
+    assert kwargs['allow_domains'] == ['pypi.org'] and 'secret_policies' not in kwargs
+
+
+def test_secret_files_and_overrides_are_never_sent(monkeypatch, logs):
+    # Tenki's other ways of delivering a secret put the real value inside the VM, where an agent with
+    # passwordless sudo can read it. Whatever a pipeline's config carries, the node sends none of them.
+    cfg = {
+        'secret_policies': ['github'],
+        'allow_domains': ['github.com'],
+        'secret_files': [{'path': '/app/.env', 'content': 'TOKEN=secrets://GITHUB_TOKEN'}],
+        'secret_overrides': {'GITHUB_TOKEN': 'OTHER_TOKEN'},
+        'setup_secrets': {'GITHUB_TOKEN': 'x'},
+        'env': {'GITHUB_TOKEN': 'x'},
+        'github_token': 'x',
+    }
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'), cfg=cfg)
+    glb.get_session()
+    [kwargs] = client.create_calls
+    assert not {'secret_files', 'secret_overrides', 'setup_secrets', 'env', 'github_token', 'clone_repo_url'} & set(
+        kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    ('cfg', 'extra'),
+    [
+        ({}, set()),
+        ({'allow_domains': ['pypi.org']}, {'allow_domains'}),
+        ({'secret_policies': ['github'], 'allow_domains': ['github.com']}, {'secret_policies', 'allow_domains'}),
+    ],
+)
+def test_the_create_request_carries_exactly_the_options_the_node_means_to_send(monkeypatch, logs, cfg, extra):
+    # Not "none of the options known to be dangerous": none at all beyond these. A new SDK option
+    # that opens the VM up (a tailnet, SSH keys, extra network ranges) must be a decision, not a default.
+    cfg = {**cfg, 'direct_runtime': True, 'tailnet': 'x', 'ssh_authorized_keys': ['k'], 'allow_cidrs': ['0.0.0.0/0']}
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'), cfg=cfg)
+    glb.get_session()
+    [kwargs] = client.create_calls
+    assert (
+        set(kwargs)
+        == {
+            'cpu_cores',
+            'memory_mb',
+            'disk_size_gb',
+            'max_duration',
+            'allow_inbound',
+            'name',
+            'tags',
+            'metadata',
+        }
+        | extra
+    )
+
+
+def test_a_replacement_session_gets_the_same_policies_and_allowlist(monkeypatch, logs):
+    # A session that ended is replaced by a new create. If that one dropped the allowlist, the agent
+    # would be handed an open network the first time anything went wrong.
+    cfg = {'secret_policies': ['github'], 'allow_domains': ['github.com']}
+    dead = _FakeSession('sb-dead', state='TERMINATED', exec_error=mod.SessionTerminatedError('session_terminated'))
+    inst, client = _instance(monkeypatch, dead, _FakeSession('sb-fresh'), cfg=cfg)
+    assert inst.run_command({'command': 'ls'})['session'] == 'replaced'
+    first, second = client.create_calls
+    assert second['secret_policies'] == first['secret_policies'] == ['github']
+    assert second['allow_domains'] == first['allow_domains'] == ['github.com']
+
+
+@pytest.mark.parametrize('field', ['secret_policies', 'allow_domains'])
+@pytest.mark.parametrize('value', [{'github.com': True}, 5, True, 1.5])
+def test_a_list_setting_given_as_something_else_stops_the_pipeline_at_startup(monkeypatch, logs, field, value):
+    # Read as "nothing configured", an allowlist typed in the wrong shape would start the sandbox with
+    # every destination open: the outcome the setting exists to prevent.
+    cfg = {'apikey': _KEY, 'secret_policies': ['github'], 'allow_domains': ['github.com'], field: value}
+    glb, _ = _make_global(monkeypatch, cfg)
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert f'tenki.{field}' in str(refused.value) and 'list' in str(refused.value)
+
+
+@pytest.mark.parametrize('field', ['secret_policies', 'allow_domains'])
+@pytest.mark.parametrize('entry', [None, 5, ['a', 'b'], b'github.com', {'name': 'x'}])
+def test_a_list_entry_that_is_not_text_stops_the_pipeline_at_startup(monkeypatch, logs, field, entry):
+    # Turned into text, these would reach Tenki as names nobody typed ("None", "['a', 'b']").
+    cfg = {'apikey': _KEY, 'secret_policies': ['github'], 'allow_domains': ['github.com']}
+    cfg[field] = [*cfg[field], entry]
+    glb, _ = _make_global(monkeypatch, cfg)
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert f'tenki.{field}' in str(refused.value)
+
+
+def test_more_domains_than_tenki_accepts_stop_the_pipeline_at_startup(monkeypatch, logs):
+    # Tenki documents a limit of 256 domains. Past it the create call would fail on the first tool
+    # call instead, long after the pipeline had started.
+    domains = [f'host-{n}.example.com' for n in range(257)]
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, 'allow_domains': domains})
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert '256' in str(refused.value)
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, 'allow_domains': domains[:256]})
+    glb.beginGlobal()
+    assert len(glb.allow_domains) == 256
+
+
+def test_a_refused_domain_that_carries_credentials_is_not_repeated_in_the_error(monkeypatch, logs):
+    # A URL with a token pasted into the wrong field must not travel on into the job log.
+    cfg = {'apikey': _KEY, 'allow_domains': ['pypi.org', 'https://user:t0k3n-value@host.example/path']}
+    glb, _ = _make_global(monkeypatch, cfg)
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert 't0k3n-value' not in str(refused.value) and 'entry 2' in str(refused.value)
+
+
+def test_the_editor_offers_secret_policies_and_the_allowlist_as_lists_of_names():
+    # Both are plain lists of names. Neither is a secret field: a policy name is not a credential.
+    services = json.loads((_NODES_SRC / 'nodes' / 'tool_tenki' / 'services.json').read_text())
+    shown = next(shape['properties'] for shape in services['shape'] if shape['section'] == 'Pipe')
+    for name in ('tenki.secret_policies', 'tenki.allow_domains'):
+        field = services['fields'][name]
+        assert field['type'] == 'array' and field['items'] == {'type': 'string'} and field['default'] == [], name
+        assert not field.get('secure'), name
+        assert name in shown, name
+
+
+def test_the_editor_offers_no_way_to_put_a_secret_value_in_the_vm():
+    services = json.loads((_NODES_SRC / 'nodes' / 'tool_tenki' / 'services.json').read_text())
+    offered = ' '.join(services['fields']).lower()
+    assert 'secret_files' not in offered and 'secret_overrides' not in offered and 'setup_secrets' not in offered
+
+
+def test_a_key_without_secrets_access_is_reported_as_a_setup_problem(monkeypatch, logs):
+    # What Tenki answers (measured with tenki 1.4.0) when a session names a policy and the API key was
+    # created without Secrets access. Nothing an agent does can fix it, so the result has to say whose fix it is.
+    denied = inst_mod.PermissionDeniedError('API key requires Secrets access; create a key with Secrets access enabled')
+    cfg = {'secret_policies': ['policy-name-in-config'], 'allow_domains': ['github.com']}
+    inst, _ = _instance(monkeypatch, cfg=cfg, create_error=denied)
+    result = inst.run_command({'command': 'ls'})
+    assert result['exit_code'] == -1
+    assert 'Secrets access' in result['error'] and 'tenki.secret_policies' in result['error']
+    assert 'operator' in result['error'] and 'will not help' in result['error']
+    # The agent has no use for what the operator typed into that field, and it may not be a name at all.
+    assert 'policy-name-in-config' not in result['error']
+
+
+def test_another_permission_error_is_not_blamed_on_secrets_access(monkeypatch, logs):
+    # Policies are configured, but this refusal is about something else. Telling the operator to fix
+    # the key's Secrets access would send them the wrong way.
+    denied = inst_mod.PermissionDeniedError('workspace suspended')
+    cfg = {'secret_policies': ['github'], 'allow_domains': ['github.com']}
+    inst, _ = _instance(monkeypatch, cfg=cfg, create_error=denied)
+    assert inst.run_command({'command': 'ls'})['error'] == 'workspace suspended'
+
+
+def test_a_permission_error_without_secret_policies_is_reported_as_it_is(monkeypatch, logs):
+    denied = inst_mod.PermissionDeniedError('workspace suspended')
+    inst, _ = _instance(monkeypatch, create_error=denied)
+    assert inst.run_command({'command': 'ls'})['error'] == 'workspace suspended'
+
+
+def test_create_restricts_outbound_traffic_to_the_configured_domains(monkeypatch, logs):
+    cfg = {'allow_domains': 'PyPI.org., files.pythonhosted.org, *.github.com, pypi.org'}
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'), cfg=cfg)
+    glb.get_session()
+    [kwargs] = client.create_calls
+    assert kwargs['allow_domains'] == ['pypi.org', 'files.pythonhosted.org', '*.github.com']
+
+
+@pytest.mark.parametrize(
+    'cfg', [{}, {'secret_policies': [], 'allow_domains': []}, {'secret_policies': ['  '], 'allow_domains': ' , '}]
+)
+def test_unset_secret_policies_and_domains_leave_the_create_request_as_before(monkeypatch, logs, cfg):
+    # No policies and no allowlist: outbound traffic stays open, exactly as before these options existed.
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'), cfg=cfg)
+    glb.get_session()
+    [kwargs] = client.create_calls
+    assert 'secret_policies' not in kwargs
+    assert 'allow_domains' not in kwargs
+
+
+@pytest.mark.parametrize(
+    'domain',
+    [
+        'https://pypi.org',
+        'pypi.org/simple',
+        'pypi.org:443',
+        'py pi.org',
+        'a..b.com',
+        '-pypi.org',
+        '*.*.example.com',
+        'example.*',
+        'localhost',
+        '10.0.0.1',
+        'a' * 64 + '.example.com',
+        '.'.join(['a' * 60] * 5),
+    ],
+)
+def test_an_outbound_domain_the_node_does_not_accept_stops_the_pipeline_at_startup(monkeypatch, logs, domain):
+    # Dropping it would be worse than failing: had every entry been dropped, the empty list left
+    # would mean no allowlist at all, a wider sandbox than the operator asked for.
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, 'allow_domains': ['pypi.org', domain]})
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert domain in str(refused.value)
+
+
+def test_validate_config_warns_about_an_outbound_domain_the_node_does_not_accept(monkeypatch, logs):
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, 'allow_domains': ['https://pypi.org']})
+    glb.validateConfig()
+    assert any('https://pypi.org' in message for message in logs)
+
+
 def test_parallel_first_calls_create_exactly_one_session(monkeypatch, logs):
     # deepagent fans tool calls out with asyncio.gather; unsynchronized, each call would
     # see no session and create one, and all but one would be orphaned while billing.
@@ -1032,6 +1285,58 @@ def test_lifecycle_error_from_a_running_session_surfaces_untouched(monkeypatch, 
     assert 'close' not in running.calls
     assert len(client.create_calls) == 1
     assert glb.get_session() is running
+
+
+@pytest.mark.parametrize(
+    'error', [_StubSnapshotFailedError('snapshot failed'), _StubSnapshotWaitTimeoutError('snapshot wait')]
+)
+def test_an_sdk_error_that_is_also_a_plain_error_keeps_its_own_type_in_a_call(monkeypatch, logs, error):
+    # Since tenki 1.4.1 two SDK errors also subclass RuntimeError or TimeoutError. The node turns a PLAIN one of those into
+    # SessionUnavailableError; an SDK error must come back as the SDK error it is, like every other.
+    session = _FakeSession('sb-1', fail={'stat': error})
+    inst, _ = _instance(monkeypatch, session)
+    glb = inst.IGlobal
+    with pytest.raises(type(error)):
+        glb.call_with_session(lambda s: s.fs.stat('/home/tenki/a.txt'))
+    assert not any('sandbox call failed' in line for line in logs)
+
+
+@pytest.mark.parametrize(
+    'error', [_StubSnapshotFailedError('snapshot failed'), _StubSnapshotWaitTimeoutError('snapshot wait')]
+)
+def test_an_sdk_error_that_is_also_a_plain_error_keeps_its_own_type_at_create(monkeypatch, logs, error):
+    inst, _ = _instance(monkeypatch, create_error=error)
+    assert inst.run_command({'command': 'ls'})['error'] == str(error)
+
+
+def test_an_sdk_error_that_is_also_a_plain_error_keeps_its_own_type_while_resuming(monkeypatch, logs):
+    error = _StubSnapshotWaitTimeoutError('snapshot wait')
+    session = _FakeSession('sb-1', state='PAUSED', ready_error=error, files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.read_file({'path': 'notes.txt'})['error'] == 'snapshot wait'
+
+
+def test_an_sdk_error_that_is_also_a_timeout_is_not_taken_for_a_command_that_never_started(monkeypatch, logs):
+    error = _StubSnapshotWaitTimeoutError('snapshot wait')
+    session = _FakeSession('sb-1')
+    start = session.start
+
+    def start_then_fail(*argv, **kwargs):
+        process = start(*argv, **kwargs)
+        process.close_stdin = lambda: _raise(error)
+        return process
+
+    session.start = start_then_fail
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.run_command({'command': 'ls'})
+    assert result['error'] == 'snapshot wait' and 'did not start' not in result['error']
+
+
+def test_an_sdk_error_that_is_also_a_timeout_is_not_taken_for_a_missing_result(monkeypatch, logs):
+    session = _FakeSession('sb-1', run_error=_StubSnapshotWaitTimeoutError('snapshot wait'))
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.run_command({'command': 'ls'})
+    assert 'snapshot wait' in result['error'] and 'no result within' not in result['error']
 
 
 def test_other_errors_propagate_without_a_state_check(monkeypatch, logs):
@@ -1250,6 +1555,36 @@ def test_the_max_duration_help_says_tenki_pauses_the_session():
     description = services['fields']['tenki.max_duration_minutes']['description']
     assert 'pauses' in description
     assert 'once a session ends' not in description
+
+
+_DENIED = "fatal: unable to access 'https://github.com/acme/private.git/': 403 secret_injection_denied"
+
+
+def test_a_denied_secret_injection_in_a_commands_output_is_explained(monkeypatch, logs):
+    # Tenki answers 403 secret_injection_denied when no attached policy allows the placeholder a request
+    # carried. An agent that only sees a 403 retries; it has to be told that repeating will not help.
+    failed = _CommandResult(argv=['bash'], exit_code=128, stderr=_DENIED.encode())
+    inst, _ = _instance(monkeypatch, _FakeSession('sb-1', exec_result=failed))
+    result = inst.run_command({'command': 'git clone https://github.com/acme/private.git'})
+    assert result['exit_code'] == 128 and result['stderr'].startswith(_DENIED)
+    assert 'no attached secret policy allows' in result['stderr'] and 'will not help' in result['stderr']
+
+
+def test_output_without_a_denied_injection_is_left_alone(monkeypatch, logs):
+    plain = _CommandResult(argv=['bash'], exit_code=22, stderr=b'curl: (22) The requested URL returned error: 403')
+    inst, _ = _instance(monkeypatch, _FakeSession('sb-1', exec_result=plain))
+    assert (
+        inst.run_command({'command': 'curl -f https://example.com'})['stderr']
+        == 'curl: (22) The requested URL returned error: 403'
+    )
+
+
+def test_a_denied_secret_injection_in_a_git_error_is_explained(monkeypatch, logs):
+    refused = mod.SandboxError(_DENIED)
+    inst, _ = _instance(monkeypatch, _FakeSession('sb-1', fail={'clone': refused}))
+    result = inst.git_clone({'repo': _REPO})
+    assert result['error'].startswith(_DENIED)
+    assert 'no attached secret policy allows' in result['error'] and 'will not help' in result['error']
 
 
 # ---------------------------------------------------------------------------
@@ -1865,6 +2200,16 @@ def test_nothing_secret_is_sent_into_the_vm(monkeypatch, logs):
     glb.get_session()
     [call] = client.create_calls
     assert not {'github_token', 'env', 'setup_env', 'setup_secrets', 'clone_repo_url'} & set(call)
+
+
+def test_every_field_the_editor_offers_is_read_by_the_node():
+    # The engine strips the "tenki." prefix before IGlobal sees the config. A field whose key the
+    # node never reads is a setting that silently does nothing, which unit tests passing their own
+    # config dicts would not notice.
+    services = json.loads((_NODES_SRC / 'nodes' / 'tool_tenki' / 'services.json').read_text())
+    source = (_NODES_SRC / 'nodes' / 'tool_tenki' / 'IGlobal.py').read_text()
+    keys = [name.split('.', 1)[1] for name in services['fields']]
+    assert [key for key in keys if f"cfg.get('{key}')" not in source] == []
 
 
 def test_the_api_key_is_the_only_secret_field():

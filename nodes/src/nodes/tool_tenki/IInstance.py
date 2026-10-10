@@ -106,6 +106,26 @@ _KILLED_NOTICE = (
     '`> out.log 2>&1`) and read back the part you need.]'
 )
 
+# What Tenki documents its proxy answers ("403 secret_injection_denied") when it refuses to put a secret
+# into a request, for one of several reasons: no attached policy allows that secret for that host,
+# method and path, the secret is not active, or the placeholder is somewhere a policy does not cover.
+# NOT MEASURED: no denial has been produced against a real session, so it is unknown whether this
+# text reaches a command's output at all (git and `curl -f` print the status, not the body). The
+# note is keyed on the text alone, so output that merely quotes it gets the note as well.
+_INJECTION_DENIED = 'secret_injection_denied'
+_DENIED_NOTICE = (
+    '[tool_tenki: this output contains "secret_injection_denied". Tenki documents that as its answer '
+    '(HTTP 403) when it refuses to put a secret into a request, for example because no attached secret '
+    'policy allows that secret for that host, method and path. If that is what happened here, repeating '
+    'the request will not help: the policy is for the operator of this pipeline to change.]'
+)
+
+
+def _explained(text: str) -> str:
+    """``text``, followed by what a denied secret injection means when it reports one."""
+    return f'{text}\n{_DENIED_NOTICE}' if _INJECTION_DENIED in text else text
+
+
 _SESSION_EVENT = {
     'type': 'string',
     'enum': ['resumed', 'replaced'],
@@ -323,6 +343,9 @@ def _exec_result(result, cap: int, *, killed: bool = False) -> dict:
     if killed:
         notice = _KILLED_NOTICE.format(limit=_OUTPUT_LIMIT_BYTES)
         stderr = f'{stderr}\n{notice}' if stderr else notice
+    if _INJECTION_DENIED in stdout_text or _INJECTION_DENIED in stderr_text:
+        # After the cap, like the kill notice, so it is never the part that gets cut off.
+        stderr = f'{stderr}\n{_DENIED_NOTICE}' if stderr else _DENIED_NOTICE
     return {
         'exit_code': result.exit_code,
         'stdout': stdout,
@@ -485,6 +508,9 @@ def _run_process(session, argv, timeout: int, started: list):
     process = session.start(*argv, timeout=timeout)
     try:
         process.close_stdin()
+    except SandboxError:
+        # Not the SDK's own plain "timed out waiting for command start": an SDK error is reported as itself.
+        raise
     except TimeoutError as e:
         process.kill()
         raise CommandNotStartedError('the sandbox did not start the command in time, so it was cancelled') from e
@@ -492,6 +518,8 @@ def _run_process(session, argv, timeout: int, started: list):
     guard = _OutputGuard(process, _OUTPUT_LIMIT_BYTES)
     try:
         result = process.wait(timeout=limit)
+    except SandboxError:
+        raise
     except TimeoutError as e:
         raise ResultTimeoutError(
             f'the sandbox reported no result within {limit}s, {_RESULT_GRACE_SECS}s past the execution timeout '
@@ -513,7 +541,7 @@ def _with_session_event(output: dict, recoveries: list) -> dict:
 def _exec_error(error: SandboxError) -> dict:
     """Shape a failed sandbox call into the tool output."""
     return {
-        'error': str(error),
+        'error': _explained(str(error)),
         'exit_code': -1,
         'stdout': '',
         'stderr': '',
@@ -954,7 +982,7 @@ class IInstance(IInstanceBase):
                 on_recovery=recoveries.append,
             )
         except SandboxError as e:
-            failed = {'directory': directory, 'output': '', 'truncated': False, 'error': str(e)}
+            failed = {'directory': directory, 'output': '', 'truncated': False, 'error': _explained(str(e))}
             return _with_session_event(failed, recoveries)
         cloned = {'directory': directory, **_git_result(output, self.IGlobal.max_output_chars)}
         return _with_session_event(cloned, recoveries)
@@ -994,7 +1022,7 @@ class IInstance(IInstanceBase):
                 on_recovery=recoveries.append,
             )
         except (SandboxError, SessionEndedError) as e:
-            return _with_session_event({'output': '', 'truncated': False, 'error': str(e)}, recoveries)
+            return _with_session_event({'output': '', 'truncated': False, 'error': _explained(str(e))}, recoveries)
         return _with_session_event(_git_result(output, self.IGlobal.max_output_chars), recoveries)
 
     @tenki_tool(
@@ -1035,7 +1063,7 @@ class IInstance(IInstanceBase):
                 on_recovery=recoveries.append,
             )
         except (SandboxError, SessionEndedError) as e:
-            return _with_session_event({'output': '', 'truncated': False, 'error': str(e)}, recoveries)
+            return _with_session_event({'output': '', 'truncated': False, 'error': _explained(str(e))}, recoveries)
         return _with_session_event(_git_result(output, self.IGlobal.max_output_chars), recoveries)
 
     @tenki_tool(
@@ -1083,5 +1111,5 @@ class IInstance(IInstanceBase):
                 on_recovery=recoveries.append,
             )
         except (SandboxError, SessionEndedError) as e:
-            return _with_session_event({'output': '', 'truncated': False, 'error': str(e)}, recoveries)
+            return _with_session_event({'output': '', 'truncated': False, 'error': _explained(str(e))}, recoveries)
         return _with_session_event(_git_result(output, self.IGlobal.max_output_chars), recoveries)
