@@ -1125,6 +1125,14 @@ def test_a_refused_domain_that_carries_credentials_is_not_repeated_in_the_error(
     with pytest.raises(ValueError) as refused:
         glb.beginGlobal()
     assert 't0k3n-value' not in str(refused.value) and 'entry 2' in str(refused.value)
+    assert 'Refused: entry 2 (not shown: it may hold a credential)' in str(refused.value)
+
+
+def test_the_editor_check_says_the_pipeline_will_not_start_before_quoting_the_refusal(monkeypatch, logs):
+    # The refusal ends with the entries, so a sentence added after it would run into the last one.
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, 'allow_domains': ['https://pypi.org']})
+    glb.validateConfig()
+    assert any(message.startswith('The pipeline will fail to start: tenki.allow_domains') for message in logs), logs
 
 
 def test_the_editor_offers_secret_policies_and_the_allowlist_as_lists_of_names():
@@ -1165,6 +1173,16 @@ def test_a_key_without_secrets_access_is_also_logged_for_the_operator(monkeypatc
     inst, _ = _instance(monkeypatch, cfg=cfg, create_error=denied)
     inst.run_command({'command': 'ls'})
     assert any('Secrets access' in message and 'tenki.secret_policies' in message for message in logs)
+
+
+def test_a_key_without_secrets_access_is_logged_once_however_many_calls_meet_it(monkeypatch, logs):
+    # Every call asks for a session again and is refused again; the operator needs telling once.
+    denied = inst_mod.PermissionDeniedError('API key requires Secrets access; create a key with Secrets access enabled')
+    cfg = {'secret_policies': ['policy-name-in-config'], 'allow_domains': ['github.com']}
+    inst, client = _instance(monkeypatch, cfg=cfg, create_error=denied)
+    for _ in range(3):
+        assert 'Secrets access' in inst.run_command({'command': 'ls'})['error']
+    assert sum('Secrets access' in message for message in logs) == 1
 
 
 def test_another_permission_error_is_not_blamed_on_secrets_access(monkeypatch, logs):
@@ -2863,6 +2881,94 @@ def test_a_resume_that_runs_out_of_time_comes_back_to_the_agent_as_an_error(monk
     assert 'did not finish resuming' in result['error']
     assert len(client.create_calls) == 1
     assert inst.IGlobal.session is paused
+
+
+@pytest.mark.parametrize(
+    ('wait_error', 'reported'),
+    [
+        (TimeoutError('timeout waiting for sandbox sb-1'), 'did not finish resuming'),
+        (mod.SandboxError('readiness check failed'), 'readiness check failed'),
+        (mod.CommandTimeoutError('Deadline Exceeded'), "checking the sandbox's state ran past the deadline"),
+    ],
+)
+def test_a_resume_that_does_not_come_up_in_time_is_reported_by_the_next_call(monkeypatch, logs, wait_error, reported):
+    # Tenki accepted the resume, so memory and /home/tenki survived and /tmp was cleared, but the session
+    # did not run within the wait. The failing call keeps its own error and does not claim the session is
+    # back; the next call says "resumed", and only that one.
+    paused = _FakeSession('sb-1', state='PAUSED', ready_state='RESUMING', ready_error=wait_error)
+    inst, _ = _instance(monkeypatch, paused)
+    first = inst.read_file({'path': 'notes.md'})
+    assert reported in first['error']
+    assert first.get('session') != 'resumed'
+    paused.state = 'RUNNING'
+    assert inst.read_file({'path': 'notes.md'})['session'] == 'resumed'
+    assert 'session' not in inst.read_file({'path': 'notes.md'})
+
+
+def test_a_started_command_whose_resume_did_not_come_up_is_not_told_the_session_is_back(monkeypatch, logs):
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    session = _CutAndStuck('sb-1', 'never ready')
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.run_command({'command': 'make deploy'})
+    assert 'did not finish resuming' in result['error'] and 'not run again' in result['error'], result['error']
+    assert 'has been resumed' not in result['error'] and result.get('session') != 'resumed'
+
+
+def test_a_sent_change_whose_resume_did_not_come_up_is_not_told_the_session_is_back(monkeypatch, logs):
+    session = _FakeSession('sb-1', ready_state='RESUMING', ready_error=TimeoutError('timeout waiting for sandbox sb-1'))
+    inst, _ = _instance(monkeypatch, session)
+    inst.list_files({'path': '.'})
+    session.state = 'PAUSED'
+    result = inst.write_file({'path': 'a.txt', 'content': 'x'})
+    assert 'did not finish resuming' in result['error']
+    assert 'has been resumed' not in result['error'] and result.get('session') != 'resumed'
+
+
+def test_a_late_resume_is_claimed_by_one_call_even_without_a_listener(monkeypatch, logs):
+    session = _FakeSession('sb-1')
+    inst, _ = _instance(monkeypatch, session)
+    glb = inst.IGlobal
+    glb.get_session()
+    glb._resume_unreported = session
+    assert glb.call_with_session(lambda s: 'ran') == 'ran'
+    assert glb._resume_unreported is None
+
+
+def test_a_late_resume_another_call_claimed_first_is_not_reported_twice(monkeypatch, logs):
+    session = _FakeSession('sb-1')
+    inst, _ = _instance(monkeypatch, session)
+    glb = inst.IGlobal
+    glb.get_session()
+    glb._resume_unreported = session
+    lock = glb._session_lock
+
+    class _ClaimedMeanwhile:
+        # Another call takes the notice between this call's unlocked look and its lock.
+        def __enter__(self):
+            lock.acquire()
+            glb._resume_unreported = None
+
+        def __exit__(self, *exc):
+            lock.release()
+
+    glb._session_lock = _ClaimedMeanwhile()
+    events = []
+    glb._report_late_resume(session, events.append)
+    assert events == []
+
+
+def test_a_failed_wait_is_not_a_recovery_for_calls_waiting_on_the_same_session(monkeypatch, logs):
+    # A call that waited on the lock with the old epoch looks at the session again rather than retrying on
+    # one that may not run yet: each such retry would run its no-op command under the lock, one after another.
+    paused = _FakeSession('sb-1', state='PAUSED', ready_state='RESUMING', ready_error=TimeoutError('timeout'))
+    inst, _ = _instance(monkeypatch, paused)
+    glb = inst.IGlobal
+    glb.get_session()
+    epoch = glb.session_epoch
+    with pytest.raises(mod.SandboxError, match='did not finish resuming'):
+        glb.recover_session(paused, epoch)
+    assert glb.session_epoch == epoch
+    assert glb.recover_session(paused, epoch) is None
 
 
 def test_a_session_that_ends_as_it_is_created_comes_back_to_the_agent_as_an_error(monkeypatch, logs):

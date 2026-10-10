@@ -154,9 +154,8 @@ session, the close at shutdown included. A command does not go through it, and a
 answer marks the connection verified. So after every create and every resume the node runs one
 bounded no-op command (`true`) before anything else, so a call made after it never meets the check.
 A file call already under way when a parallel call resumes the session still can; that window is
-narrow, and nothing has been seen to stall in it. Measured on real VMs
-with the connection forced to "not verified": a file call ran the check once; after the no-op
-command, zero times.
+narrow, and nothing has been seen to stall in it. Measured on real VMs with the connection forced
+to "not verified": a file call ran the check once; after the no-op command, zero times.
 
 ### Secret policies
 
@@ -354,8 +353,7 @@ paused and resumed. The node handles both:
   that never starts) and can refuse the resume itself. The node looks at the session's state after
   each of those, and keeps asking for a refused resume for about 90 seconds, a budget shared by the
   calls waiting on the same resume. That first call took 41 to 67 seconds when measured on
-  2026-10-05, and 13 to 17 seconds on 2026-10-09. An error of
-  any other kind is reported as it is.
+  2026-10-05, and 13 to 17 seconds on 2026-10-09. An error of any other kind is reported as it is.
 
   What happens to the call that met the pause depends on whether repeating it is safe. A read
   (`read_file`, `list_files`, `git_diff`, `git_log`) is sent again after the resume and answers as
@@ -381,7 +379,9 @@ paused and resumed. The node handles both:
 
 Every result says how the session changed during its call, when it did, in its `session` field:
 `"created"` (this call started a new, empty sandbox), `"resumed"`, `"replaced"` or `"ended"`. A
-result with no `session` field ran on the same session as the call before it. Recovery follows the
+result with no `session` field ran on the same session as the call before it. One case is reported a
+call late: when Tenki accepts a resume but the session does not run within the node's three-minute
+wait, that call returns its error and the next call carries `"resumed"`. Recovery follows the
 session's real state rather than the error that surfaced: a paused session is resumed, an ended one
 is replaced or reported, and anything else is reported to the agent unchanged. A replacement is also
 logged as a warning, since it costs a new VM.

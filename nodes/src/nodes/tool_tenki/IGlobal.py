@@ -241,7 +241,7 @@ def _allowed_domains(raw) -> list[str]:
         # ASCII is checked before lowercasing could make it so (the Kelvin sign lowercases to "k").
         if not name.isascii() or len(domain) > _MAX_DOMAIN_CHARS or not _DOMAIN.match(domain):
             # An entry with an "@" may be a URL that carries credentials: say where it is, not what it says.
-            refused.append(f'entry {position}' if '@' in name else name)
+            refused.append(f'entry {position} (not shown: it may hold a credential)' if '@' in name else name)
             positions.append(str(position))
         elif domain not in domains:
             domains.append(domain)
@@ -343,11 +343,16 @@ class IGlobal(IGlobalBase):
     # The id of the session the node has run its no-op command on since that session was created or last
     # resumed (see _warm_up). Read without the lock as a fast path; written under it.
     _warm: str | None = None
+    # A session whose resume Tenki accepted but which did not come up within the wait, so the call that
+    # asked could not say "resumed". The next call says it instead (see call_with_session). Under the lock.
+    _resume_unreported: Sandbox | None = None
+    # Set once the job log has said that the key lacks Secrets access, so later refused calls do not repeat it.
+    _secrets_refusal_logged: bool = False
 
     rpc_timeout_secs: int = 120
     image: str = ''
-    # Tenki request policies to attach, by name. Tenki holds the secret values and substitutes them
-    # outside the VM, into requests a policy allows; the sandbox only ever sees placeholders.
+    # Tenki request policies to attach, by name. As Tenki documents it, it holds the secret values and
+    # substitutes them outside the VM, into requests a policy allows; the node sends nothing but the names.
     secret_policies: tuple[str, ...] = ()
     # Hostnames the sandbox may reach. Empty means no allowlist: outbound traffic is unrestricted.
     allow_domains: tuple[str, ...] = ()
@@ -523,10 +528,12 @@ class IGlobal(IGlobalBase):
             # tenki 1.4.0: "API key requires Secrets access; ..."). No sandbox is left behind, and
             # nothing an agent does can change the key, so the operator is told in the log as well as
             # the agent in its result. Any other refusal is reported as it is.
-            warning(
-                'tool_tenki: Tenki refused to attach tenki.secret_policies: the API key needs Secrets access, '
-                f'which is chosen when the key is created ({e})'
-            )
+            if not self._secrets_refusal_logged:
+                self._secrets_refusal_logged = True
+                warning(
+                    'tool_tenki: Tenki refused to attach tenki.secret_policies: the API key needs Secrets access, '
+                    f'which is chosen when the key is created ({e})'
+                )
             raise SessionUnavailableError(
                 f'Tenki refused to attach the secret policies named in tenki.secret_policies: {e}. The Tenki '
                 'API key this pipeline uses needs Secrets access, which only its operator can grant; '
@@ -603,6 +610,7 @@ class IGlobal(IGlobalBase):
         epoch = self.session_epoch
         try:
             session = self.get_session(on_event)
+            self._report_late_resume(session, on_event)
             try:
                 self._ensure_warm(session)
                 return call(session)
@@ -631,6 +639,20 @@ class IGlobal(IGlobalBase):
             # out of the tool. Logged as well: these are rare, and worth an operator's attention.
             warning(f'tool_tenki: sandbox call failed with {type(e).__name__}: {e}')
             raise SessionUnavailableError(str(e)) from e
+
+    def _report_late_resume(self, session: Sandbox, on_event) -> None:
+        """Say "resumed" for a resume an earlier call asked for but could not see come up (see recover_session).
+
+        Told to exactly one call, before it does anything, so no tool's retry rule is involved.
+        """
+        if self._resume_unreported is not session:
+            return
+        with self._session_lock:
+            claimed = self._resume_unreported is session
+            if claimed:
+                self._resume_unreported = None
+        if claimed and on_event is not None:
+            on_event('resumed')
 
     def _recover(self, session: Sandbox, epoch: int, replace: bool, on_event) -> str | None:
         """``recover_session``, telling ``on_event`` when the session turned out to have ended.
@@ -666,6 +688,12 @@ class IGlobal(IGlobalBase):
           Never replace it, since a pause preserves the agent's memory and files.
         * Any other state (running, starting, pausing): the failure had another cause, so
           it is surfaced.
+
+        A resume Tenki accepts changes the session (memory and /home/tenki kept, /tmp cleared) even when
+        the session then does not come up within the wait. The call that asked keeps its own error, and
+        the session is recorded in ``_resume_unreported`` so that the next call says "resumed". The epoch
+        moves only once the session runs, so calls waiting on this lock look at the session again rather
+        than retrying, one after another, on one that may not run yet.
         """
         with self._session_lock:
             if self.session is not session or self.session_epoch != epoch:
@@ -688,6 +716,7 @@ class IGlobal(IGlobalBase):
                 self._resume(session)
                 # A resume drops the SDK's data-plane connection, so the no-op command runs again first.
                 self._warm = None
+                self._resume_unreported = session
                 if self._ending:
                     # The ask was on its way when shutdown began. endGlobal is waiting on this lock
                     # to close the session, so it is not made to wait for the VM to come up first.
@@ -705,6 +734,8 @@ class IGlobal(IGlobalBase):
                     if session.state in _GONE_STATES:
                         return self._drop_session(session, session.state, replace=replace)
                     raise SessionUnavailableError(f'session {session.id} did not finish resuming: {e}') from e
+                # This call retries and says "resumed" itself.
+                self._resume_unreported = None
                 self.session_epoch += 1
                 self.last_recovery = 'resumed'
                 debug(f'tool_tenki: resumed paused session {session.id}')
@@ -771,6 +802,7 @@ class IGlobal(IGlobalBase):
         except Exception as e:
             debug(f'tool_tenki: could not close dropped session {session.id}: {e}')
         self.session = None
+        self._resume_unreported = None
         self.session_epoch += 1
         self.last_replacement_epoch = self.session_epoch
         self.last_recovery = 'replaced'
@@ -805,7 +837,7 @@ class IGlobal(IGlobalBase):
             try:
                 _secret_settings(cfg)
             except ValueError as e:
-                warning(f'{e} The pipeline will fail to start.')
+                warning(f'The pipeline will fail to start: {e}')
         except Exception as e:
             warning(str(e))
 
