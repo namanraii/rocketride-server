@@ -215,6 +215,15 @@ def _fs_error(error: Exception, path: str) -> str:
     return str(error)
 
 
+def _occurrences(text: str, old: str) -> int:
+    """How many times ``old`` occurs in ``text``, counting overlapping matches ("aa" occurs twice in "aaa")."""
+    found, start = 0, text.find(old)
+    while start != -1:
+        found += 1
+        start = text.find(old, start + 1)
+    return found
+
+
 def _listing(entries, cap: int) -> tuple[list[dict], bool]:
     """Shape directory entries by name, stopping before the listing's JSON would pass ``cap``."""
     shaped, used = [], 2  # the enclosing brackets
@@ -788,6 +797,83 @@ class IInstance(IInstanceBase):
             self.IGlobal.call_with_session(once, on_event=once.recovered)
         except SandboxError as e:
             return _with_session_event({'success': False, 'path': path, 'error': _fs_error(e, path)}, events)
+        return _with_session_event({'success': True, 'path': path}, events)
+
+    @tenki_tool(
+        group='filesystem',
+        input_schema={
+            'type': 'object',
+            'required': ['path', 'old_text', 'new_text'],
+            'properties': {
+                'path': {'type': 'string', 'description': 'File to edit, e.g. "app/main.py".'},
+                'old_text': {
+                    'type': 'string',
+                    'description': (
+                        'The exact text to replace, as it appears in the file, whitespace and line endings included. '
+                        'It must occur exactly once: include enough surrounding lines to make it unique.'
+                    ),
+                },
+                'new_text': {'type': 'string', 'description': 'The text to put in its place (may be empty).'},
+            },
+        },
+        output_schema=_CHANGE_OUTPUT_SCHEMA,
+        description=lambda self: (
+            'Edit a text file in the remote Tenki sandbox by replacing one exact, unique occurrence of old_text '
+            'with new_text. Refused, and nothing written, when old_text occurs zero times or more than once. '
+            f'Use it for a small change instead of rewriting the whole file with write_file. {_PATH_NOTE} '
+            f'{_SESSION_NOTE}'
+        ),
+    )
+    def edit_file(self, args):
+        """Replace one exact, unique occurrence of old_text in a text file in the shared Tenki session."""
+        args = normalize_tool_input(args, tool_name='tenki')
+        path = _normalize_path(args.get('path'))
+        old = args.get('old_text')
+        new = args.get('new_text')
+        if not isinstance(old, str) or not old:
+            raise ValueError('"old_text" is required and must be a non-empty string')
+        if not isinstance(new, str):
+            raise ValueError('"new_text" is required and must be a string (it may be empty)')
+
+        def edit(session, sent):
+            # Read with the same calls and limit as read_file, so a huge file is refused before it is fetched.
+            info = session.fs.stat(path)
+            if info.is_dir:
+                return f'{path} is a directory; edit_file changes one text file'
+            if info.size > _READ_LIMIT_BYTES:
+                return (
+                    f'{path} is {info.size:,} bytes, more than the {_READ_LIMIT_BYTES:,} edit_file reads; '
+                    'change it with run_command (sed -i, for example)'
+                )
+            try:
+                text = session.fs.read_bytes(path).decode('utf-8')
+            except UnicodeDecodeError:
+                return f'{path} is not UTF-8 text, so edit_file cannot change it'
+            found = _occurrences(text, old)
+            if found != 1:
+                return f'old_text was found {found} times in {path}; it must occur exactly once. ' + (
+                    'Check it against the file with read_file.' if found == 0 else 'Include more surrounding lines.'
+                )
+            edited = text.replace(old, new, 1)
+            if len(edited.encode('utf-8')) > _READ_LIMIT_BYTES:
+                return (
+                    f'the edited file would be more than {_READ_LIMIT_BYTES:,} bytes, which read_file could not read '
+                    'back; change it with run_command instead'
+                )
+            # Not atomic with the read: a change made to the file in between (by a command still running, say)
+            # is overwritten. The read is not a change, so a pause met before this point is retried.
+            sent.append(True)
+            session.fs.write_text(path, edited)
+            return None
+
+        events = []
+        once = _ChangeOnce(edit, events, 'edit')
+        try:
+            refused = self.IGlobal.call_with_session(once, replace=False, on_event=once.recovered)
+        except (SandboxError, SessionEndedError) as e:
+            return _with_session_event({'success': False, 'path': path, 'error': _fs_error(e, path)}, events)
+        if refused:
+            return _with_session_event({'success': False, 'path': path, 'error': refused}, events)
         return _with_session_event({'success': True, 'path': path}, events)
 
     @tenki_tool(

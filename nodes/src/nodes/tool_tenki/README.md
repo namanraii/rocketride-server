@@ -16,7 +16,7 @@ destroyed, and resumes later with its files and memory intact.
 
 Gives the pipeline one sandbox session, created on the first tool call and shared by every call
 after it, so files written and packages installed by one call are visible to the next. The agent
-gets 11 functions in three groups: running commands and code, editing files under `/home/tenki`, and
+gets 12 functions in three groups: running commands and code, editing files under `/home/tenki`, and
 working in a git repository. Pick it over `tool_python` when the work needs a real operating system
 instead of a restricted interpreter, and over `tool_daytona` when you want a machine that keeps its
 files and installed packages for the whole session. The node holds no credentials and places none
@@ -51,6 +51,7 @@ functions are published depends on the **Tool groups** field; by default all thr
 | `run_command` | Run a shell command through a login shell, returning its exit code and output. |
 | `run_code` | Write a snippet to a temporary file and run it with `python` or `javascript`. |
 | `write_file` | Write a UTF-8 text file, creating parent directories as needed. |
+| `edit_file` | Replace one exact, unique occurrence of a piece of text in a UTF-8 text file. |
 | `read_file` | Read a UTF-8 text file back. |
 | `list_files` | List a directory, optionally including hidden entries. |
 | `make_directory` | Create a directory and its parents. |
@@ -63,7 +64,11 @@ functions are published depends on the **Tool groups** field; by default all thr
 Every path argument is resolved under `/home/tenki` and confined to it, so the file functions cannot
 read or write elsewhere in the VM. `read_file` fetches a file in one request, so it refuses one over
 4,000,000 bytes rather than pulling it into the engine; read part of a larger file with
-`run_command` instead (`head`, `tail` or `sed -n`). Execution functions return `exit_code`, `stdout`, `stderr`,
+`run_command` instead (`head`, `tail` or `sed -n`). `edit_file` reads with the same limit and refuses
+an edit that would take the file over it; it replaces `old_text` only when that text occurs exactly
+once (overlapping matches count), matching whitespace and line endings exactly, and writes nothing
+otherwise. Its read and write are two calls, so a change made to the file in between, by a command
+still running say, is overwritten. Execution functions return `exit_code`, `stdout`, `stderr`,
 `timed_out` and `truncated`; a command stopped at its timeout comes back as an ordinary result with
 `timed_out` set, not as an error. Output longer than the configured cap is truncated before it
 reaches the agent, with `truncated` set so the agent knows it did not see everything.
@@ -316,8 +321,8 @@ paused and resumed. The node handles both:
 
   What happens to the call that met the pause depends on whether repeating it is safe. A read
   (`read_file`, `list_files`, `git_diff`, `git_log`) is sent again after the resume and answers as
-  usual. A change (`write_file`, `make_directory`, `delete_path`, `git_clone`, `git_checkout`) that
-  had already been sent is not sent again: it may or may not have taken effect,
+  usual. A change (`write_file`, `edit_file`, `make_directory`, `delete_path`, `git_clone`,
+  `git_checkout`) that had already been sent is not sent again: it may or may not have taken effect,
   so the call returns an error saying so, and the agent checks before retrying. A change that failed
   before it went out (in the no-op command, say) is sent after the resume. A command that was already
   running is cut off by the pause: when measured, its process was gone within two seconds of the

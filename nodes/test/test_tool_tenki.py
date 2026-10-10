@@ -1588,7 +1588,7 @@ def test_validate_config_warns_about_unknown_tool_groups(monkeypatch, logs):
 
 
 _EXECUTION_TOOLS = {'run_command', 'run_code'}
-_FILESYSTEM_TOOLS = {'write_file', 'read_file', 'list_files', 'make_directory', 'delete_path'}
+_FILESYSTEM_TOOLS = {'write_file', 'edit_file', 'read_file', 'list_files', 'make_directory', 'delete_path'}
 _GIT_TOOLS = {'git_clone', 'git_checkout', 'git_diff', 'git_log'}
 
 
@@ -3905,3 +3905,137 @@ def test_an_sdk_error_while_the_no_op_command_starts_is_reported_as_itself(monke
     inst, _ = _instance(monkeypatch, session)
     assert inst.read_file({'path': 'notes.txt'})['error'] == 'quota exceeded'
     assert _first_data_call(session) is None
+
+
+# ---------------------------------------------------------------------------
+# edit_file
+# ---------------------------------------------------------------------------
+
+
+def test_edit_file_replaces_the_one_occurrence_and_leaves_the_rest_alone(monkeypatch, logs):
+    session = _FakeSession('sb-1', files={'/home/tenki/app.py': 'a = 1\nb = 2\nc = 3\n'})
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.edit_file({'path': 'app.py', 'old_text': 'b = 2', 'new_text': 'b = 20'})
+    assert result == {'success': True, 'path': '/home/tenki/app.py', 'session': 'created'}
+    assert session.fs.files['/home/tenki/app.py'] == 'a = 1\nb = 20\nc = 3\n'
+
+
+@pytest.mark.parametrize(
+    ('text', 'old', 'found'),
+    [
+        ('x = 1\n', 'y = 1', 0),
+        ('x = 1\nx = 1\n', 'x = 1', 2),
+        ('aaa', 'aa', 2),  # overlapping matches: which one was meant is ambiguous too
+    ],
+)
+def test_edit_file_refuses_unless_the_text_occurs_exactly_once(monkeypatch, logs, text, old, found):
+    session = _FakeSession('sb-1', files={'/home/tenki/f.txt': text})
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.edit_file({'path': 'f.txt', 'old_text': old, 'new_text': 'z'})
+    assert result['success'] is False and f'found {found} times' in result['error']
+    assert 'exactly once' in result['error']
+    assert session.fs.files['/home/tenki/f.txt'] == text
+    assert not [call for call in session.calls if call[0] == 'write_text']
+
+
+def test_edit_file_matches_exactly_without_normalising_whitespace_or_line_endings(monkeypatch, logs):
+    session = _FakeSession('sb-1', files={'/home/tenki/f.txt': 'one\r\ntwo  three\n'})
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.edit_file({'path': 'f.txt', 'old_text': 'one\ntwo', 'new_text': 'x'})['success'] is False
+    assert inst.edit_file({'path': 'f.txt', 'old_text': 'two three', 'new_text': 'x'})['success'] is False
+    assert inst.edit_file({'path': 'f.txt', 'old_text': 'one\r\ntwo  three', 'new_text': 'x'})['success'] is True
+    assert session.fs.files['/home/tenki/f.txt'] == 'x\n'
+
+
+@pytest.mark.parametrize(
+    'args',
+    [
+        {'old_text': 'a', 'new_text': 'b'},
+        {'path': 'f.txt', 'new_text': 'b'},
+        {'path': 'f.txt', 'old_text': '', 'new_text': 'b'},
+        {'path': 'f.txt', 'old_text': 5, 'new_text': 'b'},
+        {'path': 'f.txt', 'old_text': 'a'},
+        {'path': 'f.txt', 'old_text': 'a', 'new_text': None},
+        {'path': '/etc/passwd', 'old_text': 'a', 'new_text': 'b'},
+        {'path': '../x', 'old_text': 'a', 'new_text': 'b'},
+    ],
+)
+def test_edit_file_rejects_invalid_input_without_touching_the_sandbox(monkeypatch, logs, args):
+    inst, client = _instance(monkeypatch, _FakeSession('sb-1'))
+    with pytest.raises(ValueError):
+        inst.edit_file(args)
+    assert client.create_calls == []
+
+
+def test_edit_file_refuses_a_file_over_the_read_limit_without_fetching_it(monkeypatch, logs):
+    big = 'x' * (inst_mod._READ_LIMIT_BYTES + 1)
+    session = _FakeSession('sb-1', files={'/home/tenki/big.txt': big})
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.edit_file({'path': 'big.txt', 'old_text': 'x', 'new_text': 'y'})
+    assert result['success'] is False and '4,000,000' in result['error']
+    assert not [call for call in session.calls if call[0] in ('read_bytes', 'write_text')]
+
+
+def test_edit_file_refuses_an_edit_that_would_take_the_file_over_the_read_limit(monkeypatch, logs):
+    text = 'x' * (inst_mod._READ_LIMIT_BYTES - 10) + 'MARK'
+    session = _FakeSession('sb-1', files={'/home/tenki/f.txt': text})
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.edit_file({'path': 'f.txt', 'old_text': 'MARK', 'new_text': 'y' * 100})
+    assert result['success'] is False and 'read_file' in result['error']
+    assert session.fs.files['/home/tenki/f.txt'] == text
+
+
+def test_edit_file_refuses_a_directory_and_a_missing_file(monkeypatch, logs):
+    session = _FakeSession('sb-1', dirs={'/home/tenki/src'})
+    inst, _ = _instance(monkeypatch, session)
+    assert 'is a directory' in inst.edit_file({'path': 'src', 'old_text': 'a', 'new_text': 'b'})['error']
+    assert inst.edit_file({'path': 'nope.txt', 'old_text': 'a', 'new_text': 'b'})['error'] == (
+        'no such file or directory: /home/tenki/nope.txt'
+    )
+
+
+def test_edit_file_refuses_a_file_that_is_not_utf8_text(monkeypatch, logs):
+    session = _FakeSession('sb-1', files={'/home/tenki/f.bin': 'placeholder'})
+    session.fs.read_bytes = lambda path: b'\xff\xfe\x00binary'
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.edit_file({'path': 'f.bin', 'old_text': 'a', 'new_text': 'b'})
+    assert result['success'] is False and 'UTF-8' in result['error']
+
+
+def test_edit_file_on_a_session_that_ended_says_so_and_creates_nothing(monkeypatch, logs):
+    ended = mod.SessionTerminatedError('session_terminated')
+    dead = _FakeSession('sb-dead', files={'/home/tenki/f.txt': 'a'}, fail={'stat': ended})
+    inst, client = _instance(monkeypatch, dead, _FakeSession('sb-fresh'))
+    inst.run_command({'command': 'ls'})
+    dead.refresh = lambda: SimpleNamespace(id=dead.id, state='TERMINATED')
+    result = inst.edit_file({'path': 'f.txt', 'old_text': 'a', 'new_text': 'b'})
+    assert result['session'] == 'ended' and 'ended' in result['error']
+    assert len(client.create_calls) == 1
+
+
+def test_edit_file_reads_before_a_pause_and_edits_after_it_when_the_write_had_not_gone_out(monkeypatch, logs):
+    # The read is not a change: a pause met while reading resumes, reads again and edits once.
+    session = _FakeSession('sb-1', files={'/home/tenki/f.txt': 'old'})
+    inst, _ = _instance(monkeypatch, session)
+    inst.list_files({'path': '.'})
+    session.state = 'PAUSED'
+    result = inst.edit_file({'path': 'f.txt', 'old_text': 'old', 'new_text': 'new'})
+    assert result == {'success': True, 'path': '/home/tenki/f.txt', 'session': 'resumed'}
+    assert session.fs.files['/home/tenki/f.txt'] == 'new'
+
+
+def test_edit_file_whose_write_was_in_flight_when_the_session_was_paused_is_not_sent_again(monkeypatch, logs):
+    session = _FakeSession('sb-1', files={'/home/tenki/f.txt': 'old'})
+    inst, _ = _instance(monkeypatch, session)
+    inst.list_files({'path': '.'})
+    read = session.fs._read_bytes
+
+    def read_then_pause(path):
+        data = read(path)
+        session.state = 'PAUSED'  # the pause lands between the read and the write
+        return data
+
+    session.fs._read_bytes = read_then_pause
+    result = inst.edit_file({'path': 'f.txt', 'old_text': 'old', 'new_text': 'new'})
+    assert result['session'] == 'resumed' and 'not sent again' in result['error']
+    assert sum(1 for call in session.calls if call[0] == 'write_text') == 1
