@@ -152,6 +152,13 @@ class SessionUnavailableError(SandboxError):
     """
 
 
+class ResumeNotConfirmedError(SessionUnavailableError):
+    """A resumed session did not run the node's no-op command, so the call failed and no one was told "resumed".
+
+    The resume is left for the first later call whose no-op command runs (see ``_confirm_resume``).
+    """
+
+
 class CommandNotStartedError(CommandTimeoutError):
     """The sandbox never confirmed that a command had started, so the command was cancelled.
 
@@ -637,8 +644,11 @@ class IGlobal(IGlobalBase):
                 if not recovery:
                     raise
             if recovery == 'resumed':
+                # "resumed" is told only once a command has run on the resumed session.
+                self._confirm_resume(session)
                 # This result says it (or the tool stops here and its error does); a resume left unreported
-                # must not be said again by the next call. Claimed first, since on_event may raise.
+                # must not be said again by the next call. Claimed after the no-op command, so that a notice
+                # another call left meanwhile is claimed too, and before on_event, which may raise.
                 self._report_late_resume(session, None)
             if on_event is not None:
                 on_event(recovery)
@@ -655,6 +665,28 @@ class IGlobal(IGlobalBase):
             # out of the tool. Logged as well: these are rare, and worth an operator's attention.
             warning(f'tool_tenki: sandbox call failed with {type(e).__name__}: {e}')
             raise SessionUnavailableError(str(e)) from e
+
+    def _confirm_resume(self, session: Sandbox) -> None:
+        """Run the no-op command on a session this call saw resumed, before the call is told "resumed".
+
+        A session reads RUNNING after a resume (or after a refused one, see ``_resume``) before it is known to run
+        commands. If the no-op command fails, the call fails with ``ResumeNotConfirmedError`` and the resume is
+        left for the first later call whose no-op command runs, as for a resume that came up late. Run before
+        the tool hears of the resume, so a tool that stops its retry there (a started command, a sent change)
+        reports the resume only once the session has run a command.
+        """
+        try:
+            self._ensure_warm(session)
+        except (SandboxError, RuntimeError, TimeoutError) as e:
+            if self._ending:
+                raise
+            with self._session_lock:
+                # Not when another call's no-op command has run on it meanwhile: that call says "resumed".
+                if self.session is session and self._warm != session.id:
+                    self._resume_unreported = session
+            raise ResumeNotConfirmedError(
+                f'the sandbox did not answer after the pause: {e}. The next call that reaches it says whether it resumed'
+            ) from e
 
     def _report_late_resume(self, session: Sandbox, on_event) -> None:
         """Say "resumed" for a resume an earlier call asked for but could not see come up (see recover_session).

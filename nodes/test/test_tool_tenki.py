@@ -3525,6 +3525,217 @@ def test_a_refusal_followed_by_running_ends_the_budget(monkeypatch, logs):
     assert inst.IGlobal._resume_retry_until is None
 
 
+def _warm_up_ran_after_the_resume(session):
+    """Whether the node's no-op command started on ``session`` after its last resume call."""
+    calls = session.calls
+    last = max(i for i, call in enumerate(calls) if call == 'resume')
+    return any(isinstance(call, tuple) and call[0] == 'start' and call[1] == _WARM_UP for call in calls[last + 1 :])
+
+
+def _no_op_fails_once_after_the_resume(session, error):
+    """Make the node's first no-op command after a resume fail with ``error``; later ones run."""
+    start = session.start
+    failing = [error]
+
+    def start_failing_once(*argv, **kwargs):
+        if argv == _WARM_UP and 'resume' in session.calls and failing:
+            session.calls.append(('start-failed', argv))
+            raise failing.pop()
+        return start(*argv, **kwargs)
+
+    session.start = start_failing_once
+
+
+def test_resumed_is_told_only_after_the_no_op_command_ran_on_the_resumed_session(monkeypatch, logs):
+    # The condition the RUNNING-after-a-refusal rule was accepted on: a refusal followed by RUNNING counts as an
+    # accepted resume, but "resumed" reaches the tool only once the node's no-op command has run on the resumed
+    # session, so a session that only reads RUNNING is never reported as resumed.
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    session = _FakeSession('sb-1', state='PAUSED', files={'/home/tenki/notes.txt': 'kept'})
+    _refused_then_resumed(session, [mod.InvalidStateError('session is not paused')], state_while_refused='RUNNING')
+    inst, _ = _instance(monkeypatch, session)
+    told = []
+    inst.IGlobal.call_with_session(
+        lambda s: 'ran', on_event=lambda event: told.append((event, len(session.warm_up_processes)))
+    )
+    assert told == [('created', 0), ('resumed', 1)], told
+
+
+def test_a_resume_whose_no_op_command_fails_is_told_by_the_next_call_that_runs_it(monkeypatch, logs):
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    session = _FakeSession('sb-1', state='PAUSED', files={'/home/tenki/notes.txt': 'kept'})
+    _refused_then_resumed(session, [mod.InvalidStateError('session is not paused')], state_while_refused='RUNNING')
+    _no_op_fails_once_after_the_resume(session, mod.SandboxError('data plane not ready'))
+    inst, _ = _instance(monkeypatch, session)
+    first = inst.read_file({'path': 'notes.txt'})
+    assert 'data plane not ready' in first['error'] and first.get('session') != 'resumed', first
+    second = inst.read_file({'path': 'notes.txt'})
+    assert second.get('content') == 'kept' and second['session'] == 'resumed', second
+    assert 'session' not in inst.read_file({'path': 'notes.txt'})
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args'), [('run_command', {'command': 'make deploy'}), ('run_code', {'code': 'print(1)'})]
+)
+def test_a_command_cut_off_by_a_pause_is_told_resumed_only_after_the_no_op_ran(monkeypatch, logs, tool, args):
+    session = _PausedMidCommand('sb-1')
+    inst, _ = _instance(monkeypatch, session)
+    result = getattr(inst, tool)(args)
+    assert 'not run again' in result['error'] and result['session'] == 'resumed', result
+    assert _warm_up_ran_after_the_resume(session)
+
+
+def test_a_command_cut_off_by_a_pause_whose_session_does_not_answer_is_not_told_resumed(monkeypatch, logs):
+    session = _PausedMidCommand('sb-1')
+    _no_op_fails_once_after_the_resume(session, mod.SandboxError('data plane not ready'))
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.run_command({'command': 'make deploy'})
+    assert 'not run again' in result['error'] and 'part of its work may be done' in result['error'], result
+    assert result.get('session') != 'resumed' and 'has been resumed' not in result['error'], result
+    assert inst.list_files({'path': '.'})['session'] == 'resumed'
+    assert len(session.processes) == 1
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args'),
+    [
+        ('write_file', {'path': 'a.txt', 'content': 'x'}),
+        ('make_directory', {'path': 'made'}),
+        ('delete_path', {'path': 'notes.txt'}),
+        ('git_clone', {'repo': _REPO}),
+        ('git_checkout', {'ref': 'feature', 'create': True}),
+    ],
+)
+def test_a_sent_change_whose_resumed_session_does_not_answer_still_says_it_may_have_taken_effect(
+    monkeypatch, logs, tool, args
+):
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    inst.list_files({'path': '.'})
+    session.state = 'PAUSED'
+    _no_op_fails_once_after_the_resume(session, mod.SandboxError('data plane not ready'))
+    result = getattr(inst, tool)(args)
+    assert 'may or may not have taken effect' in result['error'] and 'Check before retrying' in result['error'], result
+    assert result.get('session') != 'resumed' and 'has been resumed' not in result['error'], result
+    assert inst.list_files({'path': '.'})['session'] == 'resumed'
+
+
+def test_a_failed_confirmation_leaves_no_notice_when_another_call_confirmed_the_resume(monkeypatch, logs):
+    # Two calls recover the same pause. This one's no-op command fails; meanwhile the other call's runs, and that
+    # call says "resumed". The resume must not be told again by the next call.
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    session = _FakeSession('sb-1', state='PAUSED')
+    inst, _ = _instance(monkeypatch, session)
+    glb = inst.IGlobal
+    start = session.start
+
+    def start_failing_while_another_call_confirms(*argv, **kwargs):
+        if argv == _WARM_UP and 'resume' in session.calls and glb._warm != session.id:
+            glb._warm = session.id  # the other call's no-op command ran in the meantime
+            raise mod.SandboxError('data plane not ready')
+        return start(*argv, **kwargs)
+
+    session.start = start_failing_while_another_call_confirms
+    first = inst.read_file({'path': 'notes.txt'})
+    assert 'did not answer' in first['error'] and first.get('session') != 'resumed', first
+    assert glb._resume_unreported is None
+
+
+def test_a_notice_left_while_this_call_confirms_the_resume_is_claimed_by_this_call(monkeypatch, logs):
+    # Another call recovering the same pause failed its no-op command and left a notice just before this call's
+    # ran. This call says "resumed", so the next call must not say it again.
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    session = _FakeSession('sb-1', state='PAUSED', files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    glb = inst.IGlobal
+    start = session.start
+    left = []
+
+    def start_after_another_calls_notice(*argv, **kwargs):
+        if argv == _WARM_UP and 'resume' in session.calls and not left:
+            left.append(True)
+            glb._resume_unreported = session
+        return start(*argv, **kwargs)
+
+    session.start = start_after_another_calls_notice
+    first = inst.read_file({'path': 'notes.txt'})
+    assert first.get('content') == 'kept' and first['session'] == 'resumed', first
+    assert 'session' not in inst.read_file({'path': 'notes.txt'})
+
+
+def test_a_resume_that_meets_the_shutdown_is_not_confirmed_and_not_left_for_later(monkeypatch, logs):
+    # endGlobal began while the session came back: the no-op command is not run, the call says the pipeline is
+    # shutting down rather than that the sandbox did not answer, and no later call is told "resumed".
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    session = _FakeSession('sb-1', state='PAUSED')
+    inst, _ = _instance(monkeypatch, session)
+    glb = inst.IGlobal
+    ready = session.wait_ready
+
+    def ready_then_shutdown(timeout=180):
+        ready(timeout)
+        glb._ending = True
+
+    session.wait_ready = ready_then_shutdown
+    result = inst.read_file({'path': 'notes.txt'})
+    assert 'shutting down' in result['error'] and result.get('session') != 'resumed', result
+    assert 'did not answer' not in result['error']
+    assert glb._resume_unreported is None and not _warm_up_ran_after_the_resume(session)
+
+
+def test_a_failed_confirmation_of_a_session_no_longer_in_use_leaves_no_notice(monkeypatch, logs):
+    # The session was dropped while its no-op command failed (it ended, say): a notice for it would be told to
+    # no one, and must not outlive it.
+    monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
+    session = _FakeSession('sb-1', state='PAUSED')
+    inst, _ = _instance(monkeypatch, session)
+    glb = inst.IGlobal
+    start = session.start
+
+    def start_dropping(*argv, **kwargs):
+        if argv == _WARM_UP and 'resume' in session.calls:
+            glb.session = None
+            raise mod.SandboxError('data plane not ready')
+        return start(*argv, **kwargs)
+
+    session.start = start_dropping
+    result = inst.read_file({'path': 'notes.txt'})
+    assert 'data plane not ready' in result['error'] and result.get('session') != 'resumed', result
+    assert glb._resume_unreported is None
+
+
+def test_an_edit_whose_write_was_sent_and_whose_resumed_session_does_not_answer_says_it_may_have_taken_effect(
+    monkeypatch, logs
+):
+    session = _FakeSession('sb-1', files={'/home/tenki/f.txt': 'old'})
+    inst, _ = _instance(monkeypatch, session)
+    inst.list_files({'path': '.'})
+    read = session.fs._read_bytes
+
+    def read_then_pause(path):
+        data = read(path)
+        session.state = 'PAUSED'  # the pause lands between the read and the write
+        return data
+
+    session.fs._read_bytes = read_then_pause
+    _no_op_fails_once_after_the_resume(session, mod.SandboxError('data plane not ready'))
+    result = inst.edit_file({'path': 'f.txt', 'old_text': 'old', 'new_text': 'new'})
+    assert 'may or may not have taken effect' in result['error'] and result.get('session') != 'resumed', result
+
+
+def test_an_edit_paused_before_its_write_is_not_told_it_may_have_taken_effect(monkeypatch, logs):
+    # The pause came at the read, so nothing was sent: the agent gets the failure itself, and may simply retry.
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.txt': 'kept'})
+    inst, _ = _instance(monkeypatch, session)
+    inst.list_files({'path': '.'})
+    session.state = 'PAUSED'
+    _no_op_fails_once_after_the_resume(session, mod.SandboxError('data plane not ready'))
+    result = inst.edit_file({'path': 'notes.txt', 'old_text': 'kept', 'new_text': 'changed'})
+    assert 'did not answer after the pause' in result['error'] and 'may or may not' not in result['error'], result
+    assert result.get('session') != 'resumed'
+    assert not any(call[0] == 'write_text' for call in session.calls if isinstance(call, tuple))
+
+
 def test_a_session_still_resuming_when_the_budget_runs_out_is_reported_by_the_next_call(monkeypatch, logs):
     # A resume is under way (an earlier ask Tenki answered with an error, or another client), but every ask is
     # refused until the budget is spent. The call reports the refusal; once the session runs, the next call says

@@ -388,14 +388,18 @@ paused and resumed. The node handles both:
   `session: "created"`.
 
 Every result says how the session changed during its call, when it did, in its `session` field:
-`"created"` (this call started a new, empty sandbox), `"resumed"`, `"replaced"` or `"ended"`. A
-result with no `session` field ran on the same session as the call before it. Two cases are reported
-late: when Tenki accepts a resume but the session does not run within the node's three-minute wait,
-or is still resuming when the two-minute budget ends. That call returns its error, and the first later
-call that finds the session running carries `"resumed"`. Recovery follows the
-session's real state rather than the error that surfaced: a paused session is resumed, an ended one
-is replaced or reported, and anything else is reported to the agent unchanged. A replacement is also
-logged as a warning, since it costs a new VM.
+`"created"` (this call started a new, empty sandbox), `"resumed"`, `"replaced"` or `"ended"`. A result
+with no `session` field ran on the same session as the call before it. `"resumed"` is said only once the
+node's no-op command has run on the resumed session, so a session that only reads RUNNING is not
+reported as resumed. Three cases are therefore reported late: when Tenki accepts a resume but the
+session does not run within the node's three-minute wait, when it is still resuming when the two-minute
+budget ends, and when it runs but does not answer the no-op command. That call returns its error, and
+the first later call whose no-op command runs carries `"resumed"`. A command that had started says it
+may still be running or may have been cut off; in the third case, a change that had already been sent
+also says it may or may not have taken effect. Recovery follows the session's real state rather than the
+error that surfaced: a paused session is resumed, an ended one is replaced or reported, and anything
+else is reported to the agent unchanged. A replacement is also logged as a warning, since it costs a new
+VM.
 
 ### Teardown
 

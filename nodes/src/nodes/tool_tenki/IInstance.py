@@ -52,7 +52,7 @@ from ai.common.utils import normalize_tool_input, optional_bool, optional_int
 from tenki import CommandTimeoutError, PermissionDeniedError, SandboxError
 from tenki import FileNotFoundError as TenkiFileNotFoundError  # also subclasses the builtin it shadows
 
-from .IGlobal import CommandNotStartedError, IGlobal, SessionEndedError, about_the_vm_link
+from .IGlobal import CommandNotStartedError, IGlobal, ResumeNotConfirmedError, SessionEndedError, about_the_vm_link
 from .tool_groups import tenki_tool
 
 #: The session's home and default working directory, and the only root Tenki's file API accepts.
@@ -507,11 +507,14 @@ class ChangeInterruptedError(SandboxError):
 
     The pause may have come before the change was sent (an agent back after the session reached its
     lifetime) or while it was on its way; the node cannot tell which, so the message claims neither.
+    ``resumed`` is False when the resumed session did not run the node's no-op command: the message then
+    does not say it was resumed (see ``IGlobal._confirm_resume``).
     """
 
-    def __init__(self, what: str) -> None:
+    def __init__(self, what: str, resumed: bool = True) -> None:
+        state = 'the sandbox has been resumed' if resumed else 'the sandbox has not answered since'
         super().__init__(
-            f'this {what} found the sandbox paused, and the sandbox has been resumed. The {what} was not sent '
+            f'this {what} found the sandbox paused, and {state}. The {what} was not sent '
             'again, so it may or may not have taken effect. Check before retrying.'
         )
 
@@ -543,6 +546,16 @@ class _ChangeOnce:
         self._events.append(event)
         if event == 'resumed' and self.sent:
             raise ChangeInterruptedError(self._what)
+
+    def reported(self, error: Exception) -> Exception:
+        """The error to hand the agent for a call that failed.
+
+        A change that had been sent when its session was resumed, and whose resumed session then did not run
+        the no-op command, may still have taken effect; the agent is told so rather than handed only the cause.
+        """
+        if self.sent and isinstance(error, ResumeNotConfirmedError):
+            return ChangeInterruptedError(self._what, resumed=False)
+        return error
 
 
 def _run_process(session, argv, timeout: int, started: list):
@@ -800,7 +813,9 @@ class IInstance(IInstanceBase):
         try:
             self.IGlobal.call_with_session(once, on_event=once.recovered)
         except SandboxError as e:
-            return _with_session_event({'success': False, 'path': path, 'error': _fs_error(e, path)}, events)
+            return _with_session_event(
+                {'success': False, 'path': path, 'error': _fs_error(once.reported(e), path)}, events
+            )
         return _with_session_event({'success': True, 'path': path}, events)
 
     @tenki_tool(
@@ -875,7 +890,9 @@ class IInstance(IInstanceBase):
         try:
             refused = self.IGlobal.call_with_session(once, replace=False, on_event=once.recovered)
         except (SandboxError, SessionEndedError) as e:
-            return _with_session_event({'success': False, 'path': path, 'error': _fs_error(e, path)}, events)
+            return _with_session_event(
+                {'success': False, 'path': path, 'error': _fs_error(once.reported(e), path)}, events
+            )
         if refused:
             return _with_session_event({'success': False, 'path': path, 'error': refused}, events)
         return _with_session_event({'success': True, 'path': path}, events)
@@ -1019,7 +1036,9 @@ class IInstance(IInstanceBase):
         try:
             self.IGlobal.call_with_session(once, on_event=once.recovered)
         except SandboxError as e:
-            return _with_session_event({'success': False, 'path': path, 'error': _fs_error(e, path)}, events)
+            return _with_session_event(
+                {'success': False, 'path': path, 'error': _fs_error(once.reported(e), path)}, events
+            )
         return _with_session_event({'success': True, 'path': path}, events)
 
     @tenki_tool(
@@ -1055,7 +1074,9 @@ class IInstance(IInstanceBase):
         try:
             self.IGlobal.call_with_session(once, replace=False, on_event=once.recovered)
         except (SandboxError, SessionEndedError) as e:
-            return _with_session_event({'success': False, 'path': path, 'error': _fs_error(e, path)}, events)
+            return _with_session_event(
+                {'success': False, 'path': path, 'error': _fs_error(once.reported(e), path)}, events
+            )
         return _with_session_event({'success': True, 'path': path}, events)
 
     # -----------------------------------------------------------------------
@@ -1127,7 +1148,12 @@ class IInstance(IInstanceBase):
         try:
             output = self.IGlobal.call_with_session(once, on_event=once.recovered)
         except SandboxError as e:
-            failed = {'directory': directory, 'output': '', 'truncated': False, 'error': _explained(str(e))}
+            failed = {
+                'directory': directory,
+                'output': '',
+                'truncated': False,
+                'error': _explained(str(once.reported(e))),
+            }
             return _with_session_event(failed, events)
         cloned = {'directory': directory, **_git_result(output, self.IGlobal.max_output_chars)}
         return _with_session_event(cloned, events)
@@ -1168,7 +1194,9 @@ class IInstance(IInstanceBase):
         try:
             output = self.IGlobal.call_with_session(once, replace=False, on_event=once.recovered)
         except (SandboxError, SessionEndedError) as e:
-            return _with_session_event({'output': '', 'truncated': False, 'error': _explained(str(e))}, events)
+            return _with_session_event(
+                {'output': '', 'truncated': False, 'error': _explained(str(once.reported(e)))}, events
+            )
         return _with_session_event(_git_result(output, self.IGlobal.max_output_chars), events)
 
     @tenki_tool(
