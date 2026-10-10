@@ -183,7 +183,7 @@ repository or gist the credential, or any other one the agent is given, can writ
 
 Create the secrets and policies in Tenki first (see [Private repositories](#private-repositories)).
 The API key needs Secrets access; without it Tenki refuses the session, and the tool result says so
-(measured). Tenki documents that the image has to carry its managed HTTPS trust. Nothing advertises
+(measured). See [Authentication](#authentication) for how far that access reaches. Tenki documents that the image has to carry its managed HTTPS trust. Nothing advertises
 the placeholders to the agent, so name the ones it may use in its instructions. If a command's
 output contains Tenki's documented denial text, the tool result adds a note that repeating the
 request will not help; whether that text ever reaches a command's output has not been measured.
@@ -236,7 +236,25 @@ as `${ROCKETRIDE_TENKI_APIKEY}` rather than writing the literal into a pipeline 
 
 The key authenticates the engine to Tenki and stays on the engine host. It is never placed inside the
 sandbox, so nothing the agent runs can read it. Attaching [secret policies](#secret-policies) also
-needs the key to have Secrets access, which is chosen when the key is created.
+needs the key to have Secrets access, chosen when the key is created (**Allow Secrets access**). A
+key without it cannot be given it later; create a replacement.
+
+Secrets access is one option, and it is broad. Tenki's SDK gives a key that has it the means to
+create, change, revoke and delete every secret and request policy in the workspace, so such a key
+could, for example, rewrite a policy to send a credential to another host. Neither the SDK nor
+Tenki's documentation offers a way to read a secret's value back: listing and inspecting return
+metadata only. (This is read from the SDK and the documentation. The key available for testing had
+no Secrets access.) The node itself uses none of those operations; it only names policies when it
+creates a session. To keep such a key's reach as small as Tenki allows:
+
+- Give the node a key of its own, used by nothing else. Leave Secrets access off unless the
+  pipeline sets secret policies.
+- Create and change secrets and policies with a different credential, such as your own CLI login,
+  not with the node's key.
+- Set an expiry date on the key, and revoke it when the pipeline is retired.
+- Give each stored credential only the permissions its pipeline needs (a GitHub token with read
+  access to one repository, say). A policy decides which requests get the credential, not what the
+  credential is allowed to do.
 
 ## Notes
 
