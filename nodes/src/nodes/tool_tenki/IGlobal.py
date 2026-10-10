@@ -521,7 +521,12 @@ class IGlobal(IGlobalBase):
                 raise
             # What Tenki answers when the API key was created without Secrets access (measured with
             # tenki 1.4.0: "API key requires Secrets access; ..."). No sandbox is left behind, and
-            # nothing an agent does can change the key. Any other refusal is reported as it is.
+            # nothing an agent does can change the key, so the operator is told in the log as well as
+            # the agent in its result. Any other refusal is reported as it is.
+            warning(
+                'tool_tenki: Tenki refused to attach tenki.secret_policies: the API key needs Secrets access, '
+                f'which is chosen when the key is created ({e})'
+            )
             raise SessionUnavailableError(
                 f'Tenki refused to attach the secret policies named in tenki.secret_policies: {e}. The Tenki '
                 'API key this pipeline uses needs Secrets access, which only its operator can grant; '

@@ -1158,6 +1158,15 @@ def test_a_key_without_secrets_access_is_reported_as_a_setup_problem(monkeypatch
     assert 'policy-name-in-config' not in result['error']
 
 
+def test_a_key_without_secrets_access_is_also_logged_for_the_operator(monkeypatch, logs):
+    # The agent cannot fix it, so the operator should not have to learn of it from the agent's answer.
+    denied = inst_mod.PermissionDeniedError('API key requires Secrets access; create a key with Secrets access enabled')
+    cfg = {'secret_policies': ['policy-name-in-config'], 'allow_domains': ['github.com']}
+    inst, _ = _instance(monkeypatch, cfg=cfg, create_error=denied)
+    inst.run_command({'command': 'ls'})
+    assert any('Secrets access' in message and 'tenki.secret_policies' in message for message in logs)
+
+
 def test_another_permission_error_is_not_blamed_on_secrets_access(monkeypatch, logs):
     # Policies are configured, but this refusal is about something else. Telling the operator to fix
     # the key's Secrets access would send them the wrong way.
@@ -3829,6 +3838,18 @@ def test_a_change_in_flight_when_the_session_was_paused_is_not_sent_again(monkey
     sent = [call for call in session.calls if isinstance(call, tuple) and call[0] == operation]
     assert len(sent) == 1
     assert session.calls.count('resume') == 1
+
+
+def test_a_change_sent_to_a_session_already_paused_is_not_told_the_pause_came_mid_flight(monkeypatch, logs):
+    # The usual case: the agent comes back after the session reached its lifetime, so the pause came before
+    # the call. The node cannot tell which, so the message must not claim either.
+    session = _FakeSession('sb-1')
+    inst, _ = _instance(monkeypatch, session)
+    inst.list_files({'path': '.'})
+    session.state = 'PAUSED'
+    error = inst.write_file({'path': 'a.txt', 'content': 'x'})['error']
+    assert 'in flight' not in error and 'was paused while' not in error
+    assert 'paused' in error and 'not sent again' in error and 'Check before retrying' in error
 
 
 @pytest.mark.parametrize(

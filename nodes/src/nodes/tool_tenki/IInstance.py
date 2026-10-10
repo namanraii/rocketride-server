@@ -503,12 +503,16 @@ class _StartedOnce:
 
 
 class ChangeInterruptedError(SandboxError):
-    """A change had been sent when its call lost the session to a pause, and it was not sent again."""
+    """A change had been sent when its call lost the session to a pause, and it was not sent again.
+
+    The pause may have come before the change was sent (an agent back after the session reached its
+    lifetime) or while it was on its way; the node cannot tell which, so the message claims neither.
+    """
 
     def __init__(self, what: str) -> None:
         super().__init__(
-            f'the sandbox was paused while this {what} was in flight, and has been resumed. It was not sent again, '
-            'so it may or may not have taken effect. Check before retrying.'
+            f'this {what} found the sandbox paused, and the sandbox has been resumed. The {what} was not sent '
+            'again, so it may or may not have taken effect. Check before retrying.'
         )
 
 
