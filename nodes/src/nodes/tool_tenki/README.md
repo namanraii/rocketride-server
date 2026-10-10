@@ -378,13 +378,18 @@ running or paused, is recognisable in the Tenki console and can be closed there.
 
 ### Running the tests
 
-```bash
-# Unit tests: the Tenki SDK is stubbed, so no API key and no network are needed
-pytest nodes/test/test_tool_tenki.py -v
+Run them with the engine's own Python (`./dist/server/engine`, after `./builder build`): on `develop`
+the shared `nodes/test/conftest.py` imports engine modules, so a plain `pytest` does not collect.
+Install the SDK version the node pins first, since the contract tests check that version.
 
-# Contract tests against the real SDK; skipped automatically when tenki is absent
-pytest nodes/test/test_tool_tenki_sdk.py -v
+```bash
+./dist/server/engine -m pip install -r nodes/src/nodes/tool_tenki/requirements.txt
+./dist/server/engine -m pytest nodes/test/test_tool_tenki.py nodes/test/test_tool_tenki_sdk.py -v
 ```
+
+`test_tool_tenki.py` holds the unit tests: the Tenki SDK is stubbed, so they need no API key and no
+network. `test_tool_tenki_sdk.py` holds the contract tests against the real SDK; they are skipped when
+`tenki` is not installed.
 
 The unit tests never call Tenki, because a real session costs real money. The contract tests check
 the SDK names, signatures and defaults this node depends on, so a `tenki` release that renames one of
