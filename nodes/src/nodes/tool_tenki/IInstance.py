@@ -109,9 +109,9 @@ _KILLED_NOTICE = (
 # What Tenki documents its proxy answers ("403 secret_injection_denied") when it refuses to put a secret
 # into a request, for one of several reasons: no attached policy allows that secret for that host,
 # method and path, the secret is not active, or the placeholder is somewhere a policy does not cover.
-# NOT MEASURED: no denial has been produced against a real session, so it is unknown whether this
-# text reaches a command's output at all (git and `curl -f` print the status, not the body). The
-# note is keyed on the text alone, so output that merely quotes it gets the note as well.
+# Measured 2026-10-10: a request outside the policy that carried a placeholder was answered with this
+# body, and `curl` printed it; `git` and `curl -f` print the status, not the body. The note is keyed on
+# the text alone, so output that merely quotes it gets the note as well.
 _INJECTION_DENIED = 'secret_injection_denied'
 _DENIED_NOTICE = (
     '[tool_tenki: this output contains "secret_injection_denied". Tenki documents that as its answer '

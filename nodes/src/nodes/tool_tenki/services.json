@@ -105,7 +105,7 @@
 		"tenki.secret_policies": {
 			"type": "array",
 			"title": "Secret policies",
-			"description": "Names of Tenki request policies to attach, for transparent secret injection. As Tenki documents it (not yet verified here), code in the sandbox uses a placeholder such as secrets://GITHUB_TOKEN, and Tenki puts the real value, outside the VM, only into requests a policy allows; a service a policy allows can still send the credential back in its response. Create the secrets and policies in Tenki first; the API key needs Secrets access. Requires Allowed outbound domains: a pipeline with policies and no allowlist does not start. Leave empty to attach none.",
+			"description": "Names of Tenki request policies to attach, for transparent secret injection. Code in the sandbox uses a placeholder such as secrets://GITHUB_BASIC, and Tenki puts the real value, outside the VM, only into requests a policy allows; a service a policy allows can still send the credential back in its response. For a private GitHub clone the secret holds the HTTP Basic credential and git sends Authorization: Basic secrets://NAME (see the README). Create the secrets and policies in Tenki first; the API key needs Secrets access. Requires Allowed outbound domains: a pipeline with policies and no allowlist does not start. Leave empty to attach none.",
 			"items": {
 				"type": "string"
 			},
