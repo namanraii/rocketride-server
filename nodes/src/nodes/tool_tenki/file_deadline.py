@@ -44,7 +44,9 @@ call makes the SDK send a Stat of its own, with no deadline, while holding its l
 (``Sandbox._ensure_data_plane``). If that request stalls, the file call waits on it whatever its
 own deadline, and so does every later call on the session, including the close at shutdown. A
 command does not go through that check, and its first answer marks the plane as verified, so the
-exposed case is a file call that is the first call after a resume.
+node runs one bounded no-op command after every create and resume (``IGlobal._ensure_warm``) before
+any other call. What is left exposed is a file call already under way when a parallel call resumes
+the session.
 """
 
 from __future__ import annotations

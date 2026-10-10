@@ -121,7 +121,8 @@ when the period runs out and resumed by its next call, and the agent is told whe
 A pause is not free for the agent, which is why the default is not shorter: Tenki starts it 15
 seconds to over two minutes after the period ends (measured), a command running at that moment is
 cut off part-way and has to be run again by the agent, and the first call afterwards waits while
-the session comes back, which took 40 to 63 seconds when measured.
+the session comes back, which took 41 to 67 seconds when measured on 2026-10-05 and 13 to 17
+seconds on 2026-10-09.
 
 **A command allowed to run as long as the session lives can never finish.** If the
 [Execution Timeout](#execution-timeout-seconds) is not shorter than this period, the pause will
@@ -151,7 +152,9 @@ request of its own that has no deadline, whenever Tenki has not yet reported the
 (it reports "not ready" first after a create; measured). A stall in that check would block the
 session, the close at shutdown included. A command does not go through it, and a command's first
 answer marks the connection verified. So after every create and every resume the node runs one
-bounded no-op command (`true`) before anything else, and the check never runs. Measured on real VMs
+bounded no-op command (`true`) before anything else, so a call made after it never meets the check.
+A file call already under way when a parallel call resumes the session still can; that window is
+narrow, and nothing has been seen to stall in it. Measured on real VMs
 with the connection forced to "not verified": a file call ran the check once; after the no-op
 command, zero times.
 
@@ -183,10 +186,11 @@ repository or gist the credential, or any other one the agent is given, can writ
 
 Create the secrets and policies in Tenki first (see [Private repositories](#private-repositories)).
 The API key needs Secrets access; without it Tenki refuses the session, and the tool result says so
-(measured). See [Authentication](#authentication) for how far that access reaches. Tenki documents that the image has to carry its managed HTTPS trust. Nothing advertises
-the placeholders to the agent, so name the ones it may use in its instructions. If a command's
-output contains Tenki's documented denial text, the tool result adds a note that repeating the
-request will not help; whether that text ever reaches a command's output has not been measured.
+(measured). See [Authentication](#authentication) for how far that access reaches. Tenki
+documents that the image has to carry its managed HTTPS trust. Nothing advertises the placeholders
+to the agent, so name the ones it may use in its instructions. If a command's output contains
+Tenki's documented denial text, the tool result adds a note that repeating the request will not
+help; whether that text ever reaches a command's output has not been measured.
 
 ### Allowed outbound domains
 
@@ -349,7 +353,8 @@ paused and resumed. The node handles both:
   HTTP 502, a failed connection to the VM, a "no such file" about the VM's own socket, a command
   that never starts) and can refuse the resume itself. The node looks at the session's state after
   each of those, and keeps asking for a refused resume for about 90 seconds, a budget shared by the
-  calls waiting on the same resume. That first call took 40 to 63 seconds when measured. An error of
+  calls waiting on the same resume. That first call took 41 to 67 seconds when measured on
+  2026-10-05, and 13 to 17 seconds on 2026-10-09. An error of
   any other kind is reported as it is.
 
   What happens to the call that met the pause depends on whether repeating it is safe. A read
@@ -365,13 +370,14 @@ paused and resumed. The node handles both:
   it ran exactly once. Below the node, the SDK itself sends a command's start again when the first
   got no answer at all.
 - **Ended** - terminated, from Tenki's console, CLI or API. Its files and installed packages are
-  gone. A command or change that had not started runs on a new, empty session and carries
-  `session: "replaced"`; a change that had been sent is also sent there, since nothing of the first
-  attempt is left and a file or git change has no effect outside the sandbox. A read, listing,
-  delete or git call on an existing repository returns an error saying the session ended, carries
-  `session: "ended"`, and creates nothing. So does a command that was running when the session
-  ended: it is not run again, because whatever it did outside the sandbox is already done. The next
-  call, whichever tool it is, starts a new session and carries `session: "created"`.
+  gone. A command, file write, new directory or clone that had not started runs on a new, empty
+  session and carries `session: "replaced"`; one of those changes that had been sent is also sent
+  there, since nothing of the first attempt is left and a file or git change has no effect outside
+  the sandbox. A read, listing, edit, delete or git call on an existing repository returns an error
+  saying the session ended, carries `session: "ended"`, and creates nothing. So does a command that
+  was running when the session ended: it is not run again, because whatever it did outside the
+  sandbox is already done. The next call, whichever tool it is, starts a new session and carries
+  `session: "created"`.
 
 Every result says how the session changed during its call, when it did, in its `session` field:
 `"created"` (this call started a new, empty sandbox), `"resumed"`, `"replaced"` or `"ended"`. A

@@ -44,7 +44,7 @@ Three things differ from tool_daytona and shape this file:
   closes a session promptly, but teardown is not reached after an engine
   crash, and engines before the fix in #2396 skipped it for chat- and
   webhook-sourced tasks (measured on engine 3.3.0, #2300). ``max_duration``
-  is the backstop for both, which is why its default is short.
+  is the backstop for both, which is why the README asks operators to size it.
 * A create whose readiness wait fails can leave a live, billing sandbox that
   nothing references, so the create path closes it explicitly.
 * Recovery follows the session's actual state, not the exception alone: a
