@@ -115,7 +115,7 @@
 		"tenki.allow_domains": {
 			"type": "array",
 			"title": "Allowed outbound domains",
-			"description": "Restricts the sandbox's outbound traffic to these hostnames, such as pypi.org; a leading *. wildcard is accepted. Leave empty for unrestricted outbound access. List every host the agent's work needs (pip needs pypi.org and files.pythonhosted.org, for example). An entry that is not a bare hostname stops the pipeline at startup.",
+			"description": "Restricts the sandbox's outbound traffic to these hostnames, such as pypi.org, on any port; one leading *. wildcard is accepted. Leave empty for open outbound access to any host and port. List every host the agent's work needs (pip needs pypi.org and files.pythonhosted.org, for example), and no more: a listed host is somewhere data can be sent. An entry Tenki would refuse (a URL, a port, an underscore) stops the pipeline at startup.",
 			"items": {
 				"type": "string"
 			},

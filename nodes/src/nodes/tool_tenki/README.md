@@ -190,28 +190,43 @@ request will not help; whether that text ever reaches a command's output has not
 
 ### Allowed outbound domains
 
-Restricts the sandbox's outbound traffic to the listed hostnames. Tenki documents an optional
-leading `*.` wildcard, which the node passes through; no wildcard entry has been sent to a real
-session. Empty, the default, leaves outbound traffic unrestricted. Measured with one entry,
-`github.com`: that host answered and a public clone worked, while the two other names tried did
-not resolve inside the VM and an HTTPS connection straight to an IP address failed its TLS
-handshake. The same held after Tenki had paused the session and the node resumed it, and on the
-session that replaced one terminated from outside. Not measured: other ports and protocols, and a
-listed name pointed at another address.
+Restricts the sandbox's outbound traffic to the listed hostnames. Empty, the default, sends no
+allowlist, and outbound traffic is then open. Measured on 2026-10-09, a session created without one
+reached every host tried (`github.com`, `pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`,
+`example.com`), bare IP addresses over HTTP and HTTPS, and DNS and SSH servers directly. Tenki's
+changelog of 2026-09-25 says outbound allowlists were "enabled by default in all existing and new
+workspaces": that is the option, not a default list. (Tenki's sessions page still says the option
+has to be enabled for a workspace first; on the workspace measured it needed nothing.)
 
-An allowlist limits where an agent can send what it can read, such as the files in its workspace or
-a cloned repository, so set one whenever the sandbox holds anything sensitive. List every host the
-work needs: pip, for one, needs `pypi.org` and `files.pythonhosted.org`, and a secret policy's
-destinations must be listed too. The node accepts plain hostnames of two or more labels, which is
-its own rule and narrower than Tenki's may be: a single-label name, a non-ASCII name, or one with
-an underscore is refused, and entries in one string are separated by commas only. An
-entry outside that rule, such as a URL or one with a port, stops the pipeline at startup instead
-of being dropped: had every entry been dropped, no allowlist would apply at all. So does a setting
-that is not a list. A wildcard covers every name under it, and the node does not judge how wide
-that is: `*.co.uk` is accepted. Tenki documents a limit of 256 domains, that it has to enable
-session egress policies for the workspace first, and that creating a sandbox fails with a message
-saying so until it has. The list is fixed when the session is created, and a session that replaces
-an ended one is created with the same list.
+With a list, only the listed names resolve inside the sandbox, and the list replaces open access
+rather than adding to a default: with `github.com` listed, the other four hosts above stopped
+resolving. Three ways around it were tried from inside the sandbox, whose user has `sudo`, and none
+worked:
+
+- a bare IP address that is not listed: plain HTTP was answered by Tenki with "egress blocked by
+  policy", and HTTPS failed its handshake;
+- other ports: DNS queries sent straight to `1.1.1.1` over UDP and TCP were answered "refused" by
+  Tenki, and SSH to an unlisted server that answers when there is no allowlist timed out;
+- a listed name pointed at another address in `/etc/hosts`: HTTPS failed its handshake, and HTTP got
+  "egress blocked by policy".
+
+The same list held after Tenki paused the session and the node resumed it, and on a session that
+replaced one terminated from outside. Not tried: IPv6, and UDP to ports other than 53. What the list
+does not stop is traffic to the listed hosts themselves, on any port: with `github.com` listed, its
+SSH port answered. An allowed host is a place data can be sent (a push to any repository the agent
+has credentials for), so list as few as the work needs: pip, for one, needs `pypi.org` and
+`files.pythonhosted.org`, and a secret policy's destinations must be listed too.
+
+Entries follow Tenki's rule, which the node checks at startup so that a mistake stops the pipeline
+instead of failing every create later: a hostname without a scheme, path or port, of letters,
+digits and inner hyphens, with at most one leading `*.`, and at most 256 of them. Tenki documents
+that the wildcard matches exactly one label (`*.example.com` matches `api.example.com`, not
+`example.com` or `a.b.example.com`). Measured: Tenki accepts `localhost`, `10.0.0.1`, punycode and
+`*.co.uk`, and refuses underscores, non-ASCII names, a wildcard anywhere but first, ports, schemes
+and paths. How wide a wildcard is, `*.co.uk` say, is the operator's call. An entry Tenki would refuse
+stops the pipeline instead of being dropped (had every entry been dropped, no allowlist would apply
+at all), and so does a setting that is not a list. The list is fixed when the session is created,
+and a session that replaces an ended one is created with the same list.
 
 ## Authentication
 

@@ -180,12 +180,11 @@ def _may_hide_a_pause(error: SandboxError) -> bool:
     return type(error) is SandboxError or isinstance(error, CommandNotStartedError) or about_the_vm_link(error)
 
 
-# A hostname Tenki accepts in an outbound allowlist: at least two dot-separated labels of letters,
-# digits and inner hyphens, the last containing a letter (an IP address is a CIDR to Tenki, not a
-# domain), optionally after a single leading "*." wildcard.
-_DOMAIN = re.compile(
-    r'^(\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?=[a-z0-9-]*[a-z])[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
-)
+# What Tenki's create accepts in an outbound allowlist (measured 2026-10-09 against its documented rule,
+# "hostnames ... without a URL scheme, path, or port", with one leading wildcard): RFC 1123 hostname labels
+# of 1 to 63 letters, digits and inner hyphens, any number of them, optionally after a single leading
+# "*.". So "localhost" and "10.0.0.1" are accepted and "under_score.example.com" is not, as by Tenki.
+_DOMAIN = re.compile(r'^(\*\.)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$')
 
 
 #: The most domains Tenki documents that it accepts in one allowlist, and the longest name DNS allows.
@@ -224,14 +223,13 @@ def _names(raw, field: str) -> list[str]:
 def _allowed_domains(raw) -> list[str]:
     """The configured outbound allowlist, normalized as Tenki does: lowercase, without a trailing dot.
 
-    The node accepts plain DNS hostnames with at least two labels, optionally under one leading
-    ``*.``. That is narrower than Tenki may be (its documentation gives examples, not a grammar), and
-    it is the node's rule, not Tenki's. An entry outside it stops the pipeline instead of being
-    dropped: had every entry been dropped, the empty list left would mean no allowlist at all,
-    opening outbound traffic wider than the operator asked for.
+    The rule is Tenki's (see ``_DOMAIN``), checked here so that a mistake stops the pipeline at startup
+    rather than failing every create later. An entry outside it stops the pipeline instead of being
+    dropped: had every entry been dropped, the empty list left would mean no allowlist at all, opening
+    outbound traffic wider than the operator asked for.
 
     Raises:
-        ValueError: Naming every entry the node does not accept, or for more entries than Tenki takes.
+        ValueError: Naming every entry Tenki refuses, or for more entries than Tenki takes.
     """
     domains, refused = [], []
     for position, name in enumerate(_names(raw, 'allow_domains'), 1):
@@ -243,7 +241,7 @@ def _allowed_domains(raw) -> list[str]:
             domains.append(domain)
     if refused:
         raise ValueError(
-            f'tenki.allow_domains has entries tool_tenki does not accept: {", ".join(refused)}. Use bare '
+            f'tenki.allow_domains has entries Tenki refuses: {", ".join(refused)}. Use bare '
             'hostnames such as pypi.org, optionally with one leading "*." wildcard, and no scheme, path or port.'
         )
     if len(domains) > _MAX_DOMAINS:
@@ -266,9 +264,9 @@ def _secret_settings(cfg) -> tuple[tuple[str, ...], tuple[str, ...]]:
     domains = tuple(_allowed_domains(cfg.get('allow_domains')))
     if policies and not domains:
         raise ValueError(
-            'tenki.secret_policies is set but tenki.allow_domains is empty. A sandbox that can use a secret '
-            'must not have unrestricted outbound access: list the hosts it needs in tenki.allow_domains '
-            '(github.com, for example).'
+            'tenki.secret_policies is set but tenki.allow_domains is empty. With no allowlist a sandbox can '
+            'reach any host on any port, and one that can use a secret must not: list the hosts it needs in '
+            'tenki.allow_domains (github.com, for example).'
         )
     return policies, domains
 

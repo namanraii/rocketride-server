@@ -1204,10 +1204,14 @@ def test_unset_secret_policies_and_domains_leave_the_create_request_as_before(mo
         '-pypi.org',
         '*.*.example.com',
         'example.*',
-        'localhost',
-        '10.0.0.1',
         'a' * 64 + '.example.com',
         '.'.join(['a' * 60] * 5),
+        # Refused by Tenki's create, measured 2026-10-09:
+        'under_score.example.com',
+        'b\u00fccher.example',
+        'a.*.example.com',
+        '*',
+        'trailing-.example.com',
     ],
 )
 def test_an_outbound_domain_the_node_does_not_accept_stops_the_pipeline_at_startup(monkeypatch, logs, domain):
@@ -1217,6 +1221,33 @@ def test_an_outbound_domain_the_node_does_not_accept_stops_the_pipeline_at_start
     with pytest.raises(ValueError) as refused:
         glb.beginGlobal()
     assert domain in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    ('domain', 'sent'),
+    [
+        # Accepted by Tenki's create, measured 2026-10-09. The node's rule is Tenki's, not a stricter one of its own.
+        ('localhost', 'localhost'),
+        ('intranet', 'intranet'),
+        ('xn--bcher-kva.example', 'xn--bcher-kva.example'),
+        ('*.co.uk', '*.co.uk'),
+        ('10.0.0.1', '10.0.0.1'),
+        ('Example.COM.', 'example.com'),
+        ('a' * 63 + '.example.com', 'a' * 63 + '.example.com'),
+    ],
+)
+def test_an_outbound_domain_tenki_accepts_is_sent_as_tenki_normalises_it(monkeypatch, logs, domain, sent):
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'), cfg={'allow_domains': [domain]})
+    glb.get_session()
+    [kwargs] = client.create_calls
+    assert kwargs['allow_domains'] == [sent]
+
+
+def test_the_refusal_names_tenkis_rule(monkeypatch, logs):
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, 'allow_domains': ['example.com:443']})
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert 'Tenki refuses' in str(refused.value) and 'example.com:443' in str(refused.value)
 
 
 def test_validate_config_warns_about_an_outbound_domain_the_node_does_not_accept(monkeypatch, logs):
