@@ -76,6 +76,7 @@ from tenki import (
     FileNotFoundError as TenkiFileNotFoundError,
     InvalidStateError,
     PermissionDeniedError,
+    QuotaExceededError,
     Sandbox,
     SandboxError,
     SessionNotFoundError,
@@ -462,6 +463,9 @@ class IGlobal(IGlobalBase):
     _resume_unreported: Sandbox | None = None
     # Set once the job log has said that the key lacks Secrets access, so later refused calls do not repeat it.
     _secrets_refusal_logged: bool = False
+    # Set once the job log has said that Tenki refused a create at the workspace's limit, so later refusals do not
+    # repeat it.
+    _quota_refusal_logged: bool = False
 
     rpc_timeout_secs: int = 120
     image: str = ''
@@ -661,6 +665,22 @@ class IGlobal(IGlobalBase):
                 f'Tenki refused to attach the secret policies named in tenki.secret_policies: {e}. The Tenki '
                 'API key this pipeline uses needs Secrets access, which only its operator can grant; '
                 'repeating the call will not help.'
+            ) from e
+        except QuotaExceededError as e:
+            # Measured on 2026-10-11: past the workspace's limit on sessions running at once, Tenki refuses the create
+            # with "max concurrent jobs reached (limit: 5)" and leaves nothing running. That limit belongs to the
+            # workspace, so the operator is told in the log, and the agent learns whose limit it is and when a call
+            # can work again; the next call asks for a session again.
+            if not self._quota_refusal_logged:
+                self._quota_refusal_logged = True
+                warning(
+                    f"tool_tenki: Tenki refused to create a sandbox session at the workspace's limit ({e}). Every "
+                    'running session in the workspace counts against it, whichever pipeline started it.'
+                )
+            raise SessionUnavailableError(
+                f'Tenki refused to create a sandbox session: {e}. That is a limit of the Tenki workspace this '
+                'pipeline uses, not of this call: a call works again once another session in the workspace has '
+                'ended, and the operator can raise the limit with Tenki.'
             ) from e
         except (WaitReadyFailedError, TemplateRuntimeFailedError) as e:
             self._close_left_running(e)

@@ -288,6 +288,14 @@ file, which a login shell runs before every later command.
 Run **one pipeline per user or per trust boundary**. The node cannot enforce that itself: a tool call
 carries no caller identity, so it has no way to tell two callers apart.
 
+Each of those pipelines holds its own session, and a Tenki workspace limits how many sessions run at
+once: 5 on the workspace measured on 2026-10-11, whichever pipelines started them. Past it, Tenki
+refuses the create ("max concurrent jobs reached"); the tool result then says that the workspace's
+limit was reached and that a call works again once another session has ended, and the job log says
+so once. Measured: with five sessions running, a sixth pipeline's first call was refused, and its next
+call, made after one of the five had ended, got a session. Ask Tenki to raise the limit if the
+workload needs more.
+
 ### No git credentials
 
 `git_clone` sends no credential of its own, by design. Tenki can place a GitHub token inside a

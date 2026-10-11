@@ -85,6 +85,7 @@ def _parameters(function):
         'CommandTimeoutError',
         'PermissionDeniedError',
         'FileNotFoundError',
+        'QuotaExceededError',
     ],
 )
 def test_the_errors_the_node_handles_are_sandbox_errors(name):
@@ -133,6 +134,8 @@ def test_a_failed_create_still_carries_what_it_left_running(name):
         ('NOT_FOUND', 'open /home/tenki/a.txt: no such file or directory', 'FileNotFoundError'),
         ('DEADLINE_EXCEEDED', 'deadline exceeded', 'CommandTimeoutError'),
         ('PERMISSION_DENIED', 'permission denied', 'PermissionDeniedError'),
+        # Measured 2026-10-11: what Tenki answers past the workspace's limit on sessions running at once.
+        ('RESOURCE_EXHAUSTED', 'max concurrent jobs reached (limit: 5)', 'QuotaExceededError'),
         ('UNAVAILABLE', 'Received http2 header with status: 502', 'SandboxError'),
         ('UNKNOWN', 'paused source is still being torn down, retry shortly', 'SandboxError'),
     ],

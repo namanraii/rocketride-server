@@ -101,6 +101,10 @@ class _StubPermissionDeniedError(_StubSandboxError):
     pass
 
 
+class _StubQuotaExceededError(_StubSandboxError):
+    pass
+
+
 class _StubWaitReadyFailedError(_StubSandboxError):
     def __init__(self, message, sandbox=None):
         super().__init__(message)
@@ -160,6 +164,7 @@ def _build_import_stubs():
     tenki.CommandTimeoutError = _StubCommandTimeoutError
     tenki.FileNotFoundError = _StubFileNotFoundError
     tenki.PermissionDeniedError = _StubPermissionDeniedError
+    tenki.QuotaExceededError = _StubQuotaExceededError
     tenki.WaitReadyFailedError = _StubWaitReadyFailedError
     tenki.TemplateRuntimeFailedError = _StubTemplateRuntimeFailedError
 
@@ -1169,6 +1174,42 @@ def test_a_key_without_secrets_access_is_reported_as_a_setup_problem(monkeypatch
     assert 'operator' in result['error'] and 'will not help' in result['error']
     # The agent has no use for what the operator typed into that field, and it may not be a name at all.
     assert 'policy-name-in-config' not in result['error']
+
+
+_WORKSPACE_LIMIT = 'max concurrent jobs reached (limit: 5)'
+
+
+def _quota_error(message):
+    """A QuotaExceededError of the class the node itself sees, as the other SDK errors here are raised."""
+    return (getattr(mod, 'QuotaExceededError', None) or _StubQuotaExceededError)(message)
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args'),
+    [
+        ('run_command', {'command': 'ls'}),
+        ('write_file', {'path': 'a.txt', 'content': 'x'}),
+        ('git_clone', {'repo': 'https://github.com/octocat/Hello-World.git'}),
+    ],
+)
+def test_a_create_refused_by_the_workspace_limit_is_explained_to_the_agent(monkeypatch, logs, tool, args):
+    # Measured on 2026-10-11: past the workspace's limit on sessions running at once, Tenki refuses the create with
+    # QuotaExceededError "max concurrent jobs reached (limit: 5)" and leaves nothing running. The agent cannot change
+    # that limit, so the result says whose limit it is and when a call can work again.
+    inst, _ = _instance(monkeypatch, create_error=_quota_error(_WORKSPACE_LIMIT))
+    error = getattr(inst, tool)(args)['error']
+    assert _WORKSPACE_LIMIT in error
+    assert 'workspace' in error and 'operator' in error and 'another session' in error, error
+
+
+def test_a_create_refused_by_the_workspace_limit_is_logged_once_for_the_operator(monkeypatch, logs):
+    # The job log is where the operator looks; a refusal reported only to the agent leaves them guessing.
+    inst, _ = _instance(monkeypatch, create_error=_quota_error(_WORKSPACE_LIMIT))
+    inst.run_command({'command': 'ls'})
+    inst.write_file({'path': 'a.txt', 'content': 'x'})
+    logged = [message for message in logs if _WORKSPACE_LIMIT in message]
+    assert len(logged) == 1, logs
+    assert 'workspace' in logged[0] and 'tool_tenki' in logged[0]
 
 
 def test_a_key_without_secrets_access_is_also_logged_for_the_operator(monkeypatch, logs):
