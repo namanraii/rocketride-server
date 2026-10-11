@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **docker**: releases publish `rocketride-node`, an image that runs one pipeline task (engine-base plus a warmed wheel cache), and `rocketride-engine-base`; both cosign-signed, the node image checked before signing and never tagged `latest`.
+- **nodes**: add tool_tenki - disposable Tenki Sandbox Linux VM for agents: run commands and code, edit files, work in git repositories, private ones through Tenki secret policies (#2302)
 
 ### Changed
 - **docker**: the engine image is built FROM a shared `engine-base` and runs as uid 1000 (was a system user, uid 999). An existing `/opt/data` volume has to be handed over once: `docker run --rm -v rocketride-data:/opt/data alpine chown -R 1000:1000 /opt/data`. The engine now refuses to start, naming that command, when its data directory is not writable.
@@ -52,7 +53,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **nodes**: add n8n workflow-automation node (#1231)
 - **nodes**: add tool_oura Oura Ring connector (#1625)
 - **nodes**: add tool_slack — Slack agent-tool node (post messages, list channels, read history) (#1575)
-- **nodes**: add tool_tenki — disposable Tenki Sandbox Linux VM for agents: run commands and code, edit files, work in public git repositories (#2302)
 - **nodes**: tool_filesystem pipeline-sink lanes (#1651)
 - **nodes**: tool_google_workspace — shared Google client + gmail, sheets, docs, calendar, drive services (#1570)
 - **nodes**: add Guild.ai tool node (#1689)
