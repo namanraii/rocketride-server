@@ -79,6 +79,10 @@ class IInstance(IInstanceBase):
                     'description': 'Restrict results to only pages or only databases (data sources).',
                 },
                 'page_size': {'type': 'integer', 'description': 'Max results (default 10, max 100).'},
+                'start_cursor': {
+                    'type': 'string',
+                    'description': "Pagination cursor from a previous call's next_cursor.",
+                },
             },
         },
         output_schema={
@@ -111,6 +115,8 @@ class IInstance(IInstanceBase):
                 body['filter'] = {'property': 'object', 'value': filter_type}
             if isinstance(page_size, int) and not isinstance(page_size, bool):
                 body['page_size'] = max(1, min(100, page_size))
+            if args.get('start_cursor'):
+                body['start_cursor'] = args['start_cursor']
             resp = notion_client.request('POST', '/search', api_key=self.IGlobal.apikey, json_body=body)
             return {
                 'results': resp.get('results', []),
@@ -194,6 +200,14 @@ class IInstance(IInstanceBase):
                 'results': {'type': 'array', 'items': {'type': 'object'}},
                 'has_more': {'type': 'boolean'},
                 'next_cursor': {'type': ['string', 'null']},
+                'request_status': {
+                    'type': 'object',
+                    'description': 'Notion query completeness metadata, when returned by the API.',
+                    'properties': {
+                        'type': {'type': 'string'},
+                        'incomplete_reason': {'type': 'string'},
+                    },
+                },
                 **_ERROR_SCHEMA,
             },
         },
@@ -227,11 +241,14 @@ class IInstance(IInstanceBase):
             resp = notion_client.request(
                 'POST', f'/data_sources/{data_source_id}/query', api_key=self.IGlobal.apikey, json_body=body
             )
-            return {
+            result = {
                 'results': resp.get('results', []),
                 'has_more': resp.get('has_more', False),
                 'next_cursor': resp.get('next_cursor'),
             }
+            if 'request_status' in resp:
+                result['request_status'] = resp['request_status']
+            return result
 
         return _run(op)
 

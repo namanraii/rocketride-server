@@ -41,6 +41,16 @@ on:
         required: false
         type: boolean
         default: false
+      test:
+        description: Run the test step
+        required: false
+        type: boolean
+        default: true
+      container_test:
+        description: Build the node image and run nodes:test-container (Linux)
+        required: false
+        type: boolean
+        default: false
       retention_days:
         # 1 day is enough to chain build → release → docker within the same
         # workflow run; downloads inside a run work even after "expiry".
@@ -80,7 +90,7 @@ jobs:
             vcpkg_cmd: ./build/vcpkg/vcpkg.exe
           - platform: macos
             label: macOS (ARM64)
-            runner: macos-14
+            runner: macos-15
             builder_cmd: ./builder
             vcpkg_cmd: ./build/vcpkg/vcpkg
     steps:
@@ -95,6 +105,12 @@ jobs:
           version: 10.33.0
       - name: Set up vcpkg
         run: ${{ matrix.builder_cmd }} vcpkg:submodule-build
+      - name: Install mono / macOS
+        # The macos-15 image dropped mono, and both this step and vcpkg itself
+        # run nuget.exe through it for the binary cache. Preinstalled on the
+        # ubuntu image, so macOS only.
+        if: matrix.platform == 'macos'
+        run: brew install mono
       - name: Set up vcpkg nuget / Linux/macOS
         if: matrix.platform != 'windows'
         run: |
@@ -151,10 +167,33 @@ jobs:
           # publishable key arrives from the server probe at runtime.)
         run: ${{ matrix.builder_cmd }} build --verbose --autoinstall ${{ matrix.platform == 'ubuntu' && '--system-compiler' || '' }} --version="$FULL_VERSION" --hash="$BUILD_HASH" --stamp="$BUILD_STAMP" ${{ inputs.nodownload && '--nodownload' || '' }}
 
-      # MinIO for S3Store integration tests (Linux only). Env vars are exported
-      # to $GITHUB_ENV only after MinIO is healthy; S3 tests gate on those vars
-      # so they skip on win/macOS.
-      - name: Start MinIO for tests / Linux
+      # The node image, built from the dist/server just built and checked as a
+      # run gets it. Before the tests, which install into dist/server (the image
+      # filters that out, but there is no reason to build from a dirtier tree).
+      # Docker's data goes to /mnt, the runner's large disk: the image is ~6 GB
+      # unpacked, and the root filesystem is needed by the tests that follow.
+      - name: Test the node container image / Linux
+        if: matrix.platform == 'ubuntu' && inputs.codeql == false && inputs.test && inputs.container_test
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /mnt/docker
+          conf=/etc/docker/daemon.json
+          { sudo cat "$conf" 2>/dev/null || echo '{}'; } | jq '. + {"data-root": "/mnt/docker"}' | sudo tee "$conf.new" >/dev/null
+          sudo mv "$conf.new" "$conf"
+          sudo systemctl restart docker
+          docker info --format 'docker {{.ServerVersion}}, data in {{.DockerRootDir}}'
+          ${{ matrix.builder_cmd }} nodes:test-container --verbose
+          docker system prune -af >/dev/null
+
+      # S3-compatible server for S3Store integration tests (Linux only): moto,
+      # not MinIO. MinIO stopped public distribution (2026-09-24: quay.io
+      # answers 401 for the pinned tag, Docker Hub's minio/minio is gone,
+      # dl.min.io answers 410 for the binary), which failed every Linux build.
+      # moto is a pip package, so there is no image to lose, and the S3Store
+      # suite passes the same against both (76/76, measured before the switch).
+      # Env vars are exported to $GITHUB_ENV only after the server is healthy;
+      # S3 tests gate on those vars so they skip on win/macOS.
+      - name: Start S3 test server (moto) / Linux
         if: matrix.platform == 'ubuntu' && inputs.codeql == false
         env:
           AWS_ACCESS_KEY_ID: minioadmin
@@ -162,25 +201,18 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: |
           set -euo pipefail
-          # quay.io, not Docker Hub: minio/minio on Hub returns zero tags and
-          # empty repository metadata — the whole repo is gone from there, not just
-          # this tag, and Hub reports a missing tag as "pull access denied", which
-          # makes it read like a permissions problem. Same release, same entrypoint,
-          # pulls anonymously. The comment lives ABOVE the command deliberately: a
-          # `#` line inside a `\` continuation ends the command early and docker
-          # never sees the image argument.
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          python3 -m venv /tmp/moto-venv
+          /tmp/moto-venv/bin/pip install --quiet "moto[server]==5.2.3"
+          nohup /tmp/moto-venv/bin/moto_server -H 127.0.0.1 -p 9000 > /tmp/moto.log 2>&1 &
           for i in $(seq 1 30); do
-            if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then ready=1; break; fi
+            if curl -fsS http://localhost:9000/ >/dev/null 2>&1; then ready=1; break; fi
             sleep 2
           done
-          [ "${ready:-}" = "1" ] || { echo "MinIO did not become ready"; docker logs minio || true; exit 1; }
+          [ "${ready:-}" = "1" ] || { echo "moto did not become ready"; cat /tmp/moto.log || true; exit 1; }
           # Create bucket and smoke put/get.
           aws --endpoint-url http://localhost:9000 s3 mb s3://rocketride-test
-          printf 'minio smoke\n' > /tmp/minio-smoke.txt
-          aws --endpoint-url http://localhost:9000 s3 cp /tmp/minio-smoke.txt s3://rocketride-test/smoke.txt
+          printf 's3 smoke\n' > /tmp/s3-smoke.txt
+          aws --endpoint-url http://localhost:9000 s3 cp /tmp/s3-smoke.txt s3://rocketride-test/smoke.txt
           aws --endpoint-url http://localhost:9000 s3 ls s3://rocketride-test/
           # Export test vars only once S3 is live.
           {
@@ -225,7 +257,7 @@ jobs:
 
       # Postgres for the RocketRide cloud DB node integration suites (Linux
       # only): pgvector for rocketride_sql/vector, Apache AGE for
-      # rocketride_graph. Same pattern as MinIO/Azurite above — env vars are
+      # rocketride_graph. Same pattern as the S3 (moto) and Azurite steps above — env vars are
       # exported to $GITHUB_ENV only after both databases are healthy, and
       # RR_REQUIRE_DB_TESTS additionally turns the suites' unreachable-DB
       # skip into a hard failure, so a container that fails to start can
@@ -267,7 +299,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Test
-        if: inputs.codeql == false
+        if: inputs.codeql == false && inputs.test
         # Integration tests boot a local server on :5565 and connect a test
         # client. Both sides need the same shared secret to authenticate;
         # without ROCKETRIDE_APIKEY the server raises AuthenticationException

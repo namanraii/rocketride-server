@@ -186,7 +186,8 @@ Two rules before anything else:
   files.** The scaffold carries load-bearing details that are easy to get
   subtly wrong by hand: the pinned Module Federation plugin version, the
   `src/index.ts` async boundary, the jsx-dev-runtime HMR anchor, the
-  `*.pipe` module declaration, and the vendored platform-package pins.
+  `emitOnErrors: false` build setting, the `*.pipe` module declaration,
+  and the vendored platform-package pins.
   Hand-rolled app folders fail in ways whose symptoms (blank preview,
   frozen HMR, share-negotiation errors) appear far from the cause.
   Two front doors render the identical templates: the App Builder's New
@@ -251,7 +252,7 @@ sharing one `node_modules`.
 | `README.md` | Ships with the app and appears on its store listing; readme readiness starts green. |
 | `src/index.ts` | The Module Federation **async boundary** — its entire body is `import('./AppDescriptor');`. Required so shared modules are negotiated before any app code runs. |
 | `src/global.d.ts` | Ambient module declaration for `*.pipe` imports (see [Embedding Pipelines](#embedding-pipelines)). |
-| `src/AppDescriptor.ts` | The single exposed module. Starts with `import 'react/jsx-dev-runtime';` — the **HMR anchor**: it keeps the shared JSX runtime referenced even when your root component fails to compile. Without it, an error build orphans the runtime, hot reload tombstones its module factory, and every later fix silently fails to apply (the frozen-preview bug). Do not remove it. |
+| `src/AppDescriptor.ts` | The single exposed module. Starts with `import 'react/jsx-dev-runtime';` — the **HMR anchor**: it keeps the shared JSX runtime referenced even when a save leaves your root component with no JSX. Without it, that update disposes the runtime, no later hot update can bring it back, and every later save silently fails to apply (the frozen-preview bug). Failed builds are covered separately by `emitOnErrors: false` (see [Build Configuration](#build-configuration)). Do not remove it. |
 | `src/App.tsx` | Your root component: `<AppLayout>` composed from the frame options you picked, wrapping a starter `Content`. Recompose its props (`sidebar`, `showStatus`) any time. |
 
 ---
@@ -869,6 +870,26 @@ object), never `filepath:` (Node-only). Read
 before authoring the `.pipe` content itself, and
 `ROCKETRIDE_typescript_API.md` for the full client reference.
 
+**Catalog nodes only.** A store app's pipelines may use only catalog nodes:
+the nodes that ship with the engine (`nodes/src/nodes` in the server repo;
+the node catalog on the docs site). A custom node (`local_nodes`, loaded
+with `--node_path`) exists only on the engine that loads it. RocketRide
+Cloud loads none, and also refuses the few catalog nodes marked `nosaas`,
+so being in the catalog is necessary, not sufficient. Store reviewers
+reject a submission whose pipelines reference a provider outside the
+catalog, and nothing before review checks it: the Package and Store
+preflights do not read `.pipe` providers, and
+`.rocketride/services-catalog.json` mirrors whichever engine the workspace
+last synced from, local nodes included, so on a self-hosted engine with
+`--node_path` that file is not the catalog. Decide this before building.
+If the catalog has no node for a step, keep that logic in the app (the app
+already sends documents, controls pipes and makes decisions), or give an
+agent step bounded Python through `tool_python` (sandboxed: allowlisted
+imports only, no network, filesystem or subprocess access). Only a step
+that must run inside the engine is a candidate for a catalog node, and
+that goes through an issue in the server repo, not into the app. Never
+scaffold a custom node for a store app.
+
 ### Secrets and configuration
 
 Pipeline configs reference secrets as `${ROCKETRIDE_*}` placeholders.
@@ -906,8 +927,28 @@ your app calls `use()`, the owner is the signed-in **user**. So every user
 of your app gets their own instance of the pipeline, automatically.
 `useExisting` does not change that: it attaches to *that user's* own
 already-running instance (a reload, a second tab, a second component)
-instead of failing with 'Pipeline is already running.' — it never crosses
-user boundaries.
+instead of failing with 'Pipeline is already running.' — with the default
+token it never crosses user boundaries. (A custom token is looked up by its
+value alone; see below.)
+
+To run two instances of one pipeline for the same user at once (a second
+tab, say), give each `use()` its own `token`: the server then keys the task
+on that token instead of the hash. Use an unguessable value that keeps the
+`tk_` prefix (`tk_` plus a UUID, for example): the value is the run's private
+token (full control for anyone who presents it), tokens share one namespace
+across every user of the server, and a token without the prefix cannot serve
+as a private token on webhook or dropper endpoints. With `useExisting`, a
+token that matches a running task attaches to it, whoever started it: one
+more reason the value must be unguessable. Keep the tokens you chose: both
+instances get the same `pk_` public authorization key, and a webhook call or
+dropper upload that uses it always reaches the instance that started first
+(to send data to one specific instance, use its `tk_` token); `getTaskToken()`
+is keyed by `projectId` and source, so it returns only one of them. Monitor
+subscriptions are keyed the same way: both instances' events arrive in one
+subscription (each event's `body.__id` names the emitting run, best effort),
+and a few minutes after one instance ends the shared subscription is
+dropped, so resubscribe. The run log is not built for two instances of one
+identity; treat it as unreliable.
 
 **Per-user tasks (the default, and the only behavior `use()` can produce):**
 
@@ -1455,6 +1496,8 @@ export default defineConfig(() => ({
 	// .pipe files are JSON — importable and passable to client.use().
 	tools: {
 		rspack: {
+			// A failed build emits nothing — the preview keeps the last good one.
+			optimization: { emitOnErrors: false },
 			module: { rules: [{ test: /\.pipe$/, type: 'json' } as const] },
 		},
 	},
@@ -1478,12 +1521,35 @@ Key rules:
   Bundling your own copy of any of them breaks the app at load time.
 - **Keep the exact MF plugin pin** (`2.5.1`) — see
   [the scaffold table](#the-scaffolded-files).
+- **Keep `emitOnErrors: false`.** A failed build then emits nothing, and the
+  preview keeps running the last good build until the fix lands. Without
+  it, the failed build's hot update disposes every module only the broken
+  file imported, and every later save silently fails to apply. Apps
+  scaffolded before this setting existed should add it under
+  `tools.rspack`.
 - **`npm run build` = `tsc --noEmit && rsbuild build`.** Type errors fail
   the local build exactly as the server build will (unless waived with
   `typecheck: false`).
 
 You normally never run these yourself — the watch runs the dev server, and
 deploys build on the server — but they are there for CI or scripted checks.
+
+**The `dist/` folder is never served.** `npm run build` writes `dist/` in
+your app folder, and nothing reads it: not the preview, not the server. A
+local build only proves that the app compiles. The two places a browser
+gets your app from are:
+
+- **The preview** loads it from the watch's dev server (see
+  [The Dev Loop](#the-dev-loop)). If a change does not appear there, read
+  the watch status line. Rebuilding into `dist/` will not help.
+- **Everyone else** loads a deployed version, which the server built itself
+  from your uploaded source and serves at
+  `/apps/<appManifest.id>/v<N>/remoteEntry.js` (see
+  [Deploy and Publish](#deploy-and-publish)). If a change does not appear
+  for them, deploy a new version and publish it.
+
+The served path is keyed on `appManifest.id`, never on the name of your app
+folder.
 
 ---
 
@@ -1551,6 +1617,10 @@ that audience again revives it.
   (review always tracks your current work — to ship older code, deploy it
   again as a new version). Submitting flips the version `private → submit`.
 - **Withdraw** cancels your own submission (`submit → private`).
+- Reviewers reject a submission whose bundled `.pipe` files reference a
+  node outside the catalog (see 'Catalog nodes only' under Embedding
+  Pipelines). No preflight checks this for you: read the providers in your
+  `.pipe` files before you submit.
 - The verdict lands as `ready` (approved — publishable to `@public`) or
   `rejected`, pushed live to your App Builder (`app:statusChanged`), with
   reviewer notes on rejection.
@@ -1589,8 +1659,8 @@ version you want off the air while you investigate — and the still-visible
 row is the reminder. **Remove** is the statement that you no longer serve
 this audience at all, and it tidies the table. The Deploy tab's **Remove**
 action on a where-live row is the remove verb; from scripts,
-`client.removeAppPublish(appId, target)` performs remove, and disable rides
-the same deploy command as its `disable` subcommand. For the `@public` row,
+`client.removeAppPublish(appId, target)` performs remove and
+`client.disableAppPublish(appId, target)` performs disable. For the `@public` row,
 only the developer organization may do either.
 
 ### Testing a specific published version: the version override
@@ -1641,6 +1711,7 @@ same verbs (TypeScript camelCase / Python snake_case):
 | Deploy a source zip | `client.deploy.add({ kind: 'app', data, metadata })` |
 | Publish to a rung | `client.publishApp(appId, version, target)` |
 | Remove a binding | `client.removeAppPublish(appId, target)` |
+| Disable a binding | `client.disableAppPublish(appId, target)` |
 | Where live | `client.whereApp(appId)` |
 | Submit / withdraw review | `client.submitApp(...)` / `client.withdrawApp(...)` |
 | Review thread reply | `client.replyApp(appId, message)` |

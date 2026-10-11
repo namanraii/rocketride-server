@@ -62,8 +62,8 @@
 	//
 	"invoke": {
 		"llm": {
-			"description": "LLM to use to craft SQL queries from question",
-			"min": 1
+			"description": "LLM that writes SQL from a natural-language question; not needed for execute (raw SQL)",
+			"min": 0
 		}
 	},
 	//
@@ -154,7 +154,7 @@
 			"type": "boolean",
 			"title": "Allow direct query execution",
 			"default": false,
-			"description": "Permit QuestionType.EXECUTE callers to run raw SQL without LLM translation or safety checks. Leave OFF unless a trusted application explicitly needs to issue SQL directly."
+			"description": "Permit the execute, begin, commit, and rollback tool functions to run raw SQL without LLM translation or safety checks. Leave OFF unless a trusted application explicitly needs to issue SQL directly."
 		},
 		"mysql.default": {
 			"object": "default",

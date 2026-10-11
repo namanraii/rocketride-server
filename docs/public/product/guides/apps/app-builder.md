@@ -31,6 +31,9 @@ the same loop runs from a terminal or CI.
   only apps inside that namespace. Until the prefix of your app's id
   matches, the Deploy tab is read-only with a banner; the fix is to rename
   the id in `package.json`. Design and Package always work.
+- Catalog nodes only, if the app is headed for the store. Pipelines in a
+  store app use the nodes that ship with the engine and nothing else; see
+  [Adding a pipeline to your app](#adding-a-pipeline-to-your-app).
 
 ## The loop
 
@@ -106,6 +109,16 @@ Two verbs, and they are not the same:
   the same move: repoint, never rebuild. There is no org-wide rung; an
   org-wide audience is a team your admin maintains.
 
+A deploy returns as soon as the server accepts the upload; the version
+can be published, and served, only once its server build finishes. The
+version card shows the build's progress (`queued`, `building`, …) until
+then. Once you publish, **Where this app is live** on the Deploy tab shows
+what a browser in each audience actually gets: `serving`, or why not
+(`not serving: still building`, `not serving: build failed`, `disabled`,
+`in review`). The dashboard says which version you would get right now.
+Every open App Builder updates when a build lands or anyone in your
+organization publishes or disables a version.
+
 A deploy packs the app folder plus any folders listed under
 `appManifest.include`, and nothing else. Every `include` entry must exist.
 
@@ -125,6 +138,16 @@ There are two ways, and they are different features. See
 [Apps and pipelines](/concepts/apps#apps-and-pipelines) for the idea; this
 is the how-to.
 
+Either way, a pipeline in an app you intend to publish to the store may use
+catalog nodes only: the nodes that ship with the engine, listed in the
+[node catalog](/nodes). A custom node exists only on the engine that loads
+it; RocketRide Cloud loads none, and a few catalog nodes are marked
+unavailable there. Store reviewers reject a pipeline that references
+anything else, and no preflight warns you first. If a step has no catalog
+node, keep that logic in the app, or give an agent step bounded Python
+through the `tool_python` node; ask for a catalog node only for a step
+that must run inside the engine, rather than building one for the app.
+
 ### Inside the app: runs per user, on demand
 
 Put the `.pipe` file in the app folder and import it. The scaffold's build
@@ -140,8 +163,10 @@ const { token } = await client.use({ pipeline: summarizer, useExisting: true });
 
 Every signed-in user gets their own instance. Start it once per session and
 keep the token; `useExisting: true` re-attaches after a reload instead of
-failing because the pipeline is already running. The pipeline ships with the
-app on deploy. Use this for work that happens when the user asks for it.
+failing because the pipeline is already running. To run two instances for the
+same user at once, give each `use()` its own unguessable `token` (keep the
+`tk_` prefix). The pipeline ships with the app on deploy. Use this for work
+that happens when the user asks for it.
 
 ### Outside the app: shared, on a schedule
 

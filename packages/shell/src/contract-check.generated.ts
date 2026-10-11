@@ -18,6 +18,8 @@ import type { ShellApiV0 } from '../contract/versions/v0';
 import type { ShellApiV1 } from '../contract/versions/v1';
 import type { ShellApiV2 } from '../contract/versions/v2';
 import type { ShellApiV3 } from '../contract/versions/v3';
+import type { ShellApiV4 } from '../contract/versions/v4';
+import type { ShellApiV5 } from '../contract/versions/v5';
 import type { DAPException as Frozen_DAPException } from '../contract/versions/v0';
 import type { DAPException as Current_DAPException } from './api';
 import type { RocketRideException as Frozen_RocketRideException } from '../contract/versions/v0';
@@ -604,6 +606,16 @@ import type { CreatedApp as Frozen_CreatedApp } from '../contract/versions/v1';
 import type { CreatedApp as Current_CreatedApp } from './api';
 import type { DrizzleDatabaseLike as Frozen_DrizzleDatabaseLike } from '../contract/versions/v3';
 import type { DrizzleDatabaseLike as Current_DrizzleDatabaseLike } from './api';
+import type { CProfileThreadInfo as Frozen_CProfileThreadInfo } from '../contract/versions/v4';
+import type { CProfileThreadInfo as Current_CProfileThreadInfo } from './api';
+import type { CProfileThreadsResponse as Frozen_CProfileThreadsResponse } from '../contract/versions/v4';
+import type { CProfileThreadsResponse as Current_CProfileThreadsResponse } from './api';
+import type { LogStreamIdentity as Frozen_LogStreamIdentity } from '../contract/versions/v5';
+import type { LogStreamIdentity as Current_LogStreamIdentity } from './api';
+import type { LogStreamEntry as Frozen_LogStreamEntry } from '../contract/versions/v5';
+import type { LogStreamEntry as Current_LogStreamEntry } from './api';
+import type { LogStreamsResult as Frozen_LogStreamsResult } from '../contract/versions/v5';
+import type { LogStreamsResult as Current_LogStreamsResult } from './api';
 
 // VALUE floors — the live surface must still satisfy every frozen version.
 const _floor_v0: ShellApiV0 = {} as ShellApiShape;
@@ -614,6 +626,10 @@ const _floor_v2: ShellApiV2 = {} as ShellApiShape;
 void _floor_v2;
 const _floor_v3: ShellApiV3 = {} as ShellApiShape;
 void _floor_v3;
+const _floor_v4: ShellApiV4 = {} as ShellApiShape;
+void _floor_v4;
+const _floor_v5: ShellApiV5 = {} as ShellApiShape;
+void _floor_v5;
 
 // TYPE floors — each frozen exported type must still be satisfied.
 // Generic floors are emitted APPLIED (<any, …> at the frozen arity):
@@ -1204,3 +1220,13 @@ const _t_CreatedApp: Frozen_CreatedApp = {} as Current_CreatedApp;
 void _t_CreatedApp;
 const _t_DrizzleDatabaseLike: Frozen_DrizzleDatabaseLike = {} as Current_DrizzleDatabaseLike;
 void _t_DrizzleDatabaseLike;
+const _t_CProfileThreadInfo: Frozen_CProfileThreadInfo = {} as Current_CProfileThreadInfo;
+void _t_CProfileThreadInfo;
+const _t_CProfileThreadsResponse: Frozen_CProfileThreadsResponse = {} as Current_CProfileThreadsResponse;
+void _t_CProfileThreadsResponse;
+const _t_LogStreamIdentity: Frozen_LogStreamIdentity = {} as Current_LogStreamIdentity;
+void _t_LogStreamIdentity;
+const _t_LogStreamEntry: Frozen_LogStreamEntry = {} as Current_LogStreamEntry;
+void _t_LogStreamEntry;
+const _t_LogStreamsResult: Frozen_LogStreamsResult = {} as Current_LogStreamsResult;
+void _t_LogStreamsResult;

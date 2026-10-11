@@ -331,6 +331,73 @@ async def test_on_rrext_validate_does_not_double_wrap_enveloped_config(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_on_rrext_validate_does_not_wrap_single_component_payload(monkeypatch):
+    """The node config panel validates one component at a time.
+
+    It sends IComponentValidatePayload — {version, component} — the shape the
+    shell contract declares this endpoint accepts (shell/src/types/project.ts).
+    The engine dispatches on a root-level ``component`` (#2263); wrapping that
+    payload as {'pipeline': ...} hides the key and every save comes back with
+    "'pipeline.components' must be an array", whatever the node.
+    """
+    captured = {}
+    monkeypatch.setattr(cmd_misc, 'resolve_implied_source', lambda p: None)
+    monkeypatch.setattr(
+        cmd_misc,
+        'validatePipeline',
+        lambda payload: captured.update(payload) or {'ok': True},
+    )
+
+    conn = _make_conn()
+    component = {'id': 'llm_gemini_1', 'provider': 'llm_gemini', 'config': {}}
+    await MiscCommands.on_rrext_validate(conn, {'arguments': {'pipeline': {'version': 1, 'component': component}}})
+
+    assert set(captured.keys()) == {'version', 'component'}
+    assert captured['component'] == component
+    assert 'pipeline' not in captured
+    assert 'components' not in captured
+
+
+@pytest.mark.asyncio
+async def test_on_rrext_validate_does_not_infer_source_for_a_single_component(monkeypatch):
+    """Source inference is a full-pipeline concern; a lone component is passed through."""
+    seen = []
+    monkeypatch.setattr(cmd_misc, 'resolve_implied_source', lambda p: seen.append(p) or 'webhook_1')
+    captured = {}
+    monkeypatch.setattr(
+        cmd_misc,
+        'validatePipeline',
+        lambda payload: captured.update(payload) or {'ok': True},
+    )
+
+    conn = _make_conn()
+    component = {'id': 'webhook_1', 'provider': 'webhook', 'config': {'mode': 'Source'}}
+    await MiscCommands.on_rrext_validate(conn, {'arguments': {'pipeline': {'version': 1, 'component': component}}})
+
+    assert seen == []
+    assert captured['component'] == component
+    assert 'source' not in captured
+
+
+@pytest.mark.asyncio
+async def test_on_rrext_validate_leaves_a_full_pipeline_alone(monkeypatch):
+    """A config that already carries components is untouched."""
+    captured = {}
+    monkeypatch.setattr(cmd_misc, 'resolve_implied_source', lambda p: None)
+    monkeypatch.setattr(
+        cmd_misc,
+        'validatePipeline',
+        lambda payload: captured.update(payload) or {'ok': True},
+    )
+
+    conn = _make_conn()
+    components = [{'id': 'webhook_1'}, {'id': 'llm_gemini_1'}]
+    await MiscCommands.on_rrext_validate(conn, {'arguments': {'pipeline': {'version': 1, 'components': components}}})
+
+    assert captured['pipeline']['components'] == components
+
+
+@pytest.mark.asyncio
 async def test_on_rrext_validate_propagates_validate_pipeline_errors(monkeypatch):
     """A raise from validatePipeline is logged and re-raised."""
     monkeypatch.setattr(cmd_misc, 'resolve_implied_source', lambda p: 'src')

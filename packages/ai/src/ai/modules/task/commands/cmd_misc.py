@@ -44,7 +44,6 @@ Architecture:
 - Provides read-only access to service metadata
 """
 
-import os
 import time
 from typing import TYPE_CHECKING, Dict, Any, List, Tuple
 from rocketride import EVENT_TYPE
@@ -199,14 +198,20 @@ class MiscCommands(DAPConn):
         3. Implied source: the single component whose config.mode == 'Source'
 
         The ``pipeline`` argument may be flat (the shape the SDK documents) or
-        already wrapped in the ``{'pipeline': {...}}`` envelope; either way the
-        engine receives exactly one envelope.
+        already wrapped in the ``{'pipeline': {...}}`` envelope; either way a
+        full pipeline reaches the engine in exactly one envelope. The
+        single-component form ``{'version', 'component'}`` is passed through
+        unwrapped — the engine dispatches on a root-level ``component`` key
+        (#2263).
 
         Args:
             request (Dict[str, Any]): DAP request containing:
                 - arguments (Dict[str, Any]):
                     - pipeline (Dict[str, Any]): Pipeline configuration to validate,
-                      flat or already enveloped
+                      flat or already enveloped. Also accepts the
+                      single-component form ``{'version', 'component'}`` a node
+                      editor sends on save, passed through unwrapped so the
+                      engine's single-component validator runs.
                     - source (str, optional): Override source component ID
 
         Returns:
@@ -247,10 +252,6 @@ class MiscCommands(DAPConn):
                 if org:
                     org_id = org.get('id', '') if isinstance(org, dict) else getattr(org, 'id', '')
 
-                # sys.admin: seed with server RR_* keys mapped to ROCKETRIDE_*
-                if 'sys.admin' in (self._account_info.sysPermissions or []):
-                    merged_env = {'ROCKETRIDE_' + k[3:]: v for k, v in os.environ.items() if k.startswith('RR_')}
-
                 # Layer org → team → user secrets on top
                 merged_env.update(
                     await account.get_merged_env(
@@ -263,24 +264,36 @@ class MiscCommands(DAPConn):
             # Resolve ${ROCKETRIDE_*} variables before validation
             pipeline = resolve_pipeline_env(pipeline, merged_env)
 
-            # Resolve source: explicit arg > pipeline field > implied from components
-            source = args.get('source', None) or pipeline.get('source', None)
-            if not source:
-                source = resolve_implied_source(pipeline)
+            # The node config panel validates one component at a time and sends
+            # {version, component} — the IComponentValidatePayload shape the
+            # shell contract declares this endpoint accepts (shell/src/types/
+            # project.ts). The engine dispatches on a root-level 'component'
+            # (#2263); wrapping that payload as {'pipeline': ...} hides the
+            # key and the engine answers "'pipeline.components' must be an
+            # array". A payload carrying both keys is not one the union type
+            # can produce, so `components` wins and the stray `component` is
+            # wrapped as a full pipeline rather than passed through.
+            if 'component' in pipeline and 'components' not in pipeline:
+                data = validatePipeline(pipeline)
+            else:
+                # Resolve source: explicit arg > pipeline field > implied from components
+                source = args.get('source', None) or pipeline.get('source', None)
+                if not source:
+                    source = resolve_implied_source(pipeline)
 
-            # Build the C++ payload with resolved source and default version.
-            # The engine's config loader requires the FILE-form root
-            # ({'pipeline': <config>}) — handing it the flat config rejects
-            # every wire-correct client with "'pipeline' is missing or
-            # invalid". Clients send the flat config per the DAP contract
-            # above; the wrap happens HERE.
-            inner = {**pipeline, 'version': pipeline.get('version', 1)}
-            if source:
-                inner['source'] = source
+                # Build the C++ payload with resolved source and default version.
+                # The engine's config loader requires the FILE-form root
+                # ({'pipeline': <config>}) — handing it the flat config rejects
+                # every wire-correct client with "'pipeline' is missing or
+                # invalid". Clients send the flat config per the DAP contract
+                # above; the wrap happens HERE.
+                inner = {**pipeline, 'version': pipeline.get('version', 1)}
+                if source:
+                    inner['source'] = source
 
-            # Same envelope pipe_Validate (modules/pipe) builds — the version
-            # rides INSIDE the wrapped config (see the FILE-form note above).
-            data = validatePipeline({'pipeline': inner})
+                # Same envelope pipe_Validate (modules/pipe) builds — the version
+                # rides INSIDE the wrapped config (see the FILE-form note above).
+                data = validatePipeline({'pipeline': inner})
 
             # Return the results
             return self.build_response(request, body=data)

@@ -1188,6 +1188,10 @@ export function createTestEngine(): TestEngine {
 				await client.cprofileReportTree(ctx.pipelineToken || null);
 				return;
 			}
+			case 'cprofileThreads': {
+				await client.cprofileThreads(ctx.pipelineToken || null);
+				return;
+			}
 
 			// Database
 			case 'database.query':
@@ -1411,7 +1415,7 @@ export function createTestEngine(): TestEngine {
 					makeEvent(
 						'chaos',
 						label,
-						`Server-side kill (${cfg.killProbability}% roll) — terminating pipeline`,
+						`Server-side kill (${cfg.killProbability}% roll), terminating pipeline`,
 					),
 				);
 				// Real server-side terminate

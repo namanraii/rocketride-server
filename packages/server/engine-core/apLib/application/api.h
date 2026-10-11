@@ -28,13 +28,23 @@ namespace ap::application {
 class CmdLine;
 
 [[noreturn]] void quickExit(int code = 0) noexcept;
-CmdLine &cmdline() noexcept;
+ROCKETRIDE_CORE_API CmdLine &cmdline() noexcept;
 int argc() noexcept;
 const char **argv() noexcept;
 const std::vector<Text> &args() noexcept;
 bool elevated() noexcept;
 
-file::Path execPath(bool stripExec = false) noexcept;
+int detectExecPath() noexcept;
+
+#if ROCKETRIDE_PLAT_WIN
+void installCrashHandlers() noexcept;
+
+int bootstrap(int argc, const Utf16Chr **argv, ErrorCode (*entry)()) noexcept;
+#else
+int bootstrap(int argc, const char **argv, ErrorCode (*entry)()) noexcept;
+#endif
+
+ROCKETRIDE_CORE_API file::Path execPath(bool stripExec = false) noexcept;
 inline auto execDir() noexcept { return execPath(true); }
 const file::Path &projectDir() noexcept;
 

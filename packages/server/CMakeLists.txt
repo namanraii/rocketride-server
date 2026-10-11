@@ -19,6 +19,18 @@ cmake_minimum_required(VERSION 3.19 FATAL_ERROR)
 get_filename_component(ROCKETRIDE_PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 set(ROCKETRIDE_PACKAGES_DIR "${ROCKETRIDE_PROJECT_ROOT}/packages")
 
+if(ROCKETRIDE_OVERLAY_ROOT)
+    get_filename_component(ROCKETRIDE_OVERLAY_ROOT "${ROCKETRIDE_OVERLAY_ROOT}" ABSOLUTE)
+    set(ROCKETRIDE_DIST_DIR "${ROCKETRIDE_OVERLAY_ROOT}/dist/server")
+else()
+    set(ROCKETRIDE_DIST_DIR "${ROCKETRIDE_PROJECT_ROOT}/dist/server")
+endif()
+
+# -----------------------------------------------------------------------------
+# IDE target grouping
+# -----------------------------------------------------------------------------
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+
 # -----------------------------------------------------------------------------
 # Display CMake configuration information
 # -----------------------------------------------------------------------------
@@ -30,6 +42,8 @@ message(STATUS "      version   : ${CMAKE_VERSION}")
 message(STATUS "      generator : ${CMAKE_GENERATOR}")
 message(STATUS "      compiler  : ${CMAKE_CXX_COMPILER}")
 message(STATUS "Project root    : ${ROCKETRIDE_PROJECT_ROOT}")
+message(STATUS "Overlay root    : ${ROCKETRIDE_OVERLAY_ROOT}")
+message(STATUS "Dist dir        : ${ROCKETRIDE_DIST_DIR}")
 
 # -----------------------------------------------------------------------------
 # Build time measurement (optional)
@@ -122,6 +136,7 @@ include(cmake/setup_vcpkg.cmake)
 # -----------------------------------------------------------------------------
 include(cmake/setup.cmake)
 include(cmake/rocketride.cmake)
+include(cmake/rocketride-node.cmake)
 
 # -----------------------------------------------------------------------------
 # Compiler information
@@ -155,8 +170,34 @@ add_subdirectory(engine-core)
 # Engine library (engLib) - engine-specific functionality
 add_subdirectory(engine-lib)
 
-# Main engine executable (external to packages/server)
-add_subdirectory(${ROCKETRIDE_PROJECT_ROOT}/packages/engine ${CMAKE_BINARY_DIR}/packages/engine)
+# Shared engine module (engineMod) - engine-lib provides its engLib target
+add_subdirectory(engine-mod)
+
+# Main engine executable
+add_subdirectory(engine)
+
+# C++ nodes
+set(nodeNamesSeen "")
+
+foreach(nodesRoot ${ROCKETRIDE_OVERLAY_ROOT} ${ROCKETRIDE_PROJECT_ROOT})
+    file(GLOB nodeDirs LIST_DIRECTORIES true "${nodesRoot}/nodes/src/nodes/*")
+
+    foreach(nodeDir ${nodeDirs})
+        if(NOT IS_DIRECTORY ${nodeDir})
+            continue()
+        endif()
+
+        get_filename_component(nodeName ${nodeDir} NAME)
+
+        if(NOT nodeName IN_LIST nodeNamesSeen)
+            list(APPEND nodeNamesSeen ${nodeName})
+
+            if(EXISTS ${nodeDir}/CMakeLists.txt)
+                add_subdirectory(${nodeDir} ${CMAKE_BINARY_DIR}/nodes/${nodeName})
+            endif()
+        endif()
+    endforeach()
+endforeach()
 
 # -----------------------------------------------------------------------------
 # Testing configuration

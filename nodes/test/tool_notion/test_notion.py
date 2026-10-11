@@ -179,6 +179,19 @@ class TestRequest:
         out = _nc.request('PATCH', '/pages/x', api_key='k')
         assert out == {}
 
+    def test_non_json_success_raises_notion_api_error(self, mock_requests):
+        resp = _resp(200, text='<html>upstream error</html>')
+        resp.content = b'<html>upstream error</html>'
+        mock_requests.request.return_value = resp
+
+        with pytest.raises(_nc.NotionAPIError) as exc_info:
+            _nc.request('GET', '/pages/p1', api_key='k')
+
+        assert exc_info.value.status_code == 200
+        assert exc_info.value.code == 'invalid_json_response'
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        mock_requests.request.assert_called_once()
+
     def test_json_body_and_params_are_forwarded(self, mock_requests):
         mock_requests.request.return_value = _resp(200, json_data={})
         _nc.request('POST', '/search', api_key='k', json_body={'query': 'x'}, params={'a': 1})
@@ -493,6 +506,12 @@ class TestAppendBlockChildren:
 
 
 class TestNotionSearch:
+    def test_schema_advertises_optional_start_cursor(self):
+        schema = _ii.IInstance.notion_search.__tool_meta__['input_schema']
+
+        assert schema['properties']['start_cursor']['type'] == 'string'
+        assert 'start_cursor' not in schema.get('required', [])
+
     def test_builds_query_filter_and_page_size(self, monkeypatch):
         mock_request = Mock(return_value={'results': [{'id': 'p1'}], 'has_more': True, 'next_cursor': 'c1'})
         monkeypatch.setattr(_ii.notion_client, 'request', mock_request)
@@ -517,6 +536,33 @@ class TestNotionSearch:
         inst.notion_search({'page_size': 500})
 
         assert mock_request.call_args.kwargs['json_body']['page_size'] == 100
+
+    def test_forwards_start_cursor(self, monkeypatch):
+        cursor = '3c90c3cc-0d44-4b50-8888-8dd25736052a'
+        mock_request = Mock(return_value={'results': [], 'has_more': False, 'next_cursor': None})
+        monkeypatch.setattr(_ii.notion_client, 'request', mock_request)
+        inst = _instance()
+
+        out = inst.notion_search({'query': 'roadmap', 'page_size': 5, 'start_cursor': cursor})
+
+        assert out['success'] is True
+        assert mock_request.call_args.args == ('POST', '/search')
+        assert mock_request.call_args.kwargs['json_body'] == {
+            'query': 'roadmap',
+            'page_size': 5,
+            'start_cursor': cursor,
+        }
+
+    @pytest.mark.parametrize('cursor', ['', None])
+    def test_omits_empty_start_cursor(self, monkeypatch, cursor):
+        mock_request = Mock(return_value={'results': [], 'has_more': False, 'next_cursor': None})
+        monkeypatch.setattr(_ii.notion_client, 'request', mock_request)
+        inst = _instance()
+
+        out = inst.notion_search({'query': 'roadmap', 'start_cursor': cursor})
+
+        assert out['success'] is True
+        assert mock_request.call_args.kwargs['json_body'] == {'query': 'roadmap'}
 
     def test_error_is_wrapped_in_the_standard_envelope(self, monkeypatch):
         monkeypatch.setattr(
@@ -568,6 +614,12 @@ class TestNotionGetDatabase:
 
 
 class TestNotionQueryDatabase:
+    def test_schema_advertises_optional_request_status(self):
+        schema = _ii.IInstance.notion_query_database.__tool_meta__['output_schema']
+
+        assert schema['properties']['request_status']['type'] == 'object'
+        assert 'request_status' not in schema.get('required', [])
+
     def test_missing_database_id_is_rejected(self, monkeypatch):
         mock_request = Mock()
         monkeypatch.setattr(_ii.notion_client, 'request', mock_request)
@@ -616,6 +668,46 @@ class TestNotionQueryDatabase:
         inst.notion_query_database({'database_id': 'db-1', 'data_source_id': 'ds-explicit'})
 
         mock_resolve.assert_called_once_with('db-1', api_key='test-key', data_source_id='ds-explicit')
+
+    @pytest.mark.parametrize('has_more', [True, False])
+    def test_preserves_incomplete_request_status(self, monkeypatch, has_more):
+        status = {
+            'type': 'incomplete',
+            'incomplete_reason': 'query_result_limit_reached',
+        }
+        cursor = 'next-page' if has_more else None
+        mock_request = Mock(
+            return_value={
+                'results': [{'id': 'row-1'}],
+                'has_more': has_more,
+                'next_cursor': cursor,
+                'request_status': status,
+            }
+        )
+        monkeypatch.setattr(_ii.notion_client, 'request', mock_request)
+        inst = _instance()
+
+        out = inst.notion_query_database({'database_id': 'db-1', 'data_source_id': 'ds-1'})
+
+        assert out == {
+            'success': True,
+            'results': [{'id': 'row-1'}],
+            'has_more': has_more,
+            'next_cursor': cursor,
+            'request_status': status,
+        }
+
+    def test_omits_request_status_when_upstream_omits_it(self, monkeypatch):
+        monkeypatch.setattr(
+            _ii.notion_client,
+            'request',
+            Mock(return_value={'results': [], 'has_more': False, 'next_cursor': None}),
+        )
+        inst = _instance()
+
+        out = inst.notion_query_database({'database_id': 'db-1', 'data_source_id': 'ds-1'})
+
+        assert 'request_status' not in out
 
     def test_ambiguous_data_source_error_is_wrapped(self, monkeypatch):
         monkeypatch.setattr(
@@ -671,6 +763,18 @@ class TestNotionGetPage:
         out = inst.notion_get_page({'page_id': 'p1'})
 
         assert out['in_trash'] is False
+
+    def test_non_json_success_is_wrapped_in_the_standard_envelope(self, mock_requests):
+        resp = _resp(200, text='<html>upstream error</html>')
+        resp.content = b'<html>upstream error</html>'
+        mock_requests.request.return_value = resp
+        inst = _instance()
+
+        out = inst.notion_get_page({'page_id': 'p1'})
+
+        assert out['success'] is False
+        assert 'invalid_json_response' in out['error']
+        mock_requests.request.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

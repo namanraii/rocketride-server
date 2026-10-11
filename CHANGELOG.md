@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — since 2026-09-22
+
+### Added
+- **docker**: releases publish `rocketride-node`, an image that runs one pipeline task (engine-base plus a warmed wheel cache), and `rocketride-engine-base`; both cosign-signed, the node image checked before signing and never tagged `latest`.
+
+### Changed
+- **docker**: the engine image is built FROM a shared `engine-base` and runs as uid 1000 (was a system user, uid 999). An existing `/opt/data` volume has to be handed over once: `docker run --rm -v rocketride-data:/opt/data alpine chown -R 1000:1000 /opt/data`. The engine now refuses to start, naming that command, when its data directory is not writable.
+
+## [3.4.0] - 2026-09-22
 
 <!-- Everything below ships in the next release. There is deliberately no
      [3.4.0] section here: that release was cut on `stage` (#1654) and then
@@ -21,7 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: migrate Discord notifier workflows to forum channels (tags + auto-archive) (#1510)
 - **ci**: on-demand + monthly multi-OS compile/test matrix (#1537)
 - **ci**: keep Discord forum tags live (re-apply on state/label change via bot) (#1722)
+- **cli**: `rocketride profile` subcommand (Python + TS) — profile the server process or a pipeline (#2382)
 - **cli**: rocketride validate subcommand (Python + TS) + validate-pipes composite action (#1573)
+- **client-python**: `rocketride diff` — semantic `.pipe` diff + pipe-diff composite action (#1607)
 - **client-python**: `rocketride otel` — OpenTelemetry bridge over the ingester protocol (#1612)
 - **database**: Sequelize ORM over pipes + server-side DB transactions (#1467)
 - **deploy-2**: teams-as-environments deploy, owner-scoped task identity, push-driven surfaces (#1764)
@@ -35,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **nodes**: add cognee node (#1501)
 - **nodes**: add context_optimizer node — fits questions into the model context window by token budget (#1489)
 - **nodes**: add currency_convert_explicit node (#1497)
+- **nodes**: add discord — Discord Bot source node over the Gateway; routes messages and image/audio/video/document attachments to the text/image/audio/video/tags lanes and posts the pipeline's first answer back as a reply, channel message, or thread (with thread naming); guild/channel/mention/bot gates, chunked replies (optionally numbered), mention allowlists, text-attachment decoding and attachment merge, and reaction/no_reply/outbound events (#1503)
+- **nodes**: discord support behaviours, each opt-in — thread history as context, escalation pause with a team mention alias (which also limits role pings to the final answer and one per user per hour), acknowledgement and feedback reactions, reply sanitizing with non-answer retries, a pipeline timeout, and startup backfill; engine and provider errors are never posted as answers (on by default), and generic error-shaped openings such as `Error:` are suppressed only with reply sanitizing on (#2547)
+- **nodes**: discord event capture, opt-in — writes every event the node handles (question, reply, no_reply, reaction) to a PostgreSQL table through a database node connected to the source, deduplicated per event and off the answering path, so a slow or unreachable database never delays a reply; `outbound`, `no_reply` and `reaction` rows need `emitOutbound`, `emitNoReply` and `emitReactions` on (#2548)
 - **nodes**: add extract_facts node — document-context + cell-by-cell reader + validator (#1426) (#1545)
 - **nodes**: add n8n workflow-automation node (#1231)
 - **nodes**: add tool_oura Oura Ring connector (#1625)

@@ -33,8 +33,11 @@ is exercised.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import threading
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -107,17 +110,27 @@ def _resolve(client_id: str) -> str:
     return asyncio.run(_Minimal().resolve_db_dsn(client_id))
 
 
-def test_unconfigured_env_raises_signin_error(monkeypatch):
+def test_unconfigured_env_raises_no_cloud_db_error(monkeypatch):
     monkeypatch.delenv('ROCKETRIDE_DB_BROKER_URL', raising=False)
     monkeypatch.delenv('ROCKETRIDE_DB_BROKER_TOKEN', raising=False)
-    with pytest.raises(NotImplementedError, match='require signing into RocketRide cloud'):
+    with pytest.raises(NotImplementedError, match='no RocketRide cloud database is configured on this server'):
         _resolve('tenant-1')
 
 
-def test_partial_env_still_raises(monkeypatch, broker):
-    monkeypatch.delenv('ROCKETRIDE_DB_BROKER_TOKEN', raising=False)
-    with pytest.raises(NotImplementedError):
+@pytest.mark.parametrize(
+    ('url', 'token', 'missing'),
+    [
+        ('', TEST_TOKEN, 'ROCKETRIDE_DB_BROKER_URL'),
+        ('https://broker.example/provision', '   ', 'ROCKETRIDE_DB_BROKER_TOKEN'),
+        (' ', '', 'ROCKETRIDE_DB_BROKER_URL, ROCKETRIDE_DB_BROKER_TOKEN'),
+    ],
+)
+def test_missing_broker_variables_named_without_values(monkeypatch, url, token, missing):
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_URL', url)
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', token)
+    with pytest.raises(NotImplementedError) as excinfo:
         _resolve('tenant-1')
+    assert str(excinfo.value) == f'no RocketRide cloud database is configured on this server (missing: {missing})'
 
 
 def test_resolves_dsn_via_broker(broker):
@@ -143,6 +156,27 @@ def test_bad_token_raises_runtime_error(broker, monkeypatch):
     monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', 'wrong')
     with pytest.raises(RuntimeError, match='rejected provision.*401'):
         _resolve('tenant-1')
+
+
+def test_broker_http_error_response_is_closed(monkeypatch):
+    response_body = io.BytesIO(b'broker error')
+    error = urllib.error.HTTPError(
+        'https://broker.example/provision',
+        503,
+        'Service Unavailable',
+        hdrs=None,
+        fp=response_body,
+    )
+
+    def raise_http_error(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(urllib.request, 'urlopen', raise_http_error)
+
+    with pytest.raises(RuntimeError, match='rejected provision.*503'):
+        AccountBase._call_db_broker('https://broker.example/provision', TEST_TOKEN, 'tenant-1')
+
+    assert response_body.closed
 
 
 def test_missing_dsn_in_response_raises(broker):

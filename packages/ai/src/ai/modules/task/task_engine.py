@@ -38,10 +38,10 @@ import socket
 import hashlib
 import shlex
 import shutil
-from typing import TYPE_CHECKING, Dict, Any, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, Any, List, Mapping, Optional, Tuple
 from tenacity import retry, stop_after_attempt, wait_fixed
 
-from rocketlib import debug, args as startup_args
+from rocketlib import debug, warning, args as startup_args
 from ai.constants import (
     CONST_DEFAULT_MAX_THREADS,
     CONST_CANCEL_WAIT_TIMEOUT_SECONDS,
@@ -52,6 +52,7 @@ from ai.constants import (
     CONST_STATUS_UPDATE_CANCEL_TIMEOUT,
     CONST_STATUS_HISTORY_LIMIT,
     CONST_ANALYTICS_SLOWEST_DOCS,
+    CONST_TASK_DATA_PATH,
 )
 from ai import CONST_AI_NODE_SCRIPT
 from ai.common.dap import DAPBase, DAPClient, TransportWebSocket
@@ -134,6 +135,257 @@ if TYPE_CHECKING:
 
 # Development environment optimization
 copied_python_shim = False
+
+
+# Environment the task subprocess inherits from the engine. The engine process
+# holds deployment-level credentials (object store, identity provider, database,
+# encryption) next to the pipeline-facing ROCKETRIDE_* namespace, and pipeline
+# code — plus anything it launches, e.g. a stdio MCP server — reads its
+# environment freely. So the child gets an allowlist, never a copy of the whole
+# environment: the process-runtime baseline below, the ROCKETRIDE_* namespace,
+# and whatever the operator opts in through RR_SUBPROCESS_ENV.
+#
+# RR_SUBPROCESS_ENV is a comma- or space-separated list of extra names; a
+# trailing '*' passes a prefix ('SLACK_BOT_TOKEN,GH_*'). A bare '*' hands the
+# child the entire environment, which is the pre-allowlist behaviour — only
+# sensible on a single-user install. It lives in the operator-only RR_* tier
+# on purpose: ROCKETRIDE_* is writable by any authenticated client through the
+# account set_env command, so an opt-in there could be flipped by a user.
+CONST_SUBPROCESS_ENV_OPT_IN = 'RR_SUBPROCESS_ENV'
+
+CONST_SUBPROCESS_ENV_NAMES = frozenset(
+    {
+        # Process basics (POSIX)
+        'PATH',
+        'HOME',
+        'USER',
+        'LOGNAME',
+        'SHELL',
+        'PWD',
+        'TERM',
+        'TZ',
+        'LANG',
+        'LANGUAGE',
+        'TMPDIR',
+        'TMP',
+        'TEMP',
+        # Shared-library lookup
+        'LD_LIBRARY_PATH',
+        'DYLD_LIBRARY_PATH',
+        'DYLD_FALLBACK_LIBRARY_PATH',
+        'DYLD_FRAMEWORK_PATH',
+        # TLS trust and proxies (requests/httpx/curl read these; the proxy
+        # names are conventionally lowercase on POSIX — matching is
+        # case-insensitive, see filter_subprocess_env)
+        'SSL_CERT_FILE',
+        'SSL_CERT_DIR',
+        'REQUESTS_CA_BUNDLE',
+        'CURL_CA_BUNDLE',
+        'HTTP_PROXY',
+        'HTTPS_PROXY',
+        'ALL_PROXY',
+        'NO_PROXY',
+        'FTP_PROXY',
+        # Windows process basics
+        'SYSTEMROOT',
+        'WINDIR',
+        'SYSTEMDRIVE',
+        'COMSPEC',
+        'PATHEXT',
+        'USERPROFILE',
+        'USERNAME',
+        'HOMEDRIVE',
+        'HOMEPATH',
+        'APPDATA',
+        'LOCALAPPDATA',
+        'PROGRAMDATA',
+        'PROGRAMFILES',
+        'PROGRAMFILES(X86)',
+        'PROGRAMW6432',
+        'COMMONPROGRAMFILES',
+        'COMMONPROGRAMFILES(X86)',
+        'ALLUSERSPROFILE',
+        'PUBLIC',
+        'OS',
+        'NUMBER_OF_PROCESSORS',
+        'PROCESSOR_ARCHITECTURE',
+        'PROCESSOR_IDENTIFIER',
+        'PROCESSOR_LEVEL',
+        'PROCESSOR_REVISION',
+        # RocketRide services the child reaches itself: the object store
+        # behind tool_filesystem (Store.create reads the URL and secret), the
+        # public address + signing key FileStore.get_url needs to mint fetch
+        # URLs the engine will accept, the child's own web server CORS policy,
+        # and the OAuth broker the Google/Microsoft nodes dial directly.
+        'RR_STORE_URL',
+        'RR_STORE_SECRET_KEY',
+        'RR_BASE_URL',
+        'RR_SIGNING_KEY',
+        'RR_CORS_ORIGINS',
+        'RR_OAUTH_BROKER_URL',
+        # Operator opt-in that makes task processes hide their /proc entries
+        # (ai.proc_privacy); non-secret, and tasks must see it to act on it
+        'RR_PROC_PRIVATE',
+        # Executable override for the media toolkit nodes
+        'MEDIA_TOOLKIT_FFMPEG',
+        # Bare names individual node READMEs document as engine-host fallbacks
+        # for their API keys (directly, or through the vendor SDK's own
+        # default). New nodes should read ROCKETRIDE_* instead.
+        'OPENAI_API_KEY',
+        'ELEVENLABS_API_KEY',
+        'RIME_API_KEY',
+        'NOTION_API_KEY',
+        'EXA_API_KEY',
+        'MEM0_API_KEY',
+        'COGNEE_API_KEY',
+        'CRUSTDATA_API_KEY',
+        'HYDRA_DB_API_KEY',
+        'HYDRA_DB_BASE_URL',
+        'HOTDATA_API_KEY',
+        'HOTDATA_WORKSPACE',
+        'HOTDATA_DATABASE_ID',
+        'LASER_CONNECTION_STRING',
+        'XTRACE_API_KEY',
+        'XTRACE_ORG_ID',
+    }
+)
+
+CONST_SUBPROCESS_ENV_PREFIXES = (
+    # The pipeline-facing namespace (same rule as ${VAR} expansion, see
+    # pipeline.ALLOWED_ENV_PREFIX)
+    'ROCKETRIDE_',
+    # Interpreter and package tooling
+    'PYTHON',
+    'UV_',
+    'PIP_',
+    'VIRTUAL_ENV',
+    # Locale and XDG base dirs
+    'LC_',
+    'XDG_',
+    # The S3 store backend authenticates through boto3's environment chain —
+    # static keys, or the web-identity role Kubernetes injects — and the
+    # child opens the store itself (tool_filesystem), so it needs the same
+    # AWS identity the engine has.
+    'AWS_',
+    # ML runtime caches and thread tuning
+    'HF_',
+    'HUGGINGFACE_',
+    'TRANSFORMERS_',
+    'TOKENIZERS_',
+    'TORCH_',
+    'PYTORCH_',
+    'CUDA_',
+    'NVIDIA_',
+    'OMP_',
+    'MKL_',
+    'OPENBLAS_',
+    'TIKTOKEN_',
+    'NLTK_',
+)
+
+
+def _subprocess_env_opt_in(environ: Mapping[str, str]) -> Tuple[frozenset, Tuple[str, ...]]:
+    """Parse RR_SUBPROCESS_ENV into (exact names, prefixes), upper-cased."""
+    names = set()
+    prefixes = []
+    for item in environ.get(CONST_SUBPROCESS_ENV_OPT_IN, '').replace(',', ' ').split():
+        item = item.upper()
+        if item.endswith('*'):
+            prefixes.append(item[:-1])  # '*' alone → '' → matches everything
+        else:
+            names.add(item)
+    return frozenset(names), tuple(prefixes)
+
+
+def filter_subprocess_env(environ: Mapping[str, str]) -> Dict[str, str]:
+    """Return the subset of ``environ`` a task subprocess may inherit.
+
+    Names are matched case-insensitively: Windows treats them that way, and the
+    POSIX proxy variables are conventionally lowercase. Original spelling is
+    kept in the result.
+    """
+    opt_names, opt_prefixes = _subprocess_env_opt_in(environ)
+    prefixes = CONST_SUBPROCESS_ENV_PREFIXES + opt_prefixes
+    allowed: Dict[str, str] = {}
+    for name, value in environ.items():
+        key = name.upper()
+        if key in CONST_SUBPROCESS_ENV_NAMES or key in opt_names or key.startswith(prefixes):
+            allowed[name] = value
+    return allowed
+
+
+# Nodes a hosted (SaaS) engine refuses to launch. The canvas already hides
+# `nosaas` services, but a pipeline can reach the engine without the canvas,
+# so the engine enforces the same rule itself. Any service built on the MCP
+# client node is refused in stdio mode: that transport launches a command
+# inside the engine's container. Its HTTP transports are fine. Matching is on
+# the node module, not the provider name: several services share the node
+# (tool_butterbase is one) and provider lookup is case-insensitive.
+CONST_SAAS_BLOCKED_CAPABILITY = 'nosaas'
+CONST_MCP_CLIENT_NODE_PATH = 'nodes.tool_mcp_client'
+
+# Task subprocesses of a hosted engine get this flag on their command line.
+# Pipeline-supplied args can add flags but not remove this one, so nodes can
+# rely on it (the MCP stdio client refuses to start when it is present).
+CONST_HOSTED_CHILD_FLAG = '--hosted'
+
+
+def _service_capabilities(service: Any) -> List[str]:
+    """Capability names of a service definition, lower-cased."""
+    caps = service.get('capabilities') if service else None
+    if isinstance(caps, str):
+        caps = [caps]
+    return [str(c).lower() for c in (caps or [])]
+
+
+def saas_pipeline_violation(
+    pipeline: Dict[str, Any],
+    get_service: Callable[[str], Any],
+    get_node_config: Callable[[str, Dict[str, Any]], Dict[str, Any]],
+) -> Optional[str]:
+    """Return why a hosted engine must refuse ``pipeline``, or None if it may run.
+
+    ``get_service`` and ``get_node_config`` are ``rocketlib.getServiceDefinition``
+    and ``Config.getNodeConfig`` in production. The MCP transport is resolved the
+    way the node resolves it (profile defaults merged under the component config),
+    because the default profile is itself stdio. Anything that cannot be resolved
+    is refused.
+    """
+    for component in pipeline.get('components', []) or []:
+        provider = str(component.get('provider') or '')
+        label = component.get('name') or component.get('id') or provider
+        service = get_service(provider) if provider else None
+
+        if CONST_SAAS_BLOCKED_CAPABILITY in _service_capabilities(service):
+            return f'Node "{label}" ({provider}) is not available on RocketRide Cloud.'
+
+        if str((service or {}).get('path') or '').lower() == CONST_MCP_CLIENT_NODE_PATH:
+            try:
+                transport = str(get_node_config(provider, component.get('config') or {}).get('transport') or 'stdio')
+            except Exception:
+                transport = 'unresolved'
+            if transport.strip().lower() not in ('streamable-http', 'sse'):
+                return (
+                    f'Node "{label}": the stdio MCP transport is not available on RocketRide Cloud. '
+                    'Use streamable-http or sse.'
+                )
+    return None
+
+
+def _is_saas_engine() -> bool:
+    """True when this engine is the hosted (SaaS) one.
+
+    Either signal is enough: the engine's own ``--saas`` launch flag (its argv,
+    which no pipeline can reach) or the account provider's ``saas`` capability.
+    """
+    if '--saas' in startup_args():
+        return True
+    try:
+        from ai.account import account
+
+        return 'saas' in (getattr(account, 'capabilities', None) or ())
+    except Exception:
+        return False
 
 
 class Task(DAPBase):
@@ -292,6 +544,10 @@ class Task(DAPBase):
         # Guard against _terminated() being called more than once
         self._terminated_called = False
 
+        # Whether the task sent its own >EXIT event this run. Without one,
+        # _terminated() falls back to the process exit code.
+        self._exit_event_seen = False
+
         # Server reference
         self._server = server
 
@@ -437,6 +693,23 @@ class Task(DAPBase):
     # therefore need ROCKETRIDE_DB_DSN injected into the task subprocess.
     _ROCKETRIDE_DB_PROVIDERS = frozenset({'rocketride_sql', 'rocketride_vector', 'rocketride_graph'})
 
+    # Reason handed to the node subprocess when this engine has no database
+    # broker (a local engine, or a self-hosted one without the broker env).
+    # The node prefixes it with 'RocketRide cloud database is not available
+    # for this task:' so it must read as the continuation of that sentence.
+    _NO_CLOUD_DB_REASON = (
+        'this server has no RocketRide cloud database (no database broker is configured). '
+        'The rocketride_sql, rocketride_vector and rocketride_graph nodes need a server with a '
+        'RocketRide cloud database (RocketRide Cloud, or a self-hosted engine with a database '
+        'broker); on this server use a node with its own connection settings instead '
+        '(db_postgres for SQL, PostgreSQL (pgvector) with provider postgres for vectors, '
+        'graph_neo4j for graphs)'
+    )
+    _CLOUD_DB_CONFIG_ERROR_REASON = (
+        'this RocketRide Cloud server is missing required database broker configuration. '
+        'Contact the server operator to restore the database broker configuration and retry the pipeline'
+    )
+
     def _pipeline_uses_rocketride_db(self) -> bool:
         """True when any pipeline component is a RocketRide cloud DB node."""
         components = self._pipeline.get('components') or []
@@ -448,7 +721,18 @@ class Task(DAPBase):
     async def _build_subprocess_env(self) -> Dict[str, str]:
         """Build the environment for the task subprocess.
 
-        Credential hygiene for the RocketRide cloud DB path:
+        The child never gets a copy of the engine's environment: it runs user
+        pipeline code, so it only inherits the allowlist in
+        :func:`filter_subprocess_env` (runtime baseline + ROCKETRIDE_* + the
+        services the child reaches itself + operator opt-ins). Anything the
+        engine process was started with that the allowlist does not name —
+        identity provider, platform database, encryption keys — stays behind.
+        Note the allowlist deliberately includes RR_STORE_SECRET_KEY,
+        RR_SIGNING_KEY and AWS_*: the child opens the object store and mints
+        fetch URLs itself, so pipeline code can read those values.
+
+        Credential hygiene for the RocketRide cloud DB path (these live in the
+        ROCKETRIDE_* namespace, so the allowlist alone does not cover them):
 
         - The broker credential can resolve ANY tenant's DSN — it must never
           reach node subprocesses, which run user pipeline code.
@@ -461,7 +745,7 @@ class Task(DAPBase):
         through the environment (it rides the task file's 'identity' block —
         the ROCKETRIDE_* env namespace is caller-influenced by design).
         """
-        subprocess_env = os.environ.copy()
+        subprocess_env = filter_subprocess_env(os.environ)
 
         subprocess_env.pop('ROCKETRIDE_DB_BROKER_URL', None)
         subprocess_env.pop('ROCKETRIDE_DB_BROKER_TOKEN', None)
@@ -470,11 +754,11 @@ class Task(DAPBase):
 
         # Resolve the per-tenant DSN server-side (the SaaS account context
         # exists only in this process) and hand it to the node subprocess via
-        # env — the same delivery mechanism as ROCKETRIDE_CLIENT_ID. Scoped to
-        # pipelines that actually contain one of the DB nodes so unrelated
-        # tasks never trigger provisioning. Resolution failure is non-fatal
-        # here: the node surfaces its own clear error, with the failure reason
-        # passed down so it isn't misreported as a sign-in problem.
+        # env. Scoped to pipelines that actually contain one of the DB nodes
+        # so unrelated tasks never trigger provisioning. Resolution failure is
+        # non-fatal here: the node surfaces its own clear error, with the
+        # failure reason passed down so it isn't misreported as a missing
+        # identity.
         if self._pipeline_uses_rocketride_db():
             try:
                 from ai.account import account
@@ -488,9 +772,14 @@ class Task(DAPBase):
                 dsn = await account.resolve_db_dsn(self.org_id or self.client_id)
                 subprocess_env['ROCKETRIDE_DB_DSN'] = dsn
             except NotImplementedError:
-                # Broker env not configured (open-source default) — the
-                # node raises the sign-in message itself.
-                pass
+                # Missing broker config is normal on a local engine, but on
+                # Cloud it is an operator problem, not a reason to swap nodes.
+                if _is_saas_engine():
+                    warning(f'RocketRide DB DSN not resolved: {self._CLOUD_DB_CONFIG_ERROR_REASON}')
+                    subprocess_env['ROCKETRIDE_DB_RESOLVE_ERROR'] = self._CLOUD_DB_CONFIG_ERROR_REASON
+                else:
+                    self.debug_message('RocketRide DB DSN not resolved: no database broker configured on this engine')
+                    subprocess_env['ROCKETRIDE_DB_RESOLVE_ERROR'] = self._NO_CLOUD_DB_REASON
             except Exception as e:
                 self.debug_message(f'RocketRide DB DSN resolution failed: {e}')
                 reason = (str(e).strip().splitlines() or [repr(e)])[0]
@@ -517,6 +806,14 @@ class Task(DAPBase):
 
         if source_component is None:
             raise ValueError(f'Pipeline source component "{self.source}" not found in components list')
+
+        if _is_saas_engine():
+            from rocketlib import getServiceDefinition
+            from ai.common.config import Config
+
+            problem = saas_pipeline_violation(pipeline, getServiceDefinition, Config.getNodeConfig)
+            if problem:
+                raise ValueError(problem)
 
         if 'config' not in source_component:
             source_component['config'] = {}
@@ -545,9 +842,7 @@ class Task(DAPBase):
         Returns:
             Complete subprocess task configuration
         """
-        executable_path = sys.executable
-        exec_dir = os.path.dirname(executable_path)
-        data_path = os.path.abspath(os.path.join(exec_dir, '../data'))
+        data_path = CONST_TASK_DATA_PATH
 
         os.makedirs(data_path, exist_ok=True)
 
@@ -788,6 +1083,43 @@ class Task(DAPBase):
 
         return response
 
+    async def _process_exit_code(self) -> Optional[int]:
+        """The subprocess exit code, or None if it could not be reaped (see below).
+
+        _terminated() runs when the task's output closes, which can come a
+        moment before the process is reaped. Waiting briefly means the code is
+        known when it is recorded; _terminated() runs only once, so a code that
+        is unknown then is never recorded.
+        """
+        engine = self._engine_process
+        if not engine:
+            return 1
+        if engine.returncode is None:
+            try:
+                await asyncio.wait_for(engine.wait(), timeout=CONST_CANCEL_WAIT_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                # Output closed but the process is still alive: end it rather
+                # than leave it running behind a task recorded as finished.
+                try:
+                    engine.kill()
+                    await asyncio.wait_for(engine.wait(), timeout=CONST_CANCEL_WAIT_TIMEOUT_SECONDS)
+                except (ProcessLookupError, asyncio.TimeoutError):
+                    pass
+        return engine.returncode
+
+    def _apply_process_exit_code(self, exit_code: Optional[int]) -> None:
+        """Record the subprocess exit code when the task sent no >EXIT event this run.
+
+        Tracked with a flag: exitCode starts at 0 on a first run, so testing it
+        for None recorded a task that exited before the engine could report
+        (a task refusing to start) as completed. An exit code that is still
+        unknown is not a success either, so it records 1. A requested stop
+        keeps its existing exit code: the kill signal is not a task failure.
+        """
+        if not self._exit_event_seen and not self._stop_requested:
+            self._status.exitCode = exit_code if exit_code is not None else 1
+            self._status.exitMessage = 'Stopped'
+
     async def _terminated(self) -> None:
         """
         Handle task termination with comprehensive resource cleanup.
@@ -813,21 +1145,11 @@ class Task(DAPBase):
         self._status.state = TASK_STATE.STOPPING.value
         await self._send_status_update()
 
-        # Get subprocess reference
-        engine = self._engine_process
-
-        # Process exit code
-        if engine:
-            exit_code = engine.returncode
-        else:
-            exit_code = 1
+        exit_code = await self._process_exit_code()
 
         self.debug_message(f'Subprocess for task exited with code {exit_code}')
 
-        # Update completion status - only if we didn't get an >EXIT event
-        if self._status.exitCode is None:
-            self._status.exitCode = exit_code
-            self._status.exitMessage = 'Stopped'
+        self._apply_process_exit_code(exit_code)
 
         # If we are not restarting
         if not self._is_restarting:
@@ -1473,6 +1795,7 @@ class Task(DAPBase):
             # Save it
             self._status.exitCode = exit_code
             self._status.exitMessage = exit_message
+            self._exit_event_seen = True
 
             # Send out a status update when needed
             self._status_updated = True
@@ -1955,11 +2278,17 @@ class Task(DAPBase):
         if self._status.state != TASK_STATE.NONE.value:
             raise RuntimeError('Task has already been started')
 
+        # A restart reuses this Task: drop the previous run's process so a
+        # startup failure before the new one exists is not recorded with the
+        # old exit code.
+        self._engine_process = None
+
         try:
             # Make sure some of our start is initialized in case we are restarting
             self._status.completed = False
             self._final_events_sent = False
             self._terminated_called = False
+            self._exit_event_seen = False
             self._service_up_notes = []
             self._service_down_notes = []
             self._stop_requested = False
@@ -2029,6 +2358,10 @@ class Task(DAPBase):
                     '--data_host=127.0.0.1',
                 ]
             )
+            # Tell the task it runs under a hosted engine (see CONST_HOSTED_CHILD_FLAG)
+            if _is_saas_engine():
+                child_args.append(CONST_HOSTED_CHILD_FLAG)
+
             # Pass model server address if configured
             modelserver = self._server._config.get('modelserver')
             if modelserver:

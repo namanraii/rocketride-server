@@ -9,8 +9,25 @@ from typing import Optional, Tuple, Any
 if sys.path and (sys.path[0].endswith('ai') or sys.path[0].endswith('ai\\') or sys.path[0].endswith('ai/')):
     sys.path.pop(0)
 
+# Make this task's /proc entries private before any pipeline code loads (see
+# ai.proc_privacy). A task that should be private and cannot be refuses to run.
+from ai.proc_privacy import make_process_private, should_make_private
+
+_proc_private_error = None
+if should_make_private():
+    try:
+        make_process_private()
+    except Exception as e:
+        _proc_private_error = str(e) or type(e).__name__
+
+
 # Import directly from C++
 from engLib import debug, warning
+
+
+class TaskNotPrivateError(RuntimeError):
+    """The task should be private and is not; __main__ exits non-zero on it."""
+
 
 # Total budget for the shared WebServer to come up: the startup callback plus
 # the wait for a bound listener share this one deadline, so a slow start cannot
@@ -131,9 +148,13 @@ def _setup_shared_web_server() -> Tuple[Optional[Any], Optional[Any]]:
     async def _on_startup() -> None:
         startup_ready.set()
 
+    # load_env=False: this process runs pipeline code on the allowlisted
+    # environment the engine handed it; reading the engine's .env here would
+    # put the excluded names straight back.
     server = WebServer(
         config={'host': data_host, 'port': data_port},
         on_startup=_on_startup,
+        load_env=False,
     )
     # Mount `/task/data` — the WebSocket EaaS uses to send DAP traffic
     # (data ops, cprofile, future trace control).
@@ -266,6 +287,13 @@ def run():
     """
     import os
 
+    # See the module top: a task that should hide its /proc entries and could
+    # not must not run pipeline code.
+    if _proc_private_error:
+        message = f'Refusing to run: could not make the task process private ({_proc_private_error})'
+        warning(message)
+        raise TaskNotPrivateError(message)
+
     # Inject mock modules path if set (for testing)
     mock_path = os.environ.get('ROCKETRIDE_MOCK')
     if mock_path:
@@ -345,6 +373,11 @@ def run():
 if __name__ == '__main__':
     try:
         run()
+
+    except TaskNotPrivateError:
+        # Non-zero exit with no >EXIT event: the engine records the task as
+        # ended abnormally rather than completed.
+        sys.exit(1)
 
     except Exception as e:
         debug(e)

@@ -53,6 +53,7 @@ request headers.
 import hashlib
 import mimetypes
 import os
+import posixpath
 import re
 import sys
 import time
@@ -133,11 +134,12 @@ PUBLIC_ROUTE_MANIFEST = [
         'to run, no capacity to plan, no lock-in.',
     ),
     (
-        '/mcp',
-        # NOTE: /mcp is also a plausible future API path (Model Context Protocol
-        # endpoint). server.add_route() rejects duplicate (method, path)
-        # registrations, so a clash would fail loudly at startup rather than
-        # silently shadowing one side.
+        # NOT /mcp: /mcp and /mcp/* are reserved for the MCP API (see
+        # ai.modules.mcp). A page there would shadow the bare endpoint and
+        # mark it public to the auth middleware; add_route's duplicate check
+        # cannot catch the clash because MCP registers a raw ASGI route and
+        # Mount, so ai.modules.mcp refuses to start over any claimant instead.
+        '/mcp-server',
         'MCP',
         'Connect tools and data to your AI with the Model Context Protocol. Bring '
         'your own servers or use the ones RocketRide ships with.',
@@ -185,12 +187,12 @@ PUBLIC_ROUTES = [route for route, _, _ in PUBLIC_ROUTE_MANIFEST]
 
 # Served but not advertised. These stay registered above (typing the URL or
 # hard-reloading must keep working) while being excluded from /sitemap.xml and
-# /llms.txt: /oss and /mcp are `unlisted` in the client route manifest
+# /llms.txt: /oss and /mcp-server are `unlisted` in the client route manifest
 # (routes.ts stamps them noindex — listing them here would hand crawlers the
 # very URLs the client tells them to drop), and /store is the legacy alias the
 # client canonicalizes to /marketplace, so listing it publishes a duplicate of
 # its own canonical.
-UNLISTED_ROUTES = frozenset({'/oss', '/mcp', '/store'})
+UNLISTED_ROUTES = frozenset({'/oss', '/mcp-server', '/store'})
 
 # The advertised subset — what /sitemap.xml and /llms.txt enumerate.
 LISTED_ROUTE_MANIFEST = [entry for entry in PUBLIC_ROUTE_MANIFEST if entry[0] not in UNLISTED_ROUTES]
@@ -241,11 +243,18 @@ async def shell_static(request: Request):
         request: Incoming HTTP request.
 
     Returns:
-        FileResponse for the matched file or index.html fallback.
+        FileResponse for the matched file, or the index.html fallback for
+        non-asset routes. A /shell/static/* miss or traversal is a 404.
 
     Raises:
-        HTTPException: 503 if the shell has not been built.
+        HTTPException: 404 for a /shell/static/* miss or traversal; 503 if the
+            shell has not been built.
     """
+    # Not built (or built only partway): say so before any path handling, so
+    # asset URLs get the 503 that names the build command instead of a bare 404.
+    if not (Path(_shell_root) / 'index.html').is_file():
+        raise HTTPException(status_code=503, detail='Shell UI not built. Run: ./builder shell:build')
+
     # Map the URL path into the shell directory.
     # "/" → index.html
     # "/shell/static/js/main.js" → static/js/main.js
@@ -263,8 +272,52 @@ async def shell_static(request: Request):
     # Resolve safely within the shell root
     file_path = _resolve_safe(_shell_root, raw_path)
 
-    # Serve the file if it exists
+    # Prerendered marketing page, when the shell build carries a capture for
+    # this route: <shell>/_prerender/index.html for '/', and
+    # <shell>/_prerender/<route>/index.html otherwise (the layout the CDN's
+    # router used). Only public routes reach here with a non-/shell/ path, and a
+    # capture is served only if it exists, so no route list is mirrored. Any
+    # query string gets the app instead: an OAuth callback lands on '/' with
+    # ?code/?state/?error, and invite or verification links carry a token the
+    # app must read. Crawlers fetch the canonical URL, which has none.
+    if not request.url.path.startswith('/shell/') and not request.url.query:
+        route = request.url.path.strip('/')
+        prerender_root = (Path(_shell_root) / '_prerender').resolve()
+        capture = _resolve_safe(_shell_root, f'_prerender/{route}/index.html' if route else '_prerender/index.html')
+        if capture.is_relative_to(prerender_root) and capture.is_file():
+            return FileResponse(capture)
+
+    # Content-hashed bundles under /shell/static/ are not navigation routes: a
+    # miss must 404 rather than fall through to the index.html SPA response
+    # below. Behind the immutable, edge-cached /shell/static/* CloudFront
+    # behavior, a 200 index.html under a .js/.css URL is cached as
+    # HTML-under-a-JS-URL and breaks app boot for every viewer until the cache
+    # clears. A real 404 keeps the miss uncacheable as an asset.
+    #
+    # Decided on the RESOLVED path and BEFORE the serve step: _resolve_safe
+    # answers a traversal (e.g. a percent-encoded %2e%2e, which survives edge
+    # path matching and is decoded only here) with index.html, so a check after
+    # serving would never be reached. Same rule as apps_static's
+    # "resolve before authorizing, refuse traversal".
+    #
+    # The trigger uses the stripped path, not the raw URL: '/shell//static/x.js',
+    # '/shell/%2e/static/x.js' and '/shell/a/../static/x.js' all land in static/
+    # but none starts with '/shell/static/'. Two views, either one triggers:
+    # the leading segment (catches static/../.. walking out) and the normalized
+    # path (catches a walk back in).
+    segments = [s for s in raw_path.split('/') if s not in ('', '.')]
+    normalized = posixpath.normpath('/' + raw_path).lstrip('/')
+    is_static = segments[:1] == ['static'] or normalized.split('/', 1)[0] == 'static'
+    if is_static:
+        static_root = (Path(_shell_root) / 'static').resolve()
+        if not (file_path.is_relative_to(static_root) and file_path.is_file()):
+            raise HTTPException(status_code=404, detail='Not found')
+
+    # Serve the file if it exists. Everything under static/ is content-hashed
+    # (a new build changes the name), so the browser may keep it for good.
     if file_path.exists() and file_path.is_file():
+        if is_static:
+            return FileResponse(file_path, headers={'Cache-Control': 'public, max-age=31536000, immutable'})
         return FileResponse(file_path)
 
     # SPA fallback: serve index.html for any unmatched route so that
@@ -291,7 +344,8 @@ async def shell_static(request: Request):
 # The cookie the browser attaches to every /apps/* fetch (set by apps_session).
 _APP_COOKIE = 'rr_apps_token'
 
-# Sliding permission cache: sha256('<token>.<app_id>') -> {auth: bool, expiry}.
+# Sliding permission cache: sha256('<token>.<app_id>') -> {auth: bool, expiry,
+# appId} (appId lets invalidate_app_serving drop one app's verdicts).
 # DENIALS are cached too — an unauthorized caller hammering denied apps is then
 # served from cache instead of a DB walk per file (a cheap-DoS guard). Every
 # reference slides the entry 5 min forward. Only the permission DECISION is
@@ -406,7 +460,7 @@ async def _authorize_app(token: str, app_id: str) -> bool:
         hit['expiry'] = now + _APP_AUTH_TTL  # slide on reference
         return hit['auth']
     auth = await _resolve_app_access(token, app_id)
-    _app_auth_cache[key] = {'auth': auth, 'expiry': now + _APP_AUTH_TTL}
+    _app_auth_cache[key] = {'auth': auth, 'expiry': now + _APP_AUTH_TTL, 'appId': app_id}
     # Bounded for real: expired entries go first, and if a flood of DISTINCT
     # random tokens fills the map inside one TTL window (nothing expired to
     # drop), evict the soonest-to-expire entries down to the cap — with the
@@ -427,7 +481,8 @@ async def _authorize_app(token: str, app_id: str) -> bool:
 # /apps/<appId>/v<N>/<rest> streams the registry version's built dist/ tree
 # from the STORE (deployed and seeded apps alike — bundles serve versioned
 # ONLY; the static tree below is for app ASSETS like icons/readmes). Bytes
-# are IMMUTABLE per version, so caching is aggressive; the entitlement
+# are IMMUTABLE per version, but the browser cache is capped at an hour so a
+# logged-out or revoked caller stops reusing a bundle without asking; the entitlement
 # VERDICT is cached with a HARD expiry — deliberately never slid — so a
 # pulled publish stops serving within minutes no matter how hot the traffic
 # is. The reverse move (a publish that ADDS a version — deploy, fleet bump)
@@ -436,10 +491,11 @@ async def _authorize_app(token: str, app_id: str) -> bool:
 
 _VERSION_SEG = re.compile(r'^v(\d{1,9})$')
 _APP_ID_SEG = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.\-]*$')
-_IMMUTABLE_CACHE = 'private, max-age=31536000, immutable'
+_BUNDLE_CACHE = 'private, max-age=3600'
 # sha256('<token>.<app_id>') -> {'dirs': {version: dist_dir}, 'expiry',
-# 'resolvedAt', 'floor'} — HARD expiry (contrast _app_auth_cache's sliding
-# window).
+# 'resolvedAt', 'floor', 'appId'} — HARD expiry (contrast _app_auth_cache's
+# sliding window); every deploy change also drops the app's entries
+# (invalidate_app_serving).
 _version_dir_cache: dict = {}
 # BASE floor between miss-forced re-resolutions of one caller's map: a map
 # younger than its key's CURRENT floor answers as-is even when it lacks the
@@ -501,7 +557,13 @@ async def _version_dirs_for(token: str, app_id: str, want: Optional[int] = None)
     # converges on the first ask.
     fruitless = hit is not None and hit['expiry'] > now and want is not None and want not in dirs
     floor = min(hit['floor'] * 2, _APP_AUTH_TTL) if fruitless else _VERSION_MISS_REFRACTORY
-    _version_dir_cache[key] = {'dirs': dirs, 'expiry': now + _APP_AUTH_TTL, 'resolvedAt': now, 'floor': floor}
+    _version_dir_cache[key] = {
+        'dirs': dirs,
+        'expiry': now + _APP_AUTH_TTL,
+        'resolvedAt': now,
+        'floor': floor,
+        'appId': app_id,
+    }
     # Bounded like _app_auth_cache: expired first, then soonest-to-expire.
     if len(_version_dir_cache) > 4096:
         for k in [k for k, v in _version_dir_cache.items() if v['expiry'] <= now]:
@@ -511,6 +573,24 @@ async def _version_dirs_for(token: str, app_id: str, want: Optional[int] = None)
             for k in sorted(_version_dir_cache, key=lambda k: _version_dir_cache[k]['expiry'])[:overflow]:
                 _version_dir_cache.pop(k, None)
     return dirs
+
+
+def invalidate_app_serving(app_id: str) -> None:
+    """Drop every cached serving verdict for one app, across all callers.
+
+    Called on every APP deployment change (``broadcast_app_changed`` — build
+    stamps, publish/disable/remove, review transitions): the next request
+    for the app re-resolves instead of answering from a verdict the change
+    made stale. Without it a caller that asked for a version while it was
+    still building kept its escalated miss floor after the version became
+    servable, 404ing for up to the TTL (#2461); and a disable or revocation
+    waited out the hard expiry. In-process only, like the deploy events
+    that trigger it. The miss floor itself is untouched: nonexistent-
+    version probers still decay between changes.
+    """
+    for cache in (_version_dir_cache, _app_auth_cache):
+        for key in [k for k, entry in cache.items() if entry.get('appId') == app_id]:
+            cache.pop(key, None)
 
 
 async def _serve_versioned(request: Request, app_id: str, version: int, rest: list) -> Response:
@@ -540,7 +620,7 @@ async def _serve_versioned(request: Request, app_id: str, version: int, rest: li
     except Exception:
         raise HTTPException(status_code=404, detail='Not found')
     media_type = mimetypes.guess_type(rest[-1])[0] or 'application/octet-stream'
-    return Response(content=data, media_type=media_type, headers={'Cache-Control': _IMMUTABLE_CACHE})
+    return Response(content=data, media_type=media_type, headers={'Cache-Control': _BUNDLE_CACHE})
 
 
 async def apps_session(request: Request):

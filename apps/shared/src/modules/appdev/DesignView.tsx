@@ -490,6 +490,13 @@ const styles: Record<string, React.CSSProperties> = {
 		color: 'var(--rr-brand)',
 		fontWeight: 700,
 	},
+	// The watch target rendered as a link — clicking it launches the same
+	// external-browser debug session as the gear menu's Debug (F5) row.
+	devBadgeLink: {
+		color: 'var(--rr-color-secondary)',
+		textDecoration: 'underline',
+		cursor: 'pointer',
+	},
 	devBadgeOk: {
 		color: 'var(--rr-color-success)',
 	},
@@ -848,7 +855,19 @@ export const DesignView: React.FC<IDesignViewProps> = ({ host, previewPane, code
 							{watch && watch.state !== 'idle' && (
 								<>
 									<span style={styles.devBadgeBrand}>DEV</span>
-									{watch.target ? <span>&rarr; {watch.target}</span> : null}
+									{watch.target ? (
+										<span>
+											&rarr;{' '}
+											{caps.canDebug && host.debug ? (
+												<a
+													style={styles.devBadgeLink}
+													title="Launch the debug session (F5)"
+													onClick={(e) => { e.preventDefault(); host.debug?.(); }}
+													href="#"
+												>{watch.target}</a>
+											) : watch.target}
+										</span>
+									) : null}
 									<span style={watch.state === 'error' ? styles.devBadgeErr : styles.devBadgeOk}>
 										watch: {watch.state}
 										{watch.durationMs != null ? ` · ${(watch.durationMs / 1000).toFixed(1)}s` : ''}
@@ -877,7 +896,7 @@ export const DesignView: React.FC<IDesignViewProps> = ({ host, previewPane, code
 									>
 										<button
 											style={layout === l ? { ...styles.layoutBtn, ...styles.toolBtnOn } : styles.layoutBtn}
-											title={`${label} layout: ${selected.name} ${selected.width} x ${selected.height} — hover for resolutions`}
+											title={`${label} layout: ${selected.name} ${selected.width} x ${selected.height} (hover for resolutions)`}
 											onClick={() => setLayout(l)}
 										>{icon}</button>
 										{openMenu === l && (
@@ -916,7 +935,7 @@ export const DesignView: React.FC<IDesignViewProps> = ({ host, previewPane, code
 						<label
 							style={fitMode ? { ...styles.zoomControl, ...styles.ctlDisabled } : styles.zoomControl}
 							title={fitMode
-								? 'Zoom is driven by Fit — toggle Fit off to zoom manually.'
+								? 'Zoom is driven by Fit. Toggle Fit off to zoom manually.'
 								: 'Preview zoom: absolute scale, 100% = actual size. Drag the gray canvas to pan when zoomed in. Double-click the slider for 100%.'}
 						>
 							Zoom
@@ -951,7 +970,7 @@ export const DesignView: React.FC<IDesignViewProps> = ({ host, previewPane, code
 								...(fitMode ? styles.ctlDisabled : null),
 							}}
 							title={fitMode
-								? 'The hand tool is driven by Fit — toggle Fit off to pan.'
+								? 'The hand tool is driven by Fit. Toggle Fit off to pan.'
 								: 'Hand tool: drag anywhere on the preview to pan, even over the app. The app is not interactive while active.'}
 							disabled={fitMode}
 							onClick={() => setHandTool((h) => !h)}
@@ -1079,7 +1098,7 @@ export const DesignView: React.FC<IDesignViewProps> = ({ host, previewPane, code
 					<LogList
 						rows={logRows}
 						emptyTitle="No output yet"
-						emptyDescription="Everything lands here as the app runs — console.log / warn / error from the preview, runtime and build errors, and shell platform events."
+						emptyDescription="Everything lands here as the app runs: console.log / warn / error from the preview, runtime and build errors, and shell platform events."
 					/>
 				</div>
 			)}

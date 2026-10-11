@@ -308,7 +308,7 @@ Start a RocketRide pipeline. Returns the server response body; `token` is the ta
 
 - `pipeline?: PipelineConfig` — flat pipeline object (`components`, `source`, `project_id` at top level — do **not** wrap it in `{ pipeline: { ... } }`)
 - `filepath?: string` — path to a `.pipe` or JSON file (Node.js only); `{ "pipeline": { ... } }` wrappers are unwrapped automatically
-- `token?: string` — custom task token (auto-generated if not provided)
+- `token?: string` — custom task token (auto-generated if not provided). Pass a distinct token per instance to run the same pipeline more than once at a time; tokens share one namespace across users, so use an unguessable value that keeps the `tk_` prefix
 - `source?: string` — override the pipeline's source component
 - `threads?: number` — number of execution threads. **No client default** — when omitted, the server decides
 - `useExisting?: boolean` — reuse an existing pipeline instance
@@ -385,6 +385,8 @@ Return the **unresolved** pipeline configuration for a running task — `${ROCKE
 ### `validate(options): Promise<ValidationResult>`
 
 Validate a pipeline configuration without starting it — a pre-flight check before `use()`. Options: `pipeline` (required); `source?` override, resolved with the same logic as `use()` (explicit option → pipeline's `source` field → the single component whose `config.mode` is `'Source'`). Returns `{ errors, warnings, ... }`: a pipeline will not execute while it has `errors`; `warnings` are non-fatal.
+
+`pipeline` also accepts the single-component form `{ version, component }` — the shape a node editor sends when it validates one component on save. That payload is passed through unwrapped so the engine's single-component validator runs.
 
 ```typescript
 const result = await client.validate({ pipeline });
@@ -658,6 +660,7 @@ interface LogStreamRef {
 }
 ```
 
+- `client.log.streams({ projectId, source }): Promise<LogStreamsResult>` — every continuum of that source you may read (own dev, own `@me` deploy, each team deploy you can monitor), each tagged with `teamId`, `teamName`, `runKind`, `ownerKind` and carrying the chapters body.
 - `client.log.chapters(stream): Promise<LogChaptersResult>` — the whole timeline in one small read: per-run chapters (`beginTime`, `beginSeq`, `endTime`, `outcome`), segment activity spans, the retained window, the retention horizon (`horizonSeq`), and `completed` (false while a run is writing)
 - `client.log.read(stream, params?): Promise<LogReadResult>` — read a seq/time range of events, paged. Range forms: `fromSeq`/`toSeq`, `fromTime`/`toTime` (omit the upper bound for "to now"), or `fromTime` → `toSegment`. Optional `types` filters server-side (e.g. `['output']`); `maxEvents`/`maxBytes` bound the page. When the response carries `nextSeq`, pass it back as `cursor` to continue; `truncatedAtSeq` means the request reached below the retention horizon
 - `client.log.segment(stream, segment, params?): Promise<LogSegmentResult>` — one segment's raw JSONL bytes, chunked by byte offset (the bulk replay path). Every chunk ends on a line boundary, so each parses standalone; repeat with the returned `nextOffset` until `final`. The segment table (ids + time extents) comes from `chapters()`
@@ -853,13 +856,14 @@ Without the `ttl` the run would start at 08:00 and simply run until the pipeline
 
 The automation layer under the App Builder UI: the same scaffold, version rail, review flow, and audience bindings, scriptable. Scaffold a new app with `client.deploy.createApp(slug, { template, displayName, developerId, ... })` (Node.js) — the wizard's exact templates, written under `./apps/<slug>`, platform packages vendored from this client's own server, workspace install included. Deploy an app version with `client.deploy.addApp(appFolder, { comment, onProgress? })` (Node.js) — it packs the source exactly as the App Builder does (workspace-rooted layout, `appManifest.include` honored, gitignore + baseline filtering, the 50MB zipped / 512MB uncompressed caps) and ships it through the registry rail, narrating each step through `onProgress` when given; `client.deploy.add({ kind: 'app', data })` (section 9) remains the raw door when you packed the zip yourself. Pre-check everything first with `client.deploy.verifyApp(appFolder)` — a purely local dry run (no server call) returning `{ ok, checks: [{ id, ok, note }], fileCount, uncompressedBytes }` covering the manifest shape, id grammar, declared assets, include entries, and pack size. In CI the same ship is two commands: `rocketride app verify ./apps/reports && rocketride app deploy ./apps/reports --comment 'v1.4'` — both read the `ROCKETRIDE_DEPLOY_*` pair, and deploy refuses to run without a configured deployment target. The methods below manage the deployed versions. For building apps themselves, see ROCKETRIDE_APPS.md.
 
-- `listDeployments(appId): Promise<Array<{ registryVersion, appVersion, sha256, publishedAt, author, message, state, buildStatus, rungs }>>` — the app's version rail, newest first. The developer org sees its FULL rail (published or not); other callers see only versions serving on rows visible to them. `buildStatus: 'ok'` means servable bytes exist; `rungs` names the audiences serving each version
+- `listDeployments(appId): Promise<Array<{ registryVersion, appVersion, sha256, publishedAt, author, message, state, buildStatus, buildPhase, buildEndedAt?, rungs }>>` — the app's version rail, newest first. The developer org sees its FULL rail (published or not); other callers see only versions serving on rows visible to them. `buildStatus: 'ok'` means servable bytes exist; `buildPhase` is the build phase the version reached and `buildEndedAt` when its build finished (epoch seconds; `null` until it does); `rungs` names the audiences serving each version
 - `submitApp(appId, registryVersion): Promise<{ artifact }>` — submit a deployed version for store review: flips the deployment's state `'private'` → `'submit'` (it enters the review queue). Developer-org gated
 - `withdrawApp(appId, registryVersion): Promise<{ artifact }>` — the developer's own cancel: flips `'submit'` → `'private'` (leaves the review queue, back to draft; history records `'withdrawn'`). Only a version in `'submit'` withdraws
 - `replyApp(appId, message, registryVersion?): Promise<{ replied: boolean; appId: string }>` — append a developer message to the app's review thread. It rides the app's deployment history as a `'reply'` row (side `'developer'`), the same stream `client.deploy.history()` reads
 - `buildLog(appId, registryVersion): Promise<{ appId; version; log }>` — one version's durable server build log, the full phase-by-phase output. Long logs serve their tail; `''` means no log exists. Developer-org gated
 - `publishApp(appId, registryVersion, target): Promise<{ publish }>` — bind a deployment to an audience. First publish, update, promote, and rollback are all this one verb ("repoint, never rebuild"). `target` is `'@me'`, `'@team/<name-or-id>'`, or `'@public'`; `'@public'` requires the deployment be `'ready'` (approved), `'@me'`/`'@team'` accept any non-`'failed'` deployment
 - `removeAppPublish(appId, target): Promise<{ publish }>` — remove an audience binding (the app stops serving there). SOFT: registry versions and audit history survive; publishing again revives it
+- `disableAppPublish(appId, target): Promise<{ publish }>` — disable an audience binding: serving stops, but the row STAYS in the where-live listing marked `'disabled'` (a visible off switch), unlike remove which hides it. Publishing any version to that audience re-enables it
 - `whereApp(appId): Promise<Array<{ rung, handle, version, appVersion, state, deployedAt? }>>` — the reverse index: which audiences serve which version
 
 ```typescript
@@ -940,7 +944,7 @@ Typed wrapper for subscriptions, Stripe checkout, credit wallets, and usage.
 
 Direct SQL/Cypher execution against a database pipeline node, bypassing the LLM translation layer that `chat()` uses (and its safety checks — you own the statements you send).
 
-- `query(options): Promise<{ rows: Record<string, unknown>[]; affected_rows: number }>` (`rows: unknown[][]` when `rowMode: 'array'`) — execute a raw SQL or Cypher statement. Options: `token` and `sql` (required, non-empty); `nodeId?` (empty broadcasts to all tool-lane nodes — the first database node handles it); `sessionId?` (run within a transaction session); `params?: unknown[]` (positional parameters, e.g. `[1, 'foo']` for `$1`, `$2` placeholders); `rowMode?: 'object' | 'array'` (`'array'` returns positional `unknown[][]` rows, which is what ORM drivers need — duplicate column names in joins survive)
+- `query(options): Promise<{ rows: Record<string, unknown>[]; affected_rows: number }>` (`rows: unknown[][]` when `rowMode: 'array'`) — execute a raw SQL or Cypher statement. Options: `token` and `sql` (required, non-empty); `nodeId?` (empty broadcasts to all tool-lane nodes — the first database node handles it); `sessionId?` (run within a transaction session); `params?: unknown[] | Record<string, unknown>` (an array of positional parameters for SQL nodes, e.g. `[1, 'foo']` for `$1`, `$2`; an object keyed by placeholder name for the built-in `rocketride_graph` node, e.g. `{ rows: [...] }` for `UNWIND $rows` (`graph_neo4j` / `graph_falkordb` reject params) — bound values need no escaping and do not count toward the graph node's query-length limit); `rowMode?: 'object' | 'array'` (`'array'` returns positional `unknown[][]` rows, which is what ORM drivers need — duplicate column names in joins survive)
 - `beginTransaction(options: { token: string; nodeId?: string }): Promise<{ session_id: string }>` — begin a transaction; thread the returned `session_id` through subsequent `query`/`commit`/`rollback` calls
 - `commit(options: { token: string; sessionId: string; nodeId?: string }): Promise<{ ok: boolean }>` / `rollback(...)` — same shape
 - `dialect(options: { token: string; nodeId?: string }): Promise<DatabaseDialect>` — discover the underlying engine (`DatabaseDialect.POSTGRES | MYSQL | NEO4J`); branch on SQL syntax differences or detect a graph DB
@@ -989,6 +993,16 @@ try {
 	await client.database.rollback({ token, sessionId: session_id });
 	throw err;
 }
+```
+
+**Graph bulk upsert** (`rocketride_graph`, see Pattern 14 in ROCKETRIDE_PIPELINES.md) — named
+params, and MERGE then a separate `MATCH ... SET`:
+
+```typescript
+const rows = [{ id: 1, name: 'a' }, { id: 2, name: 'b' }];
+const graph = { token, nodeId: 'rocketride_graph_1' };
+await client.database.query({ ...graph, sql: 'UNWIND $rows AS row MERGE (:Item {id: row.id})', params: { rows } });
+await client.database.query({ ...graph, sql: 'UNWIND $rows AS row MATCH (n:Item {id: row.id}) SET n.name = row.name', params: { rows } });
 ```
 
 Pin `nodeId` on every call of a transaction when the pipeline has more than one database node — broadcasts may land on different nodes.
@@ -1148,11 +1162,15 @@ const tree = await client.cprofileReportTree(token);    // call tree
 - `cprofileStatus(target?)` — active/inactive, owner, runtime.
 - `cprofileReport(target?)` — the full pstats text report of the last
   completed session.
-- `cprofileReportTree(target?, maxDepth?, minPct?, includeSystem?)` — the
-  call tree (defaults: depth 50, 0.1% cumtime threshold) with `total_time`
-  and `total_calls`; raise `minPct` or lower `maxDepth` to shrink it. Read
-  it top-down: the widest cumulative-time branch under the run loop is the
-  slow pipeline component.
+- `cprofileReportTree(target?, maxDepth?, minPct?, includeSystem?, thread?)` —
+  the call tree (defaults: depth 50, 0.1% cumtime threshold) with
+  `total_time` and `total_calls`; raise `minPct` or lower `maxDepth` to
+  shrink it. Read it top-down: the widest cumulative-time branch under the
+  run loop is the slow pipeline component. Pass `thread` to get one thread's
+  tree instead of all threads merged.
+- `cprofileThreads(target?)` — the threads of the last session, busiest
+  first: `id` (the `thread` to pass above), `name`, system thread id `tid`, `ttot`,
+  `functions` and `calls`. Names are not unique; `tid` is.
 
 ## 18. Exceptions
 

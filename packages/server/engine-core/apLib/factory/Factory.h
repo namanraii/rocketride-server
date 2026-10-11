@@ -87,9 +87,20 @@ public:
     template <typename T>
     using DetectLogLevel = std::is_enum<decltype(T::LogLevel)>;
 
-    static ErrorOr<FACTORY> findFactory(iTextView type,
-                                        iTextView name) noexcept;
-    static Names getFactories(iTextView type) noexcept;
+    static ROCKETRIDE_CORE_API ErrorOr<FACTORY> findFactory(
+        iTextView type, iTextView name) noexcept;
+    static ROCKETRIDE_CORE_API Names getFactories(iTextView type) noexcept;
+
+    // Declare a node module, mapped when its name is first looked up
+    static ROCKETRIDE_CORE_API Error registerNode(
+        iTextView name, const file::Path &libPath) noexcept;
+
+    // Run every loaded node's deinitializeNode, while they are still mapped
+    static ROCKETRIDE_CORE_API void unloadNodes() noexcept;
+
+    // Whether this process can host node modules, cleared by a host that
+    // linked engLib statically and would load a second engine with a node
+    static ROCKETRIDE_CORE_API bool &nodeModulesSupported() noexcept;
 
     // Define the sorter for factories
     struct Sorter {
@@ -172,58 +183,50 @@ public:
     static ErrorOr<Ptr<T>> find(Location location, uint32_t requiredFlags,
                                 TextView name, Args &&...args) noexcept;
 
-    // Accessor for the global factory set
-    static Set &factories() noexcept {
-        static Set factorySet;
-        return factorySet;
-    }
-
     // Register a factory in the factory set
     template <typename... Args>
     static Error registerFactory(Args &&...args) noexcept {
-        auto registerEntry = [&](const FACTORY &factory) {
-            auto expansions = expand(factory);
-            if (expansions.empty())
-                return APERRL(Error, Ec::InvalidParam, "Invalid factory",
-                              factory);
-
-            for (auto &expanded : expand(factory)) {
-                auto [iter, inserted] = factories().insert(expanded);
-                if (!inserted)
-                    return APERRL(Error, Ec::InvalidParam,
-                                  "Factory already registered", factory);
-                LOG(Factory, "Register", expanded);
-            }
-
-            return Error{};
-        };
-
         // Use error's || operator here, through the fold expression, will
         // call all factory registrations but return the first error
-        return (registerEntry(args) || ...);
+        return (registerFactoryEntry(args) || ...);
     }
 
     // De-register a factory
     template <typename... Args>
     static void deregisterFactory(const Args &...args) noexcept {
-        auto deregisterEntry = [&](const FACTORY &arg) {
-            for (auto &expanded : expand(arg))
-                Factory::factories().erase(expanded);
-        };
-        (deregisterEntry(args), ...);
+        (deregisterFactoryEntry(args), ...);
     }
 
 private:
-    static std::vector<FACTORY> expand(const FACTORY &factory) noexcept {
-        std::vector<FACTORY> result;
-        auto fields = string::view::tokenizeArray<10>(factory.name, ',');
-        for (auto &&name : fields) {
-            if (!name) break;
-            result.push_back(
-                {factory.type, name, factory.flags, factory.method});
-        }
-        return result;
-    }
+    // Shared mutable state, safe only under the locks Factory.cpp holds.
+    // The entry points stay exported: a node instantiates the templates
+    // above and links them out of engineMod
+    static Set &factories() noexcept;
+
+    // A declared node module, and what we need to unload it again
+    struct NODE {
+        file::Path libPath;
+        RocketrideNodeDeinit deinit = nullptr;
+
+        // Set either way, so a node that cannot load is not retried
+        bool loadAttempted = false;
+    };
+    using Nodes = std::map<iText, NODE>;
+
+    static Nodes &nodes() noexcept;
+
+    // Maps the node module declaring a factory name, on a lookup miss. The
+    // caller re-reads the registry either way - a racing thread may have
+    // mapped it first
+    static void loadNode(iTextView name) noexcept;
+
+    // Register/de-register a single factory
+    static ROCKETRIDE_CORE_API Error
+    registerFactoryEntry(const FACTORY &factory) noexcept;
+    static ROCKETRIDE_CORE_API void deregisterFactoryEntry(
+        const FACTORY &factory) noexcept;
+
+    static std::vector<FACTORY> expand(const FACTORY &factory) noexcept;
 #if defined(ROCKETRIDE_FACTORY_DEBUG)
     // Declare our instance structure, it contains callbacks to render
     // the type information and live string conversion for live stats

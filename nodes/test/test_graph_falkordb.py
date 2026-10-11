@@ -432,6 +432,24 @@ def test_execute_tool_is_disabled_unless_allowed():
         inst.execute({'query': 'CREATE (n:Person)'})
 
 
+@pytest.mark.parametrize(
+    'args',
+    [
+        {'query': 'CREATE (n:Person)', 'session_id': 'tx-1'},
+        {'sql': 'CREATE (n:Person)', 'row_mode': 'array'},
+        {'query': 'CREATE (n:Person {name: $n})', 'params': {'n': 'Ada'}},
+        {'query': 'CREATE (n:Person)', 'params': ['Ada']},
+        {'query': ''},
+    ],
+)
+def test_execute_tool_reports_disabled_before_argument_errors(args):
+    # A disabled node answers "disabled", not which argument is wrong.
+    graph = _FakeGraph()
+    with pytest.raises(ValueError, match='allow_execute'):
+        _instance(_FakeGlobal(graph)).execute(args)
+    assert graph.calls == []
+
+
 def test_execute_tool_runs_writes_when_allowed():
     graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=1))
     glb = _FakeGlobal(graph)
@@ -439,6 +457,81 @@ def test_execute_tool_runs_writes_when_allowed():
     out = _instance(glb).execute({'query': 'CREATE (n:Person)'})
     assert graph.calls[0][0] == 'query'
     assert out['affected_rows'] == 1
+
+
+def test_execute_tool_accepts_sql_key_from_database_query():
+    # client.database.query sends the statement as 'sql', not 'query'.
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    out = _instance(glb).execute({'sql': 'CREATE (n:Person)'})
+    assert graph.calls[0][0] == 'query'
+    assert out['affected_rows'] == 1
+
+
+@pytest.mark.parametrize('params', [None, {}, []])
+def test_execute_tool_treats_empty_params_as_none(params):
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    out = _instance(glb).execute({'query': 'CREATE (n:Person)', 'params': params})
+    assert out['affected_rows'] == 1
+
+
+def test_execute_tool_refuses_params_the_driver_cannot_bind():
+    # FalkorDB's _run_query_raw takes no params: refuse rather than drop them.
+    glb = _FakeGlobal(_FakeGraph())
+    glb.allow_execute = True
+    with pytest.raises(ValueError, match='not supported'):
+        _instance(glb).execute({'query': 'CREATE (n:Person {name: $n})', 'params': {'n': 'Ada'}})
+
+
+@pytest.mark.parametrize('params', [0, False, '', 'rows', 42])
+def test_execute_tool_refuses_non_object_params(params):
+    glb = _FakeGlobal(_FakeGraph())
+    glb.allow_execute = True
+    with pytest.raises(ValueError, match='keyed by placeholder name'):
+        _instance(glb).execute({'query': 'CREATE (n:Person)', 'params': params})
+
+
+@pytest.mark.parametrize(
+    ('extra', 'message'),
+    [
+        ({'session_id': 'tx-1'}, 'no transactions'),
+        ({'row_mode': 'array'}, "must be 'object'"),
+    ],
+)
+def test_execute_tool_refuses_sql_only_options(extra, message):
+    # client.database.query forwards these SQL-node options; graph nodes have
+    # no transactions and always return row objects.
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    with pytest.raises(ValueError, match=message):
+        _instance(glb).execute({'sql': 'CREATE (n:Person)', **extra})
+    assert graph.calls == []
+
+
+def test_execute_tool_accepts_object_row_mode():
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    out = _instance(glb).execute({'sql': 'CREATE (n:Person)', 'row_mode': 'object', 'session_id': ''})
+    assert out['affected_rows'] == 1
+
+
+def test_execute_schema_lists_params_only_when_supported():
+    glb = _FakeGlobal(_FakeGraph())
+    assert 'params' not in _instance(glb)._execute_input_schema()['properties']
+    glb.supports_execute_params = True
+    assert 'params' in _instance(glb)._execute_input_schema()['properties']
+
+
+def test_execute_tool_refuses_positional_params():
+    glb = _FakeGlobal(_FakeGraph())
+    glb.allow_execute = True
+    with pytest.raises(ValueError, match='keyed by placeholder name'):
+        _instance(glb).execute({'query': 'CREATE (n:Person {name: $1})', 'params': ['Ada']})
 
 
 def test_validate_query_uses_explain():
@@ -669,6 +762,40 @@ def recording_client(monkeypatch):
     return _RecordingFalkorDB
 
 
+class _GraphListingFalkorDB:
+    """Fake client exposing only list_graphs(), for the #2155 graph-existence checks.
+
+    ``graphs_to_list`` is class-level (mirroring _RecordingFalkorDB's last_kwargs/
+    last_url) so a test can set it before either constructor path runs.
+    """
+
+    graphs_to_list: list = ['agent']
+    raise_on_list: Exception | None = None
+
+    def __init__(self, **kwargs):
+        pass
+
+    @classmethod
+    def from_url(cls, url, **kwargs):
+        return cls()
+
+    def list_graphs(self):
+        if type(self).raise_on_list is not None:
+            raise type(self).raise_on_list
+        return type(self).graphs_to_list
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def graph_listing_client(monkeypatch):
+    monkeypatch.setattr(_glb_mod, 'FalkorDB', _GraphListingFalkorDB)
+    _GraphListingFalkorDB.graphs_to_list = ['agent']
+    _GraphListingFalkorDB.raise_on_list = None
+    return _GraphListingFalkorDB
+
+
 def test_manual_profile_connects_with_host_and_port(recording_client):
     """The pre-existing profile must keep building the client from host/port."""
     _glb_mod.IGlobal._connect(
@@ -786,6 +913,103 @@ def test_probe_reports_missing_host_on_manual_profile(monkeypatch):
     _FakeGlobal(_FakeGraph())._probe_connection({'mode': 'manual', 'host': ''})
 
     assert messages == ['host is required']
+
+
+# ---------------------------------------------------------------------------
+# #2155: a read-only node silently fell back to querying the unrelated
+# default graph "agent" instead of the one actually configured, surfacing a
+# cryptic "ERR Invalid graph operation on empty key" only on the first
+# query. _open_driver now fails fast, and _probe_connection warns at save
+# time, when the configured graph does not exist -- unless a write path is
+# enabled, since FalkorDB creates a graph lazily on its first write.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_graph_name_falls_back_on_absent_empty_or_blank():
+    assert _glb_mod._resolve_graph_name({}) == 'agent'
+    assert _glb_mod._resolve_graph_name({'graph': ''}) == 'agent'
+    assert _glb_mod._resolve_graph_name({'graph': '   '}) == 'agent'
+    assert _glb_mod._resolve_graph_name({'graph': 'changeimpact'}) == 'changeimpact'
+
+
+def test_open_driver_raises_when_the_configured_graph_is_missing(graph_listing_client):
+    graph_listing_client.graphs_to_list = ['other-graph']
+    glb = _FakeGlobal(_FakeGraph())
+
+    with pytest.raises(Exception, match='FalkorDB graph "agent" does not exist.*other-graph'):
+        glb._open_driver({'mode': 'manual', 'host': 'localhost', 'graph': 'agent'})
+
+
+def test_open_driver_succeeds_when_the_configured_graph_exists(graph_listing_client):
+    graph_listing_client.graphs_to_list = ['changeimpact', 'other']
+    glb = _FakeGlobal(_FakeGraph())
+
+    glb._open_driver({'mode': 'manual', 'host': 'localhost', 'graph': 'changeimpact'})
+
+    assert glb.graph_name == 'changeimpact'
+
+
+@pytest.mark.parametrize('flag', ['allow_writes', 'allow_execute'])
+def test_open_driver_skips_the_graph_check_when_a_write_path_is_enabled(graph_listing_client, flag):
+    """FalkorDB creates a graph lazily on its first write, so a write-capable
+    node may legitimately target one that does not exist yet.
+    """
+    graph_listing_client.graphs_to_list = []  # nothing exists yet
+    glb = _FakeGlobal(_FakeGraph())
+
+    glb._open_driver({'mode': 'manual', 'host': 'localhost', 'graph': 'brand-new', flag: True})
+
+    assert glb.graph_name == 'brand-new'  # did not raise
+
+
+def test_probe_warns_when_the_configured_graph_is_missing(monkeypatch, graph_listing_client):
+    graph_listing_client.graphs_to_list = ['changeimpact']
+    messages = []
+    monkeypatch.setattr(_glb_mod, 'warning', messages.append)
+
+    _FakeGlobal(_FakeGraph())._probe_connection({'mode': 'manual', 'host': 'localhost', 'graph': 'agent'})
+
+    assert len(messages) == 1
+    assert 'FalkorDB graph "agent" was not found' in messages[0]
+    assert 'changeimpact' in messages[0]
+
+
+def test_probe_is_silent_about_the_graph_when_it_already_exists(monkeypatch, graph_listing_client):
+    graph_listing_client.graphs_to_list = ['agent']
+    messages = []
+    monkeypatch.setattr(_glb_mod, 'warning', messages.append)
+
+    _FakeGlobal(_FakeGraph())._probe_connection({'mode': 'manual', 'host': 'localhost', 'graph': 'agent'})
+
+    assert messages == []
+
+
+@pytest.mark.parametrize('flag', ['allow_writes', 'allow_execute'])
+def test_probe_does_not_warn_about_a_missing_graph_when_a_write_path_is_enabled(
+    monkeypatch, graph_listing_client, flag
+):
+    graph_listing_client.graphs_to_list = []
+    messages = []
+    monkeypatch.setattr(_glb_mod, 'warning', messages.append)
+
+    _FakeGlobal(_FakeGraph())._probe_connection(
+        {'mode': 'manual', 'host': 'localhost', 'graph': 'brand-new', flag: True}
+    )
+
+    assert messages == []
+
+
+def test_probe_still_reports_a_connection_failure_when_a_write_path_is_enabled(monkeypatch, graph_listing_client):
+    """The write-capable early-out skips only the graph-existence check --
+    a real connection failure must still be reported either way.
+    """
+    graph_listing_client.raise_on_list = _StubRedisError('connection refused')
+    messages = []
+    monkeypatch.setattr(_glb_mod, 'warning', messages.append)
+
+    _FakeGlobal(_FakeGraph())._probe_connection({'mode': 'manual', 'host': 'localhost', 'allow_writes': True})
+
+    assert any('Could not connect to FalkorDB' in m for m in messages)
 
 
 def test_reflect_schema_failure_does_not_break_begin(monkeypatch):

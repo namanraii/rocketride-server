@@ -53,7 +53,7 @@ function(rocketride_set_common_target_options target)
         set(TARGET_DEBUG_FILE ${TARGET_FILE_DIR}/${TARGET_NAME}.debug)
         get_target_property(target_type ${target} TYPE)
 
-        if(target_type STREQUAL "EXECUTABLE")
+        if(target_type STREQUAL "EXECUTABLE" OR target_type STREQUAL "SHARED_LIBRARY")
             # On *nix break out the debug info so we can store it separate from the release binary
             if("${CMAKE_BUILD_TYPE}" MATCHES "Release" OR "${CMAKE_BUILD_TYPE}" MATCHES "Sanitize")
                 if(ROCKETRIDE_PLAT_LIN)
@@ -151,10 +151,10 @@ function(rocketride_add_executable targetName)
 
     rocketride_set_common_target_options(${targetName})
 
-    if (ROCKETRIDE_CMAKE_KIST)
+    if (ROCKETRIDE_CMAKE_KITS)
         add_custom_command(TARGET ${targetName} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${ROCKETRIDE_PROJECT_ROOT}/dist/server"
-            COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:${targetName}> "${ROCKETRIDE_PROJECT_ROOT}/dist/server/"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${ROCKETRIDE_DIST_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:${targetName}> "${ROCKETRIDE_DIST_DIR}/"
             COMMENT "Copying ${targetName} binary to dist/server directory")
     endif()
 endfunction()

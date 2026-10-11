@@ -24,6 +24,7 @@ Two methods are already exercised by separate, security-focused tests:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import sys
@@ -33,7 +34,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from ai.constants import CONST_STATUS_HISTORY_LIMIT
-from ai.modules.task.task_engine import CONST_TRACE_PAYLOAD_CAP, CONST_TRACE_PREVIEW_BYTES, Task, cap_trace_payload
+from ai.modules.task.task_engine import (
+    CONST_TRACE_PAYLOAD_CAP,
+    CONST_TRACE_PREVIEW_BYTES,
+    Task,
+    cap_trace_payload,
+    filter_subprocess_env,
+    saas_pipeline_violation,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -886,14 +894,175 @@ async def test_subprocess_env_stale_dsn_does_not_survive_broker_failure(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_subprocess_env_unconfigured_account_is_nonfatal(monkeypatch):
+async def test_subprocess_env_unconfigured_account_reports_missing_cloud_db(monkeypatch):
+    """No broker on this engine (#2463): still non-fatal, but the node gets a
+    reason that names the missing cloud database, so it does not fall back to
+    the ROCKETRIDE_CLIENT_ID message nothing documents.
+    """
+
     async def fake_resolve(client_id):
-        raise NotImplementedError('sign in')
+        raise NotImplementedError('no RocketRide cloud database is configured on this server')
 
     _patch_resolve(monkeypatch, fake_resolve)
-    env = await Task._build_subprocess_env(_env_task(pipeline=_DB_PIPELINE))
+    monkeypatch.setattr('ai.modules.task.task_engine._is_saas_engine', lambda: False)
+    warn = MagicMock()
+    monkeypatch.setattr('ai.modules.task.task_engine.warning', warn)
+    t = _env_task(pipeline=_DB_PIPELINE)
+    env = await Task._build_subprocess_env(t)
     assert 'ROCKETRIDE_DB_DSN' not in env
-    assert 'ROCKETRIDE_DB_RESOLVE_ERROR' not in env
+    assert env['ROCKETRIDE_DB_RESOLVE_ERROR'] == Task._NO_CLOUD_DB_REASON
+    assert 'this server has no RocketRide cloud database' in env['ROCKETRIDE_DB_RESOLVE_ERROR']
+    assert 'ROCKETRIDE_CLIENT_ID' not in env['ROCKETRIDE_DB_RESOLVE_ERROR']
+    # Missing broker config is normal on a local engine: debug only.
+    t.debug_message.assert_called_once()
+    assert 'no database broker' in t.debug_message.call_args.args[0]
+    warn.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('hosted_signal', ['flag', 'capability'])
+async def test_subprocess_env_hosted_missing_broker_warns_and_directs_to_operator(monkeypatch, hosted_signal):
+    import ai.account
+    import ai.modules.task.task_engine as engine
+
+    async def fake_resolve(client_id):
+        raise NotImplementedError('broker not configured')
+
+    _patch_resolve(monkeypatch, fake_resolve)
+    monkeypatch.setattr(engine, 'startup_args', lambda: ['--saas'] if hosted_signal == 'flag' else [])
+    monkeypatch.setattr(ai.account.account, 'capabilities', ['saas'] if hosted_signal == 'capability' else [])
+    warn = MagicMock()
+    monkeypatch.setattr(engine, 'warning', warn)
+    monkeypatch.setenv('ROCKETRIDE_DB_DSN', 'postgresql://stale@parent/other-tenant')
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_URL', 'https://broker.example/provision')
+    monkeypatch.setenv('ROCKETRIDE_DB_BROKER_TOKEN', 'secret-test-token')
+    t = _env_task(pipeline=_DB_PIPELINE)
+    env = await Task._build_subprocess_env(t)
+    reason = env['ROCKETRIDE_DB_RESOLVE_ERROR']
+    assert reason == Task._CLOUD_DB_CONFIG_ERROR_REASON
+    assert 'Contact the server operator' in reason
+    assert 'db_postgres' not in reason
+    for name in ('ROCKETRIDE_DB_DSN', 'ROCKETRIDE_DB_BROKER_URL', 'ROCKETRIDE_DB_BROKER_TOKEN'):
+        assert name not in env
+    warn.assert_called_once_with(f'RocketRide DB DSN not resolved: {reason}')
+    t.debug_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# filter_subprocess_env — the child inherits an allowlist, never the whole env
+# ---------------------------------------------------------------------------
+
+
+def test_filter_subprocess_env_is_an_allowlist():
+    """Engine-tier configuration never reaches pipeline code: only the runtime
+    baseline, the ROCKETRIDE_* namespace, the services the child reaches
+    itself (store, fetch URLs, OAuth broker) and README-documented node
+    fallbacks pass.
+    """
+    env = filter_subprocess_env(
+        {
+            'PATH': '/usr/bin',
+            'HOME': '/home/rocketride',
+            'http_proxy': 'http://proxy:3128',
+            'PYTHONPATH': '/opt/rocketride/ai',
+            'HF_HOME': '/cache/hf',
+            'ROCKETRIDE_OPENAI_KEY': 'sk-pipe',
+            'RR_STORE_URL': 's3://bucket',
+            'RR_STORE_SECRET_KEY': 'store',
+            'RR_BASE_URL': 'https://engine.example',
+            'RR_SIGNING_KEY': 'sign',
+            'RR_OAUTH_BROKER_URL': 'https://broker.example',
+            'RR_PROC_PRIVATE': '1',
+            'AWS_ROLE_ARN': 'arn:aws:iam::1:role/engine',
+            'MEDIA_TOOLKIT_FFMPEG': '/opt/ffmpeg',
+            'NOTION_API_KEY': 'notion',
+            # engine-only: deployment credentials and server-side settings
+            'RR_DB_URL': 'postgresql://platform',
+            'RR_MASTER_KEY': 'fernet',
+            'RR_IDP_SERVICE_TOKEN': 'jwt',
+            'RR_APP_URL': 'https://app.example',
+            'ENGINE_API_KEY': 'engine',
+            'DATABASE_URL': 'postgresql://other',
+            'SLACK_BOT_TOKEN': 'xoxb',
+        }
+    )
+    assert env == {
+        'PATH': '/usr/bin',
+        'HOME': '/home/rocketride',
+        'http_proxy': 'http://proxy:3128',
+        'PYTHONPATH': '/opt/rocketride/ai',
+        'HF_HOME': '/cache/hf',
+        'ROCKETRIDE_OPENAI_KEY': 'sk-pipe',
+        'RR_STORE_URL': 's3://bucket',
+        'RR_STORE_SECRET_KEY': 'store',
+        'RR_BASE_URL': 'https://engine.example',
+        'RR_SIGNING_KEY': 'sign',
+        'RR_OAUTH_BROKER_URL': 'https://broker.example',
+        'RR_PROC_PRIVATE': '1',  # tasks must see the opt-in to act on it
+        'AWS_ROLE_ARN': 'arn:aws:iam::1:role/engine',
+        'MEDIA_TOOLKIT_FFMPEG': '/opt/ffmpeg',
+        'NOTION_API_KEY': 'notion',
+    }
+
+
+def test_filter_subprocess_env_opt_in_names_and_prefixes():
+    """RR_SUBPROCESS_ENV adds exact names and '*'-suffixed prefixes, separated
+    by commas or spaces. The knob itself is operator-tier (RR_*) and is not
+    handed to the child.
+    """
+    env = filter_subprocess_env(
+        {
+            'RR_SUBPROCESS_ENV': 'SLACK_BOT_TOKEN, gh_*',
+            'SLACK_BOT_TOKEN': 'xoxb',
+            'GH_TOKEN': 'ghp',
+            'GH_HOST': 'github.example',
+            'RR_MASTER_KEY': 'fernet',
+        }
+    )
+    assert env == {
+        'SLACK_BOT_TOKEN': 'xoxb',
+        'GH_TOKEN': 'ghp',
+        'GH_HOST': 'github.example',
+    }
+
+
+def test_filter_subprocess_env_ignores_caller_writable_opt_in():
+    """ROCKETRIDE_* is writable by any authenticated client (account set_env),
+    so an opt-in spelled there must have no effect.
+    """
+    env = filter_subprocess_env({'ROCKETRIDE_SUBPROCESS_ENV': '*', 'RR_MASTER_KEY': 'fernet', 'PATH': '/usr/bin'})
+    assert env == {'ROCKETRIDE_SUBPROCESS_ENV': '*', 'PATH': '/usr/bin'}
+
+
+def test_filter_subprocess_env_star_passes_everything():
+    """A bare '*' is the explicit opt-out back to full inheritance."""
+    src = {'RR_SUBPROCESS_ENV': '*', 'RR_MASTER_KEY': 'fernet', 'PATH': '/usr/bin'}
+    assert filter_subprocess_env(src) == src
+
+
+def test_filter_subprocess_env_matches_names_case_insensitively():
+    """Windows env names are case-insensitive; the child sees the original spelling."""
+    env = filter_subprocess_env({'Path': 'C:\\Windows', 'SystemRoot': 'C:\\Windows', 'Rr_Master_Key': 'fernet'})
+    assert env == {'Path': 'C:\\Windows', 'SystemRoot': 'C:\\Windows'}
+
+
+@pytest.mark.asyncio
+async def test_subprocess_env_drops_engine_credentials(monkeypatch):
+    """The built env is the allowlisted view of os.environ: deployment
+    credentials stay in the engine, the pipeline namespace comes through.
+    """
+    monkeypatch.setenv('RR_MASTER_KEY', 'fernet')
+    monkeypatch.setenv('RR_DB_URL', 'postgresql://platform')
+    monkeypatch.setenv('ROCKETRIDE_OPENAI_KEY', 'sk-pipe')
+    monkeypatch.setenv('PATH', '/usr/bin')
+    monkeypatch.delenv('RR_SUBPROCESS_ENV', raising=False)
+
+    env = await Task._build_subprocess_env(_env_task())  # no DB nodes
+
+    assert 'RR_MASTER_KEY' not in env
+    assert 'RR_DB_URL' not in env
+    assert env['ROCKETRIDE_OPENAI_KEY'] == 'sk-pipe'
+    assert env['PATH'] == '/usr/bin'
 
 
 # ---------------------------------------------------------------------------
@@ -1359,3 +1528,187 @@ async def test_an_absent_trace_level_still_emits_nothing(level):
     await Task.on_event(t, dict(_TRACE_MESSAGE))
 
     t._forward_task_event.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# saas_pipeline_violation — what a hosted engine refuses to launch
+# ---------------------------------------------------------------------------
+
+_SERVICES = {
+    'mcp_client': {'capabilities': ['invoke'], 'path': 'nodes.tool_mcp_client'},
+    'tool_butterbase': {'capabilities': ['invoke'], 'path': 'nodes.tool_mcp_client'},
+    'filesys': {'capabilities': ['filesystem', 'noremote', 'security', 'nosaas'], 'path': 'nodes.filesys'},
+    'llm_openai': {'capabilities': ['invoke'], 'path': 'nodes.llm_openai'},
+}
+_DEFAULT_TRANSPORT = {'mcp_client': 'stdio', 'tool_butterbase': 'streamable-http'}
+
+
+def _get_service(provider):
+    """Stand-in for rocketlib.getServiceDefinition, which is case-insensitive."""
+    return _SERVICES.get(provider.lower())
+
+
+def _mcp_node_config(provider, config):
+    """Stand-in for Config.getNodeConfig: profile defaults under the component config."""
+    profiles = {
+        'default': {'transport': _DEFAULT_TRANSPORT[provider.lower()]},
+        'RocketRide': {'transport': 'stdio'},
+        'sse': {'transport': 'sse'},
+    }
+    profile = config.get('profile', 'default')
+    if profile not in profiles:
+        raise Exception(f'Profile {profile} is not defined in {provider}')
+    return {**profiles[profile], **{k: v for k, v in config.items() if k != 'profile'}}
+
+
+def _violation(*components):
+    return saas_pipeline_violation({'components': list(components)}, _get_service, _mcp_node_config)
+
+
+def test_saas_gate_allows_ordinary_nodes_and_http_mcp():
+    assert _violation({'id': 'a', 'provider': 'llm_openai'}) is None
+    assert _violation({'id': 'm', 'provider': 'mcp_client', 'config': {'transport': 'streamable-http'}}) is None
+    assert _violation({'id': 'm', 'provider': 'mcp_client', 'config': {'profile': 'sse'}}) is None
+    assert _violation({'id': 'b', 'provider': 'tool_butterbase', 'config': {}}) is None  # HTTP by default
+
+
+def test_saas_gate_refuses_nosaas_nodes():
+    assert 'not available on RocketRide Cloud' in _violation({'id': 'f', 'provider': 'filesys'})
+
+
+@pytest.mark.parametrize(
+    'config',
+    [
+        {},  # default profile is stdio
+        {'profile': 'RocketRide'},
+        {'transport': 'stdio'},
+        {'transport': 'STDIO '},
+        {'profile': 'sse', 'transport': 'stdio'},  # component value wins over the profile
+        {'profile': 'nope'},  # unresolvable -> refused
+    ],
+)
+def test_saas_gate_refuses_stdio_mcp(config):
+    problem = _violation(
+        {'id': 'm', 'provider': 'llm_openai'}, {'id': 'm2', 'provider': 'mcp_client', 'config': config}
+    )
+    assert problem and 'stdio MCP transport' in problem
+
+
+@pytest.mark.parametrize(
+    'component',
+    [
+        # another service built on the MCP client node, switched to stdio
+        {'id': 'b', 'provider': 'tool_butterbase', 'config': {'transport': 'stdio', 'commandLine': 'x'}},
+        # provider lookup is case-insensitive, so this is the MCP client with its stdio default
+        {'id': 'c', 'provider': 'MCP_Client', 'config': {}},
+    ],
+)
+def test_saas_gate_matches_the_node_not_the_provider_name(component):
+    problem = _violation(component)
+    assert problem and 'stdio MCP transport' in problem
+
+
+# ---------------------------------------------------------------------------
+# Exit code when the task sends no >EXIT event
+# ---------------------------------------------------------------------------
+
+
+def _exit_task(exit_event_seen=False):
+    from rocketride import TASK_STATUS
+
+    t = _task(status=TASK_STATUS())  # a first run: exitCode starts at 0
+    t._exit_event_seen = exit_event_seen
+    t._stop_requested = False
+    return t
+
+
+def test_process_exit_code_used_when_no_exit_event():
+    """A task that exits before it can report (a refusal) is not recorded as exit 0."""
+    t = _exit_task()
+    Task._apply_process_exit_code(t, 1)
+    assert t._status.exitCode == 1
+    assert t._status.exitMessage == 'Stopped'
+
+
+def test_exit_event_wins_over_process_exit_code():
+    t = _exit_task(exit_event_seen=True)
+    t._status.exitMessage = 'Completed'
+    Task._apply_process_exit_code(t, 1)
+    assert (t._status.exitCode, t._status.exitMessage) == (0, 'Completed')
+
+
+def test_requested_stop_keeps_its_exit_code():
+    """The kill signal of a user stop is not a task failure (no dashboard task_error)."""
+    t = _exit_task()
+    t._stop_requested = True
+    Task._apply_process_exit_code(t, -9)
+    assert t._status.exitCode == 0
+
+
+def test_unknown_process_exit_code_is_not_success():
+    """The process did not exit in time: that is not a completed task."""
+    t = _exit_task()
+    Task._apply_process_exit_code(t, None)
+    assert t._status.exitCode == 1
+
+
+@pytest.mark.asyncio
+async def test_exit_event_marks_the_run_as_reported():
+    t = _exit_task()
+    await Task.on_event(t, {'type': 'event', 'event': 'apaevt_exit', 'body': {'exitCode': 3, 'message': 'boom'}})
+    assert t._exit_event_seen is True
+    assert (t._status.exitCode, t._status.exitMessage) == (3, 'boom')
+
+
+class _ExitingProcess:
+    """A subprocess whose output has closed but which is not reaped until wait()."""
+
+    def __init__(self, code):
+        self.returncode = None
+        self._code = code
+
+    async def wait(self):
+        self.returncode = self._code
+        return self._code
+
+
+@pytest.mark.asyncio
+async def test_exit_code_is_read_after_the_process_is_reaped():
+    t = _exit_task()
+    t._engine_process = _ExitingProcess(1)
+    assert await Task._process_exit_code(t) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_process_counts_as_failed():
+    t = _exit_task()
+    t._engine_process = None
+    assert await Task._process_exit_code(t) == 1
+
+
+class _LingeringProcess:
+    """Output closed, but the process only exits once it is killed."""
+
+    def __init__(self):
+        self.returncode = None
+        self.killed = False
+
+    async def wait(self):
+        if not self.killed:
+            await asyncio.sleep(3600)
+        self.returncode = -9
+        return -9
+
+    def kill(self):
+        self.killed = True
+
+
+@pytest.mark.asyncio
+async def test_a_process_that_does_not_exit_is_killed_and_reaped(monkeypatch):
+    import ai.modules.task.task_engine as te
+
+    monkeypatch.setattr(te, 'CONST_CANCEL_WAIT_TIMEOUT_SECONDS', 0.05)
+    t = _exit_task()
+    t._engine_process = _LingeringProcess()
+    assert await Task._process_exit_code(t) == -9
+    assert t._engine_process.killed
