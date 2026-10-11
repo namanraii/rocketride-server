@@ -913,6 +913,7 @@ def test_create_sends_sizing_a_lifetime_cap_in_seconds_and_no_inbound(monkeypatc
             'max_duration': 5400,
             'pause_retention': 24 * 3600,
             'allow_inbound': False,
+            'allow_outbound': True,
         }
     ]
 
@@ -1060,6 +1061,7 @@ def test_the_create_request_carries_exactly_the_options_the_node_means_to_send(m
             'disk_size_gb',
             'max_duration',
             'allow_inbound',
+            'allow_outbound',
             'name',
             'tags',
             'metadata',
@@ -1067,6 +1069,9 @@ def test_the_create_request_carries_exactly_the_options_the_node_means_to_send(m
         }
         | extra
     )
+    # Sent explicitly rather than left to the SDK's default: with outbound access off, Tenki ignores the
+    # allowlist and the sandbox reaches nothing, so a changed default would silently change both.
+    assert kwargs['allow_outbound'] is True and kwargs['allow_inbound'] is False
 
 
 def test_a_replacement_session_gets_the_same_policies_and_allowlist(monkeypatch, logs):

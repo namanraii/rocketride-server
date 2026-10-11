@@ -300,6 +300,7 @@ def test_create_accepts_every_option_the_node_sends():
         'max_duration',
         'pause_retention',
         'allow_inbound',
+        'allow_outbound',
         'image',
         'name',
         'tags',
@@ -328,6 +329,19 @@ def test_secret_policies_and_domains_reach_the_create_request():
     assert list(request.secret_policies) == ['github']
     assert list(request.egress.allow_domains) == ['pypi.org']
     assert not build_create_session_request().HasField('egress')
+
+
+def test_outbound_access_is_a_create_option_the_node_sets_itself():
+    # The node passes allow_outbound=True on every create instead of relying on this default. The SDK documents
+    # that allow_domains is ignored when allow_outbound is false, so the flag has to reach the request with the
+    # allowlist, as it does here.
+    parameter = inspect.signature(tenki.Client.create).parameters['allow_outbound']
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is True
+    request = build_create_session_request(allow_outbound=True, allow_domains=['pypi.org'])
+    assert request.allow_outbound is True
+    assert list(request.egress.allow_domains) == ['pypi.org']
+    assert build_create_session_request(allow_outbound=False).allow_outbound is False
 
 
 @pytest.mark.parametrize('options', [{'disk_size_gb': 4}, {'memory_mb': 4097}])

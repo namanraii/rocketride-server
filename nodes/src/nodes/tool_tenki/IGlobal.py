@@ -622,6 +622,10 @@ class IGlobal(IGlobalBase):
             # Inbound exposure can only be set at create time, and no tool this node
             # publishes uses it, so sessions are created closed to inbound traffic.
             'allow_inbound': False,
+            # Outbound stays on, said here rather than left to the SDK's default: with it off, Tenki
+            # ignores allow_domains and the sandbox reaches nothing, so a changed default would quietly
+            # change both. Where it may go is decided by allow_domains below.
+            'allow_outbound': True,
             # So that a session a crashed engine left behind can be recognised in Tenki's console
             # and listed by tag. The suffix keeps names distinct in case the service requires it.
             'name': f'rocketride-tool-tenki-{uuid.uuid4().hex[:8]}',
