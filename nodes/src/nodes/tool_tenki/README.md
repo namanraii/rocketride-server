@@ -202,10 +202,10 @@ changelog of 2026-09-25 says outbound allowlists were "enabled by default in all
 workspaces": that is the option, not a default list. (Tenki's sessions page still says the option
 has to be enabled for a workspace first; on the workspace measured it needed nothing.)
 
-With a list, only the listed names resolve inside the sandbox, and the list replaces open access
-rather than adding to a default: with `github.com` listed, the other four hosts above stopped
-resolving. Three ways around it were tried from inside the sandbox, whose user has `sudo`, and none
-worked:
+With a list, the listed names resolve inside the sandbox and the list replaces open access (the
+workspace measured had no default list for it to add to): with `github.com` listed, the other four hosts
+above stopped resolving. Three ways around it were tried from inside the sandbox, whose user has `sudo`,
+and none worked:
 
 - a bare IP address that is not listed: plain HTTP was answered by Tenki with "egress blocked by
   policy", and HTTPS failed its handshake;
@@ -215,11 +215,12 @@ worked:
   "egress blocked by policy".
 
 The same list held after Tenki paused the session and the node resumed it, and on a session that
-replaced one terminated from outside. Not tried: IPv6, and UDP to ports other than 53. What the list
-does not stop is traffic to the listed hosts themselves, on any port: with `github.com` listed, its
-SSH port answered. An allowed host is a place data can be sent (a push to any repository the agent
-has credentials for), so list as few as the work needs: pip, for one, needs `pypi.org` and
-`files.pythonhosted.org`, and a secret policy's destinations must be listed too.
+replaced one terminated from outside. Not tried: IPv6, UDP to ports other than 53, and whether the
+sandbox's own resolver passes on lookups of names that are not listed (data can travel in a name looked
+up). What the list does not stop is traffic to the listed hosts themselves, on other ports too: with
+`github.com` listed, its SSH port answered. An allowed host is a place data can be sent (a push to any
+repository the agent has credentials for), so list as few as the work needs: pip, for one, needs
+`pypi.org` and `files.pythonhosted.org`, and a secret policy's destinations must be listed too.
 
 Entries follow Tenki's rule, which the node checks at startup so that a mistake stops the pipeline
 instead of failing every create later: a hostname without a scheme, path or port, of letters,
