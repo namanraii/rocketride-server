@@ -105,7 +105,7 @@
 		"tenki.secret_policies": {
 			"type": "array",
 			"title": "Secret policies",
-			"description": "Names of Tenki request policies to attach, for transparent secret injection. Code in the sandbox uses a placeholder such as secrets://GITHUB_BASIC, and Tenki puts the real value, outside the VM, only into requests a policy allows; a service a policy allows can still send the credential back in its response. For a private GitHub clone the secret holds the HTTP Basic credential and git sends Authorization: Basic secrets://NAME (see the README). Create the secrets and policies in Tenki first; the API key needs Secrets access. Requires Allowed outbound domains: a pipeline with policies and no allowlist does not start. Leave empty to attach none.",
+			"description": "Names of Tenki request policies to attach, for transparent secret injection. Code in the sandbox uses a placeholder such as secrets://GITHUB_BASIC, and Tenki puts the real value, outside the VM, only into requests a policy allows; a service a policy allows can still send the credential back in its response. For private repositories, name the secret under Private repositories below; git_clone then sends Authorization: Basic secrets://NAME (see the README). Create the secrets and policies in Tenki first; the API key needs Secrets access. Requires Allowed outbound domains: a pipeline with policies and no allowlist does not start. Leave empty to attach none.",
 			"items": {
 				"type": "string"
 			},
@@ -120,6 +120,20 @@
 				"type": "string"
 			},
 			"default": [],
+			"optional": true
+		},
+		"tenki.git_auth_url": {
+			"type": "string",
+			"title": "Private repositories: URL prefix",
+			"description": "git_clone clones the private repositories under this https prefix, such as https://github.com/acme/, with the Tenki secret named below as their credential; clones of anything else are sent with no credential, as before. Only used when a secret is named. Make an attached secret policy cover the same URLs: a clone under the prefix that no policy covers is refused by Tenki (403 secret_injection_denied), public repositories included. The host must be in Allowed outbound domains.",
+			"default": "https://github.com/",
+			"optional": true
+		},
+		"tenki.git_auth_secret": {
+			"type": "string",
+			"title": "Private repositories: Tenki secret",
+			"description": "Name of the Tenki secret holding the HTTP Basic credential for the repositories under the prefix above: for GitHub, the base64 of x-access-token: followed by a read-only token for those repositories (see the README). Only the name is set here; the value stays in Tenki, which adds it outside the VM. Requires Secret policies and Allowed outbound domains. Leave empty to clone public repositories only.",
+			"default": "",
 			"optional": true
 		},
 		"tenki.toolGroups": {
@@ -154,7 +168,7 @@
 		{
 			"section": "Pipe",
 			"title": "Tenki Sandbox",
-			"properties": ["type", "tenki.apikey", "tenki.base_url", "tenki.cpu_cores", "tenki.memory_mb", "tenki.disk_size_gb", "tenki.max_duration_minutes", "tenki.pause_retention_hours", "tenki.exec_timeout_secs", "tenki.max_output_chars", "tenki.image", "tenki.secret_policies", "tenki.allow_domains", "tenki.toolGroups"]
+			"properties": ["type", "tenki.apikey", "tenki.base_url", "tenki.cpu_cores", "tenki.memory_mb", "tenki.disk_size_gb", "tenki.max_duration_minutes", "tenki.pause_retention_hours", "tenki.exec_timeout_secs", "tenki.max_output_chars", "tenki.image", "tenki.secret_policies", "tenki.allow_domains", "tenki.git_auth_url", "tenki.git_auth_secret", "tenki.toolGroups"]
 		}
 	]
 }

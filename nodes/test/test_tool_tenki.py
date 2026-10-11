@@ -2565,6 +2565,332 @@ def test_git_clone_on_an_ended_session_clones_into_a_fresh_one(monkeypatch, logs
 
 
 # ---------------------------------------------------------------------------
+# git_clone of a private repository, through a Tenki secret policy
+# ---------------------------------------------------------------------------
+
+_PRIVATE_CFG = {
+    'secret_policies': ['git'],
+    'allow_domains': ['github.com'],
+    'git_auth_url': 'https://github.com/acme/',
+    'git_auth_secret': 'GITHUB_BASIC',
+}
+_PRIVATE_REPO = 'https://github.com/acme/private.git'
+_PRIVATE_HEADER = 'http.https://github.com/acme/.extraHeader=Authorization: Basic secrets://GITHUB_BASIC'
+
+
+def _git_clone_argv(*options, repo=_PRIVATE_REPO, directory='/home/tenki/private'):
+    return (
+        'env',
+        'GIT_TERMINAL_PROMPT=0',
+        'git',
+        'clone',
+        '--config',
+        _PRIVATE_HEADER,
+        *options,
+        '--',
+        repo,
+        directory,
+    )
+
+
+def test_private_clones_are_off_unless_a_secret_is_named(monkeypatch, logs):
+    glb, _ = _started(monkeypatch, cfg={'secret_policies': ['git'], 'allow_domains': ['github.com']})
+    assert glb.git_auth_secret == '' and glb.git_auth_url == ''
+
+
+def test_the_private_prefix_defaults_to_all_of_github(monkeypatch, logs):
+    cfg = {**_PRIVATE_CFG, 'git_auth_url': ''}
+    glb, _ = _started(monkeypatch, cfg=cfg)
+    assert glb.git_auth_url == 'https://github.com/' and glb.git_auth_secret == 'GITHUB_BASIC'
+
+
+@pytest.mark.parametrize(
+    ('raw', 'kept'),
+    [
+        ('https://github.com/acme', 'https://github.com/acme/'),
+        (' HTTPS://GitHub.com/acme/ ', 'https://github.com/acme/'),
+        ('https://github.com', 'https://github.com/'),
+        ('https://github.com/acme/private.git', 'https://github.com/acme/private.git/'),
+    ],
+)
+def test_the_private_prefix_is_kept_in_the_form_git_matches(monkeypatch, logs, raw, kept):
+    # git applies an http.<url>.* setting to a URL under <url> on a path-segment boundary, so the prefix
+    # always ends in a slash: https://github.com/acme must not also cover https://github.com/acme-evil.
+    glb, _ = _started(monkeypatch, cfg={**_PRIVATE_CFG, 'git_auth_url': raw})
+    assert glb.git_auth_url == kept
+
+
+@pytest.mark.parametrize(
+    'url',
+    [
+        'http://github.com/acme/',
+        'github.com/acme',
+        'ssh://git@github.com/acme/',
+        'https://token@github.com/acme/',
+        'https://github.com:8443/acme/',
+        'https://github.com/acme/?x=1',
+        'https://github.com/acme/#x',
+        'https:///acme/',
+        'https://github.com/acme/../other/',
+        'https://github.com/a=b/',
+        'https://github.com/a b/',
+        'https://github.com/acme/\nx',
+        'https://github.com:port/acme/',
+        'https://*.github.com/acme/',
+    ],
+)
+def test_a_private_prefix_the_node_cannot_match_safely_stops_the_pipeline_at_startup(monkeypatch, logs, url):
+    # Fail closed. The prefix decides which clones carry the placeholder; one the node reads differently from
+    # git, or a URL that is not plain https, would send it where the operator did not mean to.
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, **_PRIVATE_CFG, 'git_auth_url': url})
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert 'tenki.git_auth_url' in str(refused.value)
+    assert 'token' not in str(refused.value)
+
+
+@pytest.mark.parametrize('name', ['1GITHUB', 'GIT HUB', 'GIT/HUB', 'secrets://GITHUB', 'G' * 129, 'GIT.HUB'])
+def test_a_secret_name_tenki_would_not_read_stops_the_pipeline_at_startup(monkeypatch, logs, name):
+    # Tenki reads a placeholder's name as a letter or underscore, then up to 127 letters, digits, underscores
+    # and hyphens. Any other name would never be substituted, so every private clone would fail.
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, **_PRIVATE_CFG, 'git_auth_secret': name})
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert 'tenki.git_auth_secret' in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'), [('git_auth_secret', 5), ('git_auth_secret', ['GIT']), ('git_auth_url', 5)]
+)
+def test_a_private_clone_setting_that_is_not_text_stops_the_pipeline_at_startup(monkeypatch, logs, field, value):
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, **_PRIVATE_CFG, field: value})
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert f'tenki.{field}' in str(refused.value)
+
+
+def test_a_git_secret_without_secret_policies_stops_the_pipeline_at_startup(monkeypatch, logs):
+    # Without a policy Tenki substitutes nothing and refuses the request, so every private clone would fail.
+    cfg = {'apikey': _KEY, **_PRIVATE_CFG, 'secret_policies': []}
+    glb, _ = _make_global(monkeypatch, cfg)
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert 'tenki.git_auth_secret' in str(refused.value) and 'tenki.secret_policies' in str(refused.value)
+
+
+@pytest.mark.parametrize('domains', [['pypi.org'], ['api.github.com'], ['github.co']])
+def test_a_private_host_missing_from_the_allowlist_stops_the_pipeline_at_startup(monkeypatch, logs, domains):
+    cfg = {'apikey': _KEY, **_PRIVATE_CFG, 'allow_domains': domains}
+    glb, _ = _make_global(monkeypatch, cfg)
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert 'github.com' in str(refused.value) and 'tenki.allow_domains' in str(refused.value)
+
+
+@pytest.mark.parametrize('domains', [['github.com'], ['pypi.org', 'GitHub.com.'], ['*.example.com']])
+def test_a_private_host_on_the_allowlist_starts(monkeypatch, logs, domains):
+    url = 'https://git.example.com/acme/' if domains == ['*.example.com'] else 'https://github.com/acme/'
+    glb, _ = _started(monkeypatch, cfg={**_PRIVATE_CFG, 'allow_domains': domains, 'git_auth_url': url})
+    assert glb.git_auth_url == url
+
+
+def test_validate_config_warns_about_a_private_clone_setting_that_will_not_start(monkeypatch, logs):
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, **_PRIVATE_CFG, 'allow_domains': ['pypi.org']})
+    glb.validateConfig()
+    assert any('fail to start' in message and 'tenki.allow_domains' in message for message in logs)
+
+
+def test_the_editor_offers_the_private_clone_settings_as_names_not_values():
+    services = json.loads((_NODES_SRC / 'nodes' / 'tool_tenki' / 'services.json').read_text())
+    fields = services['fields']
+    assert fields['tenki.git_auth_url']['type'] == 'string'
+    assert fields['tenki.git_auth_url']['default'] == 'https://github.com/'
+    assert fields['tenki.git_auth_secret']['type'] == 'string'
+    assert fields['tenki.git_auth_secret']['default'] == ''
+    # The field holds a secret's name; the value never passes through RocketRide.
+    assert 'secure' not in fields['tenki.git_auth_secret']
+    [shape] = services['shape']
+    assert {'tenki.git_auth_url', 'tenki.git_auth_secret'} <= set(shape['properties'])
+
+
+def test_git_clone_under_the_private_prefix_runs_git_with_the_placeholder_header(monkeypatch, logs):
+    # Measured on 2026-10-10: one `git clone --config http.<prefix>.extraHeader=...` cloned the private
+    # repository through the policy and kept the header in the clone's own config, where a later fetch or
+    # pull found it. Only the placeholder ever enters the sandbox; Tenki substitutes the value outside it.
+    cloning = _CommandResult(argv=[], exit_code=0, stderr=b"Cloning into '/home/tenki/src/p'...\n")
+    session = _FakeSession('sb-1', exec_result=cloning)
+    inst, _ = _instance(monkeypatch, session, cfg=_PRIVATE_CFG)
+    result = inst.git_clone({'repo': _PRIVATE_REPO, 'branch': 'main', 'depth': 1, 'directory': 'src/p'})
+    assert result == {
+        'directory': '/home/tenki/src/p',
+        'output': "Cloning into '/home/tenki/src/p'...",
+        'truncated': False,
+        'session': 'created',
+    }
+    [(argv, kwargs)] = _execs(session)
+    assert argv == _git_clone_argv('--branch', 'main', '--depth', '1', directory='/home/tenki/src/p')
+    assert kwargs['timeout'] == inst.IGlobal.rpc_timeout_secs
+    assert _git_calls(session, 'clone') == []
+
+
+def test_git_clone_of_a_private_repository_defaults_to_its_folder(monkeypatch, logs):
+    session = _FakeSession('sb-1')
+    inst, _ = _instance(monkeypatch, session, cfg=_PRIVATE_CFG)
+    assert inst.git_clone({'repo': 'https://github.com/acme/private'})['directory'] == '/home/tenki/private'
+    [(argv, _)] = _execs(session)
+    assert argv == _git_clone_argv(repo='https://github.com/acme/private')
+
+
+@pytest.mark.parametrize(
+    'repo',
+    [
+        'https://gitlab.com/acme/private.git',
+        'https://github.com/octocat/Hello-World.git',
+        'https://github.com/acme-evil/private.git',
+        'https://github.com/ACME/private.git',
+        'http://github.com/acme/private.git',
+        'https://github.com.evil.example/acme/private.git',
+        'https://evilgithub.com/acme/private.git',
+        'https://github.com:8443/acme/private.git',
+        'https://github.com:port/acme/private.git',
+    ],
+)
+def test_git_clone_outside_the_private_prefix_is_left_as_it_was(monkeypatch, logs, repo):
+    # Measured on 2026-10-10: a public github.com repository cloned with the placeholder, under a policy that
+    # covered another repository, was refused (403 secret_injection_denied). So the header goes only where
+    # git itself would apply the prefix's setting: same scheme, host and port, a path under the prefix's.
+    session = _FakeSession('sb-1', git_outputs={'clone': 'cloned'})
+    inst, _ = _instance(monkeypatch, session, cfg=_PRIVATE_CFG)
+    assert inst.git_clone({'repo': repo})['output'] == 'cloned'
+    assert _execs(session) == []
+    assert len(_git_calls(session, 'clone')) == 1
+
+
+def test_git_clone_matches_the_default_port_as_git_does(monkeypatch, logs):
+    session = _FakeSession('sb-1')
+    inst, _ = _instance(monkeypatch, session, cfg=_PRIVATE_CFG)
+    inst.git_clone({'repo': 'https://GitHub.com:443/acme/private.git'})
+    assert [argv[5] for argv, _ in _execs(session)] == [_PRIVATE_HEADER]
+
+
+def test_a_failed_private_clone_returns_gits_output_to_the_agent(monkeypatch, logs):
+    failed = _CommandResult(
+        argv=[], exit_code=128, stderr=b"Cloning into '/home/tenki/private'...\nremote: Repository not found.\n"
+    )
+    inst, _ = _instance(monkeypatch, _FakeSession('sb-1', exec_result=failed), cfg=_PRIVATE_CFG)
+    result = inst.git_clone({'repo': _PRIVATE_REPO})
+    assert result['output'] == '' and result['directory'] == '/home/tenki/private'
+    assert 'exit code 128' in result['error'] and 'Repository not found' in result['error']
+
+
+def test_a_private_clone_the_policy_does_not_cover_is_explained(monkeypatch, logs):
+    # What git printed in the measurement above, for a repository under the prefix the policy did not cover.
+    denied = _CommandResult(
+        argv=[],
+        exit_code=128,
+        stderr=b"remote: secret_injection_denied\nfatal: unable to access 'https://github.com/acme/x.git/': "
+        b'The requested URL returned error: 403\n',
+    )
+    inst, _ = _instance(monkeypatch, _FakeSession('sb-1', exec_result=denied), cfg=_PRIVATE_CFG)
+    error = inst.git_clone({'repo': 'https://github.com/acme/x.git'})['error']
+    assert 'secret_injection_denied' in error and 'will not help' in error
+
+
+def test_a_private_clone_stopped_at_its_timeout_says_so(monkeypatch, logs):
+    stopped = _CommandResult(argv=[], exit_code=-1, timed_out=True, stderr=b"Cloning into '/home/tenki/private'...")
+    inst, _ = _instance(monkeypatch, _FakeSession('sb-1', exec_result=stopped), cfg=_PRIVATE_CFG)
+    error = inst.git_clone({'repo': _PRIVATE_REPO})['error']
+    assert f'{inst.IGlobal.rpc_timeout_secs}s' in error and 'depth' in error
+
+
+def test_a_private_clone_whose_session_ended_runs_on_a_fresh_one(monkeypatch, logs):
+    ended = mod.SessionTerminatedError('session_terminated')
+    dead = _FakeSession('sb-dead', state='TERMINATED', exec_error=ended)
+    fresh = _FakeSession('sb-fresh')
+    inst, _ = _instance(monkeypatch, dead, fresh, cfg=_PRIVATE_CFG)
+    assert inst.git_clone({'repo': _PRIVATE_REPO})['session'] == 'replaced'
+    assert [argv for argv, _ in _execs(fresh)] == [_git_clone_argv()]
+
+
+def test_a_private_clone_a_paused_session_never_started_is_sent_after_the_resume(monkeypatch, logs):
+    # Tenki refused the start, so git never ran: nothing can have taken effect, and the clone goes out once
+    # the session is back, as a command whose start was never confirmed does.
+    session = _FakeSession('sb-1')
+    inst, _ = _instance(monkeypatch, session, cfg=_PRIVATE_CFG)
+    inst.list_files({'path': '.'})
+    session.state = 'PAUSED'
+    result = inst.git_clone({'repo': _PRIVATE_REPO})
+    assert 'error' not in result and result['session'] == 'resumed', result
+    assert [argv for argv, _ in _execs(session)] == [_git_clone_argv(), _git_clone_argv()]
+    assert session.calls.count('resume') == 1
+
+
+def test_a_private_clone_cut_off_by_a_pause_is_not_sent_again(monkeypatch, logs):
+    # git had started and may have written part of the clone: the agent is told, and checks.
+    session = _PausedMidCommand('sb-1')
+    inst, _ = _instance(monkeypatch, session, cfg=_PRIVATE_CFG)
+    result = inst.git_clone({'repo': _PRIVATE_REPO})
+    assert result['session'] == 'resumed'
+    assert 'not sent again' in result['error'], result
+    assert [argv for argv, _ in _execs(session)] == [_git_clone_argv()]
+
+
+def test_a_long_private_clone_error_is_marked_truncated(monkeypatch, logs):
+    failed = _CommandResult(argv=[], exit_code=128, stderr=b'fatal: ' + b'x' * 5000)
+    inst, _ = _instance(
+        monkeypatch, _FakeSession('sb-1', exec_result=failed), cfg={**_PRIVATE_CFG, 'max_output_chars': 1000}
+    )
+    result = inst.git_clone({'repo': _PRIVATE_REPO})
+    assert len(result['error']) <= 1000 and result['truncated'] is True
+
+
+def test_a_private_clone_killed_for_its_output_says_so(monkeypatch, logs):
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit))
+    inst, _ = _instance(monkeypatch, session, cfg=_PRIVATE_CFG)
+    error = inst.git_clone({'repo': _PRIVATE_REPO})['error']
+    assert ('kill',) in session.calls
+    assert 'killed' in error and f'{limit:,} bytes' in error
+
+
+@pytest.mark.parametrize(
+    'repo', ['git@github.com:acme/private.git', 'ssh://git@github.com/acme/private.git', 'https:///x.git']
+)
+def test_a_refused_repository_url_does_not_call_the_repository_public(monkeypatch, logs, repo):
+    # With a private prefix set, "use a public URL" would send the agent the wrong way: it needs the https form.
+    inst, _ = _instance(monkeypatch, _FakeSession('sb-1'), cfg=_PRIVATE_CFG)
+    with pytest.raises(ValueError) as refused:
+        inst.git_clone({'repo': repo})
+    assert 'public' not in str(refused.value) and 'http' in str(refused.value)
+
+
+def test_a_wildcard_entry_covers_only_one_label_of_the_private_host(monkeypatch, logs):
+    # Tenki documents that a wildcard matches exactly one label, so a.b.example.com is not covered by *.example.com.
+    cfg = {
+        'apikey': _KEY,
+        **_PRIVATE_CFG,
+        'allow_domains': ['*.example.com'],
+        'git_auth_url': 'https://a.b.example.com/acme/',
+    }
+    glb, _ = _make_global(monkeypatch, cfg)
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert 'a.b.example.com' in str(refused.value) and 'tenki.allow_domains' in str(refused.value)
+
+
+def test_the_clone_description_tells_the_agent_which_private_repositories_it_can_clone(monkeypatch, logs):
+    # An agent reads tool descriptions, not the README: told nothing, it would not try a private repository.
+    configured, _ = _instance(monkeypatch, cfg=_PRIVATE_CFG)
+    text = configured.git_clone.__tool_meta__['description'](configured)
+    assert 'https://github.com/acme/' in text and 'Private repositories under' in text
+    assert 'fetch' in text and 'pull' in text
+    plain, _ = _instance(monkeypatch)
+    text = plain.git_clone.__tool_meta__['description'](plain)
+    assert 'Private repositories cannot be cloned' in text
+
+
+# ---------------------------------------------------------------------------
 # git_checkout / git_diff / git_log
 # ---------------------------------------------------------------------------
 

@@ -110,8 +110,8 @@ _KILLED_NOTICE = (
 # into a request, for one of several reasons: no attached policy allows that secret for that host,
 # method and path, the secret is not active, or the placeholder is somewhere a policy does not cover.
 # Measured 2026-10-10: a request outside the policy that carried a placeholder was answered with this
-# body, and `curl` printed it; `git` and `curl -f` print the status, not the body. The note is keyed on
-# the text alone, so output that merely quotes it gets the note as well.
+# body; `curl` printed it, and a refused `git clone` printed it after "remote:". The note is keyed on the
+# text alone, so output that merely quotes it gets the note as well.
 _INJECTION_DENIED = 'secret_injection_denied'
 _DENIED_NOTICE = (
     '[tool_tenki: this output contains "secret_injection_denied". Tenki documents that as its answer '
@@ -285,36 +285,92 @@ def _git_directory(args: dict) -> str | None:
     return _normalize_path(directory)
 
 
-def _public_repo_url(repo: str) -> str:
-    """Return ``repo`` unchanged if it is a public http(s) URL, and raise otherwise.
+def _clone_url(repo: str) -> str:
+    """Return ``repo`` unchanged if it is an http(s) URL without credentials, and raise otherwise.
 
     ``repo`` is agent-controlled, and git records the remote it cloned from in .git/config. A URL
     carrying userinfo (``https://token@host/org/private.git``) would therefore write that credential
     into the sandbox, whose user has passwordless sudo and whose network is open, and which every
-    caller of a shared pipeline reaches. The node holds no git credentials by design, so the only
-    thing to do with a credential-bearing URL is refuse it before it reaches Tenki.
+    caller of a shared pipeline reaches. The node holds no git credentials by design (a private
+    repository it clones gets a placeholder that Tenki fills in outside the VM, see
+    ``_private_clone_argv``), so the only thing to do with a credential-bearing URL is refuse it
+    before it reaches Tenki.
 
     ssh, git, file and scp-style (``git@host:org/repo``) forms are refused for the same reason: each
     names a repository this node has no way to authenticate to, so git would fail inside the VM with
     a far less obvious error.
 
     Raises:
-        ValueError: If ``repo`` is not a public http(s) URL, or carries credentials.
+        ValueError: If ``repo`` is not an http(s) URL, or carries credentials.
     """
     parsed = urllib.parse.urlsplit(repo)
     if parsed.scheme.lower() not in ('http', 'https'):
         raise ValueError(
-            f'"repo" must be a public http(s) URL, but {repo!r} is not. This node holds no git '
-            'credentials, so ssh, git, file and local repositories cannot be cloned.'
+            f'"repo" must be an http(s) URL, such as https://github.com/owner/repo.git, but {repo!r} is not. '
+            'ssh, git, file and local repositories cannot be cloned: this node has no way to authenticate to them.'
         )
     if parsed.username or parsed.password or '@' in parsed.netloc:
         raise ValueError(
             '"repo" must not carry credentials in the URL: they would be written into the '
-            'sandbox, which this node never places a secret in. Public repositories only.'
+            'sandbox, which this node never places a secret in.'
         )
     if not parsed.hostname:
-        raise ValueError(f'"repo" must be a public http(s) URL with a host, but {repo!r} has none')
+        raise ValueError(f'"repo" must be an http(s) URL with a host, but {repo!r} has none')
     return repo
+
+
+def _under_prefix(repo: str, prefix: str) -> bool:
+    """Whether git applies an ``http.<prefix>.*`` setting to ``repo``, which the node then authenticates.
+
+    git's rule: the same scheme, host and port (443 is https's own), and a path under the prefix's on a
+    segment boundary. ``prefix`` comes normalized from IGlobal, lowercase and ending in a slash. Where the
+    node and git could still read a URL differently (dot segments, percent-encoding), git decides whether
+    the header is sent, and a clone without it fails as one without credentials would.
+    """
+    url = urllib.parse.urlsplit(repo)
+    try:
+        port = url.port
+    except ValueError:
+        return False
+    want = urllib.parse.urlsplit(prefix)
+    path = url.path if url.path.endswith('/') else url.path + '/'
+    return (
+        url.scheme.lower() == 'https'
+        and port in (None, 443)
+        and url.hostname == want.hostname
+        and path.startswith(want.path)
+    )
+
+
+def _private_clone_argv(
+    repo: str, directory: str, branch: str | None, depth: int | None, prefix: str, secret: str
+) -> tuple[str, ...]:
+    """The clone command for a repository under the private prefix, with Tenki's placeholder as its credential.
+
+    Measured on 2026-10-10 against a private GitHub repository: ``git clone --config`` sent the header on the
+    clone, and kept it in the clone's own config, scoped to the prefix, so a later fetch or pull there, from
+    run_command too, authenticated the same way. Only ``secrets://<secret>`` enters the VM; Tenki's proxy
+    puts the secret's value, the HTTP Basic credential, in its place on requests a policy allows. Run
+    without a shell, and with git's terminal prompt off, so a refused request fails instead of waiting.
+    """
+    argv = ['env', 'GIT_TERMINAL_PROMPT=0', 'git', 'clone']
+    argv += ['--config', f'http.{prefix}.extraHeader=Authorization: Basic secrets://{secret}']
+    if branch:
+        argv += ['--branch', branch]
+    if depth:
+        argv += ['--depth', str(depth)]
+    return (*argv, '--', repo, directory)
+
+
+def _private_clone_note(glb) -> str:
+    """What git_clone's description says about private repositories, as the pipeline is configured."""
+    if not glb.git_auth_secret:
+        return 'Private repositories cannot be cloned: this node holds no git credentials.'
+    return (
+        f'Private repositories under {glb.git_auth_url} can be cloned with an https URL: Tenki adds the '
+        'credential outside the sandbox, and a later fetch or pull in the clone, run_command included, '
+        'authenticates the same way. Other private repositories cannot be cloned.'
+    )
 
 
 def _clone_folder(repo: str) -> str | None:
@@ -1120,7 +1176,7 @@ class IInstance(IInstanceBase):
         },
         description=lambda self: (
             "Clone a git repository into the remote Tenki sandbox, returning git's output and the folder "
-            'it was cloned into. Private repositories cannot be cloned: this node holds no git credentials. '
+            f'it was cloned into. {_private_clone_note(self.IGlobal)} '
             f'The clone must finish within {self.IGlobal.rpc_timeout_secs}s, so use depth for large '
             f'repositories. {_SESSION_NOTE}'
         ),
@@ -1128,7 +1184,7 @@ class IInstance(IInstanceBase):
     def git_clone(self, args):
         """Clone a git repository into the shared Tenki session."""
         args = normalize_tool_input(args, tool_name='tenki')
-        repo = _public_repo_url(_git_arg(args, 'repo', required=True))
+        repo = _clone_url(_git_arg(args, 'repo', required=True))
         branch = _git_arg(args, 'branch')
         depth = optional_int(args, 'depth', lo=1, tool_name='tenki')
         directory = _git_directory(args)
@@ -1138,24 +1194,49 @@ class IInstance(IInstanceBase):
             if folder is None:
                 raise ValueError('could not derive a folder name from "repo"; pass "directory"')
             directory = _normalize_path(folder)
+        glb = self.IGlobal
+        # Only clones under the private prefix carry the placeholder. Tenki refuses a request carrying one that
+        # no attached policy allows (measured: a public github.com repository outside the policy got 403
+        # secret_injection_denied), so every other clone goes through Tenki's git helper as before.
+        private = None
+        if glb.git_auth_secret and _under_prefix(repo, glb.git_auth_url):
+            private = _private_clone_argv(repo, directory, branch, depth, glb.git_auth_url, glb.git_auth_secret)
 
         def clone(session, sent):
-            sent.append(True)
-            return session.git.clone(repo, branch=branch, depth=depth, directory=directory)
+            if private is None:
+                sent.append(True)
+                return session.git.clone(repo, branch=branch, depth=depth, directory=directory)
+            # Marked sent only once the sandbox confirms git started, as for a command (see _StartedOnce): a
+            # start Tenki refused ran nothing, so it is sent again after a resume.
+            return _run_process(session, private, glb.rpc_timeout_secs, sent)
 
         events = []
         once = _ChangeOnce(clone, events, 'clone')
+        error = None
         try:
-            output = self.IGlobal.call_with_session(once, on_event=once.recovered)
+            output = glb.call_with_session(once, on_event=once.recovered)
         except SandboxError as e:
-            failed = {
-                'directory': directory,
-                'output': '',
-                'truncated': False,
-                'error': _explained(str(once.reported(e))),
-            }
+            error = str(once.reported(e))
+        else:
+            if private is not None:
+                output, killed = output
+                text = '\n'.join(part for part in (output.stderr_text.strip(), output.stdout_text.strip()) if part)
+                if killed:
+                    # The note first, so that truncating git's output cannot cut it off.
+                    error = f'{_KILLED_NOTICE.format(limit=_OUTPUT_LIMIT_BYTES)} git printed: {text}'
+                elif output.timed_out:
+                    error = (
+                        f'the clone did not finish within {glb.rpc_timeout_secs}s, when Tenki stopped it; use '
+                        f'depth for a large repository. git printed: {text}'
+                    )
+                elif output.exit_code != 0:
+                    error = f'git clone failed (exit code {output.exit_code}): {text}'
+                output = text
+        if error is not None:
+            error, cut = _truncate(error, glb.max_output_chars)
+            failed = {'directory': directory, 'output': '', 'truncated': cut, 'error': _explained(error)}
             return _with_session_event(failed, events)
-        cloned = {'directory': directory, **_git_result(output, self.IGlobal.max_output_chars)}
+        cloned = {'directory': directory, **_git_result(output, glb.max_output_chars)}
         return _with_session_event(cloned, events)
 
     @tenki_tool(

@@ -63,6 +63,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+import urllib.parse
 import uuid
 from contextlib import nullcontext
 
@@ -301,6 +302,100 @@ def _secret_settings(cfg) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return policies, domains
 
 
+#: The name Tenki reads after "secrets://" in a placeholder (tenki 1.4.1): a letter or underscore, then up to 127
+#: letters, digits, underscores and hyphens. A name outside it would never be substituted.
+_SECRET_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_-]{0,127}')
+
+#: The path a private-repository prefix may have: slashes and URL characters that git leaves as they are when it
+#: normalizes a URL, so that the node and git read the same prefix.
+_PREFIX_PATH = re.compile(r'/[A-Za-z0-9._~/-]*')
+
+_DEFAULT_GIT_AUTH_URL = 'https://github.com/'
+
+
+def _git_auth_url(raw: str) -> str:
+    """The private-repository prefix, normalized as git matches it: lowercase scheme and host, ending in a slash.
+
+    git applies an ``http.<url>.*`` setting to a URL with the same scheme, host and port whose path is under
+    <url>'s on a segment boundary, so the slash keeps https://github.com/acme from also covering
+    https://github.com/acme-evil. The entry is not quoted in the error: it may carry a credential.
+
+    Raises:
+        ValueError: For anything but a plain https URL with a host and an optional path.
+    """
+    parsed = urllib.parse.urlsplit(raw)
+    try:
+        port = parsed.port
+    except ValueError:
+        port = -1
+    host = parsed.hostname or ''
+    path = parsed.path or '/'
+    segments = path.split('/')
+    if (
+        not raw.isascii()
+        or any(character.isspace() for character in raw)
+        or parsed.scheme.lower() != 'https'
+        or '@' in parsed.netloc
+        or port is not None
+        or '?' in raw
+        or '#' in raw
+        or not host
+        or host.startswith('*')
+        or not _DOMAIN.match(host)
+        or not _PREFIX_PATH.fullmatch(path)
+        or '.' in segments
+        or '..' in segments
+    ):
+        raise ValueError(
+            'tenki.git_auth_url must be an https URL with a host and, optionally, a path, such as '
+            'https://github.com/acme/, with no credentials, port, query or fragment (the value is not shown: '
+            'it may hold a credential)'
+        )
+    return f'https://{host}{path if path.endswith("/") else path + "/"}'
+
+
+def _git_auth_settings(cfg, policies: tuple[str, ...], domains: tuple[str, ...]) -> tuple[str, str]:
+    """The URL prefix git_clone authenticates under and the Tenki secret it names there, or ('', '') when off.
+
+    git_clone puts ``Authorization: Basic secrets://<secret>`` on clones under the prefix, and Tenki's proxy puts
+    the secret's value in its place, outside the VM, when an attached policy allows the request. Without a policy
+    Tenki refuses every such request, and without the prefix's host on the allowlist the sandbox cannot reach it,
+    so either gap stops the pipeline rather than failing every private clone later.
+
+    Raises:
+        ValueError: For a secret name Tenki would not read, a prefix the node does not accept, no secret
+            policies, or a prefix whose host the allowlist does not cover.
+    """
+    secret = cfg.get('git_auth_secret')
+    if secret is None or (isinstance(secret, str) and not secret.strip()):
+        return '', ''
+    if not isinstance(secret, str) or not _SECRET_NAME.fullmatch(secret.strip()):
+        raise ValueError(
+            'tenki.git_auth_secret must be the name of a Tenki secret, as a placeholder names it: a letter or '
+            'underscore, then up to 127 letters, digits, underscores and hyphens'
+        )
+    raw = cfg.get('git_auth_url')
+    if raw is not None and not isinstance(raw, str):
+        raise ValueError('tenki.git_auth_url must be a URL such as https://github.com/acme/')
+    prefix = _git_auth_url((raw or '').strip() or _DEFAULT_GIT_AUTH_URL)
+    if not policies:
+        raise ValueError(
+            'tenki.git_auth_secret is set but tenki.secret_policies is empty. Tenki adds the secret only to '
+            'requests an attached policy allows: name the policy that covers the repositories under '
+            f'{prefix} in tenki.secret_policies.'
+        )
+    host = urllib.parse.urlsplit(prefix).hostname
+    # Tenki documents that a wildcard entry matches exactly one label: *.example.com covers api.example.com only.
+    if not any(
+        domain == host or (domain.startswith('*.') and host.partition('.')[2] == domain[2:]) for domain in domains
+    ):
+        raise ValueError(
+            f'tenki.git_auth_url is on {host}, which tenki.allow_domains does not list, so the sandbox could '
+            f'not reach it: add {host} to tenki.allow_domains.'
+        )
+    return prefix, secret.strip()
+
+
 def _outlives_the_session(exec_timeout_secs: int, max_duration_minutes: int) -> str | None:
     """The warning for a command allowed to run as long as the session lives, or None.
 
@@ -375,6 +470,10 @@ class IGlobal(IGlobalBase):
     secret_policies: tuple[str, ...] = ()
     # Hostnames the sandbox may reach. Empty means no allowlist: outbound traffic is unrestricted.
     allow_domains: tuple[str, ...] = ()
+    # Private repositories git_clone authenticates to: the URL prefix they are under, and the name of the Tenki
+    # secret holding the HTTP Basic credential for them. Both empty when the operator set no secret.
+    git_auth_url: str = ''
+    git_auth_secret: str = ''
     cpu_cores: int = 2
     memory_mb: int = 4096
     disk_size_gb: int = 5
@@ -419,6 +518,7 @@ class IGlobal(IGlobalBase):
         base_url = str((cfg.get('base_url') or '')).strip() or _DEFAULT_BASE_URL
         self.image = str((cfg.get('image') or '')).strip()
         self.secret_policies, self.allow_domains = _secret_settings(cfg)
+        self.git_auth_url, self.git_auth_secret = _git_auth_settings(cfg, self.secret_policies, self.allow_domains)
         self.cpu_cores = _int_or(cfg.get('cpu_cores'), 2, lo=1, hi=16)
         # Tenki rejects odd memory sizes (they must align to 2 MiB). Rounding down stays in
         # range because both bounds are even.
@@ -939,7 +1039,7 @@ class IGlobal(IGlobalBase):
             except ValueError:
                 warning('toolGroups matches no known group, so the pipeline will fail to start')
             try:
-                _secret_settings(cfg)
+                _git_auth_settings(cfg, *_secret_settings(cfg))
             except ValueError as e:
                 warning(f'The pipeline will fail to start: {e}')
         except Exception as e:

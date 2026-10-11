@@ -20,8 +20,8 @@ gets 12 functions in three groups: running commands and code, editing files unde
 working in a git repository. Pick it over `tool_python` when the work needs a real operating system
 instead of a restricted interpreter, and over `tool_daytona` when you want a machine that keeps its
 files and installed packages for the whole session. The node holds no git credentials and places none
-inside the VM, so `git_clone` sends no credential of its own; private repositories go through
-[secret policies](#secret-policies).
+inside the VM: `git_clone` clones a private repository with a placeholder that Tenki replaces outside
+the VM (see [Private repositories](#private-repositories)).
 
 ## Example pipelines
 
@@ -57,7 +57,7 @@ functions are published depends on the **Tool groups** field; by default all thr
 | `list_files` | List a directory, optionally including hidden entries. |
 | `make_directory` | Create a directory and its parents. |
 | `delete_path` | Delete a file or directory recursively. |
-| `git_clone` | Clone a public git repository into the sandbox. |
+| `git_clone` | Clone a git repository into the sandbox: a public one, or a private one under the configured prefix. |
 | `git_checkout` | Check out a branch, tag or commit, optionally creating the branch. |
 | `git_diff` | Show a diff, optionally between two revisions or limited to one path. |
 | `git_log` | Show commit history, bounded by a maximum count. |
@@ -162,11 +162,11 @@ to "not verified": a file call ran the check once; after the no-op command, zero
 ### Secret policies
 
 **Measured on real VMs on 2026-10-10** (SDK 1.4.1, an API key with Secrets access), with a
-read-only token for one private GitHub repository: a clone through this node worked in the form shown
-under [Private repositories](#private-repositories), and only in that form; no prefix of the token
-(`github_pat_`, `ghp_`, or the start of a Basic credential) was found in the sandbox's environment,
-any process's environment, files under `/home/tenki` and `/tmp`, git's configuration or shell
-history; a request outside the policy that carried a placeholder was answered
+read-only token for one private GitHub repository: `git_clone` cloned it with the secret holding the
+HTTP Basic credential, as set up under [Private repositories](#private-repositories); no prefix of
+the token (`github_pat_`, `ghp_`, or the start of a Basic credential) was found in the sandbox's
+environment, any process's environment, files under `/home/tenki` and `/tmp`, git's configuration or
+shell history; a request outside the policy that carried a placeholder was answered
 `403 secret_injection_denied`; and a push was refused by GitHub.
 
 Attaches Tenki request policies to the sandbox, by name, for transparent secret injection. As Tenki
@@ -193,7 +193,7 @@ The API key needs Secrets access; without it Tenki refuses the session, and the 
 documents that the image has to carry its managed HTTPS trust. Nothing advertises the placeholders
 to the agent, so name the ones it may use in its instructions. If a command's output contains
 Tenki's denial text, the tool result adds a note on stderr that repeating the request will not help.
-`curl` prints that text (measured); `git` reports only the status code.
+`curl` prints that text, and `git` prints it after `remote:` (both measured).
 
 ### Allowed outbound domains
 
@@ -235,6 +235,15 @@ and paths. How wide a wildcard is, `*.co.uk` say, is the operator's call. An ent
 stops the pipeline instead of being dropped (had every entry been dropped, no allowlist would apply
 at all), and so does a setting that is not a list. The list is fixed when the session is created,
 and a session that replaces an ended one is created with the same list.
+
+### Private repositories: URL prefix and Tenki secret
+
+Naming a Tenki secret lets `git_clone` clone the private repositories under the URL prefix, which
+defaults to `https://github.com/`; see [Private repositories](#private-repositories) for the setup.
+The prefix must be a plain `https` URL with no credentials, port, query or fragment, its host must be
+in the allowed outbound domains, and secret policies must be set; otherwise the pipeline does not
+start. The secret's name follows Tenki's rule for placeholders: a letter or underscore, then up to 127
+letters, digits, underscores and hyphens.
 
 ## Authentication
 
@@ -281,84 +290,95 @@ carries no caller identity, so it has no way to tell two callers apart.
 
 ### No git credentials
 
-`git_clone` sends no credential, by design. Tenki can place a GitHub token inside a sandbox, but there
-it is an ordinary environment variable or file and the sandbox user has passwordless `sudo`, so any
-command the agent runs could read it. Rather than ship a secret that cannot be protected inside the
-machine it is handed to, the node holds no git credentials at all and never asks Tenki to deliver one
-into the VM.
+`git_clone` sends no credential of its own, by design. Tenki can place a GitHub token inside a
+sandbox, but there it is an ordinary environment variable or file and the sandbox user has
+passwordless `sudo`, so any command the agent runs could read it. Rather than ship a secret that
+cannot be protected inside the machine it is handed to, the node holds no git credentials at all and
+never asks Tenki to deliver one into the VM. For a private repository it sends a placeholder, which
+Tenki replaces outside the VM (see [Private repositories](#private-repositories)).
 
-`git_clone` enforces that rather than trusting the agent to respect it: it accepts public `http(s)`
-URLs only, and refuses one carrying credentials in the URL (`https://token@host/org/repo.git`) along
+`git_clone` enforces that rather than trusting the agent to respect it: it accepts `http(s)` URLs
+only, and refuses one carrying credentials in the URL (`https://token@host/org/repo.git`) along
 with the `ssh`, `git`, `file` and `git@host:path` forms, none of which it could authenticate anyway.
 Git records the URL it cloned from in `.git/config`, so a credential passed that way would be left
 inside the VM for every later command, and every later caller, to read.
 
 ### Private repositories
 
-With [secret policies](#secret-policies), a token can be used from the sandbox without being placed
-in it (measured, see below). What the operator sets up, once, in Tenki:
+With [secret policies](#secret-policies), `git_clone` clones a private repository without the token
+entering the sandbox (measured, see below). What the operator sets up, once, in Tenki:
 
 1. A GitHub token that can do as little as possible: a fine-grained personal access token limited
-   to the one repository, with read-only access to its contents. Nothing in this setup needs write
-   access, so do not grant it.
+   to the repositories the agent needs, with read-only access to their contents. Nothing in this
+   setup needs write access, so do not grant it.
 2. A Tenki secret holding the HTTP Basic credential git sends, not the bare token: the base64 of
    `x-access-token:` followed by the token (`printf 'x-access-token:%s' "$TOKEN" | base64`),
    `GITHUB_BASIC` in this example.
-3. A Tenki request policy, `github-clone` here, that allows the secret only on the requests a
-   clone or fetch makes:
+3. A Tenki request policy, `github-acme` here, that allows the secret on the requests a clone or
+   fetch makes, for the same URLs as the node's prefix, `https://github.com/acme/` in this example:
 
    ```json
    [
      {
        "origin": "https://github.com",
        "methods": ["GET"],
-       "pathPrefix": "/acme/private-repo.git/info/refs",
+       "pathPrefix": "/acme/",
        "header": "Authorization",
        "secrets": ["GITHUB_BASIC"]
      },
      {
        "origin": "https://github.com",
        "methods": ["POST"],
-       "pathPrefix": "/acme/private-repo.git/git-upload-pack",
+       "pathPrefix": "/acme/",
        "header": "Authorization",
        "secrets": ["GITHUB_BASIC"]
      }
    ]
    ```
 
-4. On the node: `github-clone` under Secret policies and `github.com` under Allowed outbound
-   domains.
-5. In the agent's instructions: clone with `run_command`, passing the placeholder as a header for
-   that one command, so it is not written to `.git/config`:
+4. On the node: `github-acme` under Secret policies, `github.com` under Allowed outbound domains,
+   `https://github.com/acme/` under Private repositories: URL prefix, and `GITHUB_BASIC` under Private
+   repositories: Tenki secret.
 
-   ```
-   git -c http.extraHeader="Authorization: Basic secrets://GITHUB_BASIC" clone https://github.com/acme/private-repo.git
-   ```
+`git_clone` then sends `Authorization: Basic secrets://GITHUB_BASIC` with a clone whose URL is under
+the prefix (an `https` URL on the same host whose path is under the prefix's, as git matches it), and
+with nothing else: a clone from another host or of another owner goes out as before, with no header.
+git keeps that header in the clone's own configuration, scoped to the prefix, so a later `git fetch`
+or `git pull` in the clone, through `run_command` too, authenticates the same way. Only the placeholder
+is written there. The tool's description tells the agent which repositories it can clone this way.
 
-   `git_clone` itself sends no credential and no placeholder, so use it for public repositories. A
-   later fetch or pull needs the same `-c` option.
+Make the policy cover the same URLs as the prefix. Tenki refuses a request that carries the placeholder
+when no attached policy allows it, a public repository's included: measured with the default prefix
+(all of `github.com`) and a policy for one owner, a public `github.com` repository of another owner was
+refused (`403 secret_injection_denied`), and `git_clone` returned that with the note above. So narrow
+the prefix to what the policy covers, as above, or, with the default prefix, give the policy rules
+whose `pathPrefix` is `/`.
 
-The upload path (`git-receive-pack`) is deliberately absent, so by Tenki's documented rules the
-policy should not put the token into the request that carries a push. The first rule is a path
-prefix, so it also matches the request that opens a push (`info/refs?service=git-receive-pack`):
-the token would be sent on that one, which lists refs and writes nothing. Measured with a read-only
-token, GitHub refused the push (`403`, "Write access to repository not granted"). Most likely the token
-was sent on that first request and GitHub refused the write on the token's read-only permission (the
-test did not show which request carried it), so keep the token read-only.
+The `POST` rule also matches the request that carries a push (`git-receive-pack`), so by Tenki's
+documented rules the token is sent on it, and whether the push is allowed is GitHub's decision on the
+token's permissions. Measured with a read-only token, GitHub refused a push (`403`, "Write access to
+repository not granted"). Keep the token read-only.
 
-**Measured on 2026-10-10**, against a private repository through this node on both engines tested:
-the clone above worked, and `Authorization: Bearer secrets://NAME` with the bare token as the secret
-did not (git then asks for a username). The same clone with no header was refused. In the spike,
-directly on a real VM, a Basic credential with the placeholder inside its base64 did not work either
-(it was not replaced there). That is why the secret holds the whole Basic credential.
+**Measured on 2026-10-10**, with a read-only token for one private repository, a policy for its owner
+and the prefix set to that owner, through this node on both engines tested: `git_clone` cloned the
+repository, with and without `.git` at the end of its URL; a `git fetch` and a `git pull` in the clone
+through `run_command` succeeded; the clone's configuration held the placeholder header and nothing else
+of the credential; a public repository on another host (`gitlab.com`) and one of another owner on
+`github.com` were cloned, with no header stored in either; and no prefix of the token was found in the
+places listed under [Secret policies](#secret-policies), every clone's `.git/config` included. Earlier
+the same day, with git run through `run_command`: `Authorization: Bearer secrets://NAME` with the bare
+token as the secret did not work (git then asks for a username), and the same clone with no header was
+refused. In the spike, directly on a real VM, a Basic credential with the placeholder inside its base64
+did not work either (it was not replaced there). That is why the secret holds the whole Basic
+credential.
 
 **What a policy cannot protect against.** Tenki checks where a request goes, not why it was made.
 The credential is available to the sandbox, so it is available to whoever can steer the agent:
 every user of the pipeline, and any text the agent reads and obeys, such as a README in a cloned
 repository or a web page. Any of them can have the agent use the token for anything the policy
-allows, and read what comes back. So keep the policy to one repository and to reading, keep the
-token itself read-only, run one pipeline per trust boundary, and treat everything the token can
-read as readable by everyone who can reach the pipeline.
+allows, and read what comes back. So keep the policy and the token to the repositories the work
+needs and to reading, run one pipeline per trust boundary, and treat everything the token can read as
+readable by everyone who can reach the pipeline.
 
 ### Session lifecycle
 
