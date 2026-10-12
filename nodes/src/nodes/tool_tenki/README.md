@@ -73,6 +73,9 @@ still running say, is overwritten. Execution functions return `exit_code`, `stdo
 `timed_out` and `truncated`; a command stopped at its timeout comes back as an ordinary result with
 `timed_out` set, not as an error. Output longer than the configured cap is truncated before it
 reaches the agent, with `truncated` set so the agent knows it did not see everything.
+Edits of one session's files take turns: `edit_file` is a read-modify-write, and two edits of the same file sent in
+one wave would otherwise read the same original and the later write would drop the earlier change (measured
+2026-10-12; both calls reported success). A command still running in the VM is not covered by that lock.
 
 A command that streams back more than 8 MiB of output is killed before it finishes. The engine
 holds a command's whole output in memory until it exits, so a runaway one (`yes`, say) would
@@ -100,6 +103,17 @@ surface: `["filesystem", "git"]` lets it read and edit a repository without lett
 A function that is not published is invisible to the agent and refused if it is called anyway. A
 value naming only unknown groups stops the pipeline at startup rather than quietly falling back to
 the default, so a typo surfaces immediately instead of widening access.
+
+### Label
+
+A name for this node instance. Several Tenki Sandbox nodes in one pipeline (one per sub-agent, say) each
+create their own session, and nothing the engine hands a node says which instance it is, so without a label
+their sessions are told apart only by random suffixes. With one, the session is named
+`rocketride-tool-tenki-<label>-<suffix>` and carries `label` in its metadata, so it can be found in the Tenki
+console or by anything that lists sessions. 1 to 32 letters, digits, `_` or `-`, starting with a letter or
+digit; a value outside that stops the pipeline at startup (and the editor warns), so it cannot surface later
+as a failed create on the first tool call. Leave it empty for none; the request to Tenki is then exactly what
+it was before the field existed.
 
 ### Max Duration (minutes)
 
@@ -459,8 +473,9 @@ engine runs teardown after a crash. In every case the VM that is not closed keep
 billing compute, until max duration pauses it, since nothing pauses an idle session sooner. That is
 why that field, rather than teardown, is the backstop to size.
 
-Sessions are named `rocketride-tool-tenki-<suffix>` and tagged `rocketride`, so anything orphaned,
-running or paused, is recognisable in the Tenki console and can be closed there.
+Sessions are named `rocketride-tool-tenki-<suffix>` (`rocketride-tool-tenki-<label>-<suffix>` when the node has a
+**Label**) and tagged `rocketride`, so anything orphaned, running or paused, is recognisable in the Tenki console
+and can be closed there.
 
 ### Running the tests
 

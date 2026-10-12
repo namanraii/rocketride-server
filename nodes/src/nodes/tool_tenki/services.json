@@ -102,6 +102,13 @@
 			"default": "",
 			"optional": true
 		},
+		"tenki.label": {
+			"type": "string",
+			"title": "Label",
+			"description": "A name for this node instance, put into its sessions' names (rocketride-tool-tenki-<label>-<suffix>) and metadata (label). With several Tenki Sandbox nodes in one pipeline, this is what tells their sessions apart in the Tenki console or in anything that lists them. 1 to 32 letters, digits, _ or -, starting with a letter or digit; a value outside that stops the pipeline at startup. Leave empty for none.",
+			"default": "",
+			"optional": true
+		},
 		"tenki.secret_policies": {
 			"type": "array",
 			"title": "Secret policies",
@@ -168,7 +175,7 @@
 		{
 			"section": "Pipe",
 			"title": "Tenki Sandbox",
-			"properties": ["type", "tenki.apikey", "tenki.base_url", "tenki.cpu_cores", "tenki.memory_mb", "tenki.disk_size_gb", "tenki.max_duration_minutes", "tenki.pause_retention_hours", "tenki.exec_timeout_secs", "tenki.max_output_chars", "tenki.image", "tenki.secret_policies", "tenki.allow_domains", "tenki.git_auth_url", "tenki.git_auth_secret", "tenki.toolGroups"]
+			"properties": ["type", "tenki.apikey", "tenki.base_url", "tenki.cpu_cores", "tenki.memory_mb", "tenki.disk_size_gb", "tenki.max_duration_minutes", "tenki.pause_retention_hours", "tenki.exec_timeout_secs", "tenki.max_output_chars", "tenki.image", "tenki.label", "tenki.secret_policies", "tenki.allow_domains", "tenki.git_auth_url", "tenki.git_auth_secret", "tenki.toolGroups"]
 		}
 	]
 }

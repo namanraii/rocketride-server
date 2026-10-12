@@ -43,6 +43,7 @@ import shlex
 import threading
 import urllib.parse
 import uuid
+from contextlib import nullcontext
 from typing import Callable
 
 from rocketlib import IInstanceBase
@@ -911,6 +912,12 @@ class IInstance(IInstanceBase):
             raise ValueError('"new_text" is required and must be a string (it may be empty)')
 
         def edit(session, sent):
+            # One edit at a time per session: the read-modify-write below is not atomic, and two edits of the same file in
+            # one wave would otherwise read the same original and the later write would drop the earlier change.
+            with self.IGlobal._edit_lock or nullcontext():
+                return _edit_once(session, sent)
+
+        def _edit_once(session, sent):
             # Read with the same calls and limit as read_file, so a huge file is refused before it is fetched.
             info = session.fs.stat(path)
             if info.is_dir:
@@ -935,8 +942,9 @@ class IInstance(IInstanceBase):
                     f'the edited file would be more than {_READ_LIMIT_BYTES:,} bytes, which read_file could not read '
                     'back; change it with run_command instead'
                 )
-            # Not atomic with the read: a change made to the file in between (by a command still running, say)
-            # is overwritten. The read is not a change, so a pause met before this point is retried.
+            # Not atomic with the read against a command still running in the VM: a change it makes in between is
+            # overwritten. Other edit_file calls wait for the lock above. The read is not a change, so a pause met before
+            # this point is retried.
             sent.append(True)
             session.fs.write_text(path, edited)
             return None

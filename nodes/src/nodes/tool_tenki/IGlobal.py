@@ -414,6 +414,33 @@ def _outlives_the_session(exec_timeout_secs: int, max_duration_minutes: int) -> 
     )
 
 
+#: What a label may look like: it is put into the session's name and metadata, so it is kept to the characters a
+#: session name already uses (measured: Tenki accepts rocketride-tool-tenki-<hex>), and short enough to read.
+_LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,31}')
+
+
+def _label(cfg) -> str:
+    """The configured ``tenki.label``, stripped, or '' when none was set.
+
+    Several instances of this node in one pipeline each create their own session, and nothing the engine
+    hands a node says which instance it is. The label is the operator's name for the instance; it is stamped
+    on the session (name and metadata) so the sessions can be told apart in Tenki's console or by anything
+    that lists them. A value that could be refused there would only surface on the first tool call, as a
+    failed create, so it is refused here, where the config is read.
+
+    Raises:
+        ValueError: For a label that is not 1 to 32 characters of letters, digits, ``_`` and ``-``, starting
+            with a letter or digit.
+    """
+    label = str(cfg.get('label') or '').strip()
+    if label and not _LABEL.fullmatch(label):
+        raise ValueError(
+            f'tenki.label {label!r} is not a label Tenki can carry: use 1 to 32 letters, digits, "_" or "-", '
+            'starting with a letter or digit, or leave the field empty.'
+        )
+    return label
+
+
 def _int_or(value, default: int, *, lo: int, hi: int) -> int:
     try:
         n = int(value)
@@ -436,6 +463,9 @@ class IGlobal(IGlobalBase):
     # deepagent's asyncio.gather fan-out), and an unsynchronized check-then-act would
     # create two billed sessions and orphan one, or resume one session several times.
     _session_lock: threading.Lock | None = None
+    # Serialises edit_file's read-modify-write per session: a wave agent may send two edits of one file in the same wave, and
+    # without this the later write dropped the earlier edit while both calls reported success (measured 2026-10-12).
+    _edit_lock: threading.Lock | None = None
     # How the most recent recovery went, 'resumed' or 'replaced'. A call that retries after a
     # concurrent call did the recovering reports this, since it did not see the recovery itself.
     last_recovery: str = ''
@@ -469,6 +499,8 @@ class IGlobal(IGlobalBase):
 
     rpc_timeout_secs: int = 120
     image: str = ''
+    # The operator's name for this instance, stamped on its sessions (see _label). Empty when none was set.
+    label: str = ''
     # Tenki request policies to attach, by name. As Tenki documents it, it holds the secret values and
     # substitutes them outside the VM, into requests a policy allows; the node sends nothing but the names.
     secret_policies: tuple[str, ...] = ()
@@ -492,6 +524,7 @@ class IGlobal(IGlobalBase):
             return
 
         self._session_lock = threading.Lock()
+        self._edit_lock = threading.Lock()
         self._ending = False
         self._create_attempted = False
         self._resume_retry_until = None
@@ -521,6 +554,7 @@ class IGlobal(IGlobalBase):
 
         base_url = str((cfg.get('base_url') or '')).strip() or _DEFAULT_BASE_URL
         self.image = str((cfg.get('image') or '')).strip()
+        self.label = _label(cfg)
         self.secret_policies, self.allow_domains = _secret_settings(cfg)
         self.git_auth_url, self.git_auth_secret = _git_auth_settings(cfg, self.secret_policies, self.allow_domains)
         self.cpu_cores = _int_or(cfg.get('cpu_cores'), 2, lo=1, hi=16)
@@ -632,9 +666,13 @@ class IGlobal(IGlobalBase):
             'allow_outbound': True,
             # So that a session a crashed engine left behind can be recognised in Tenki's console
             # and listed by tag. The suffix keeps names distinct in case the service requires it.
-            'name': f'rocketride-tool-tenki-{uuid.uuid4().hex[:8]}',
+            'name': f'rocketride-tool-tenki-{self.label + "-" if self.label else ""}{uuid.uuid4().hex[:8]}',
             'tags': ['rocketride', self._run_tag],
-            'metadata': {'created_by': 'rocketride', 'node': 'tool_tenki'},
+            'metadata': {
+                'created_by': 'rocketride',
+                'node': 'tool_tenki',
+                **({'label': self.label} if self.label else {}),
+            },
         }
         if self.image:
             create_kwargs['image'] = self.image
@@ -1064,6 +1102,10 @@ class IGlobal(IGlobalBase):
                 warning('toolGroups matches no known group, so the pipeline will fail to start')
             try:
                 _git_auth_settings(cfg, *_secret_settings(cfg))
+            except ValueError as e:
+                warning(f'The pipeline will fail to start: {e}')
+            try:
+                _label(cfg)
             except ValueError as e:
                 warning(f'The pipeline will fail to start: {e}')
         except Exception as e:

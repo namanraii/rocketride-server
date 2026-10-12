@@ -4506,6 +4506,47 @@ def test_sessions_are_labelled_so_an_orphan_can_be_found(monkeypatch, logs):
     assert first['name'] != second['name']
 
 
+def test_a_configured_label_names_the_session_and_rides_in_its_metadata(monkeypatch, logs):
+    # Several instances in one pipeline each make their own session. Nothing the engine hands the node says
+    # which instance it is, so an operator (or a dashboard reading Tenki) can only tell the sessions apart by
+    # something the node stamps on the session itself: the label goes into the name and the metadata.
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'), _FakeSession('sb-2'), cfg={'label': ' verify '})
+    glb.get_session()
+    glb.session = None
+    glb.get_session()
+    first, second = client.create_calls
+    assert first['name'].startswith('rocketride-tool-tenki-verify-')
+    assert first['name'] != second['name']
+    assert first['metadata'] == {'created_by': 'rocketride', 'node': 'tool_tenki', 'label': 'verify'}
+    assert second['metadata'] == first['metadata']
+    assert first['tags'] == ['rocketride', glb._run_tag]  # the tags stay as they were
+
+
+def test_an_empty_label_leaves_the_create_request_as_it_was(monkeypatch, logs):
+    glb, client = _started(monkeypatch, _FakeSession('sb-1'), cfg={'label': '   '})
+    glb.get_session()
+    [kwargs] = client.create_calls
+    assert kwargs['metadata'] == {'created_by': 'rocketride', 'node': 'tool_tenki'}
+    assert (
+        kwargs['name'].startswith('rocketride-tool-tenki-') and len(kwargs['name']) == len('rocketride-tool-tenki-') + 8
+    )
+
+
+@pytest.mark.parametrize('bad', ['has space', 'slash/y', 'dot.', '-leading', 'a' * 33, 'ünïcode'])
+def test_a_label_that_could_be_refused_stops_the_pipeline_at_startup(monkeypatch, logs, bad):
+    # The label lands in the session name and metadata; a value Tenki could refuse would surface as a failed
+    # create on the first tool call, long after the operator could see it. Refuse it where the config is read.
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, 'label': bad})
+    with pytest.raises(ValueError, match='tenki.label'):
+        glb.beginGlobal()
+
+
+def test_validate_config_warns_about_a_label_that_will_stop_the_pipeline(monkeypatch, logs):
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, 'label': 'no spaces allowed'})
+    glb.validateConfig()
+    assert any('tenki.label' in message and 'fail to start' in message for message in logs)
+
+
 def test_groups_without_tools_are_no_longer_offered():
     # Selecting one used to validate and then publish nothing at all.
     with pytest.raises(ValueError):
@@ -5051,3 +5092,40 @@ def test_edit_file_whose_write_was_in_flight_when_the_session_was_paused_is_not_
     result = inst.edit_file({'path': 'f.txt', 'old_text': 'old', 'new_text': 'new'})
     assert result['session'] == 'resumed' and 'not sent again' in result['error']
     assert sum(1 for call in session.calls if call[0] == 'write_text') == 1
+
+
+def test_two_edits_to_one_file_in_the_same_wave_keep_both_changes(monkeypatch, logs):
+    # Measured 2026-10-12: a wave agent sent two edit_file calls for the same file in one wave. Each read the original,
+    # the later write dropped the earlier edit, and both calls reported success. Edits to a session's files are a
+    # read-modify-write, so they have to take turns.
+    import threading
+
+    session = _FakeSession('sb-1', files={'/home/tenki/app.py': 'a = 1\nb = 2\nc = 3\n'})
+    inst, _ = _instance(monkeypatch, session)
+    both_read = threading.Barrier(2)
+    real_read = session.fs._read_bytes
+
+    def slow_read(path):
+        text = real_read(path)
+        try:
+            both_read.wait(timeout=0.5)  # without serialisation both edits get here before either writes
+        except threading.BrokenBarrierError:
+            pass
+        return text
+
+    monkeypatch.setattr(session.fs, '_read_bytes', slow_read)
+    results = {}
+
+    def run(name, old, new):
+        results[name] = inst.edit_file({'path': 'app.py', 'old_text': old, 'new_text': new})
+
+    threads = [
+        threading.Thread(target=run, args=('first', 'a = 1', 'a = 10')),
+        threading.Thread(target=run, args=('second', 'c = 3', 'c = 30')),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert results['first']['success'] and results['second']['success']
+    assert session.fs.files['/home/tenki/app.py'] == 'a = 10\nb = 2\nc = 30\n', 'the first edit survived the second'
