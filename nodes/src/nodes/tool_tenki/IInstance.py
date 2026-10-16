@@ -36,6 +36,7 @@ not start it again (see ``_StartedOnce``).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import posixpath
 import re
@@ -54,6 +55,7 @@ from tenki import CommandTimeoutError, PermissionDeniedError, SandboxError
 from tenki import FileNotFoundError as TenkiFileNotFoundError  # also subclasses the builtin it shadows
 
 from .IGlobal import CommandNotStartedError, IGlobal, ResumeNotConfirmedError, SessionEndedError, about_the_vm_link
+from .output_sink import stop_keeping_output
 from .tool_groups import tenki_tool
 
 #: The session's home and default working directory, and the only root Tenki's file API accepts.
@@ -85,13 +87,15 @@ _MAX_LOG_COUNT = 1000
 #: How long past the execution timeout a command's result may take to arrive. Tenki stops the command
 #: at the timeout and reports it on the result; only a stalled stream ever reaches this limit.
 _RESULT_GRACE_SECS = 30
-# The most output one command may stream back before it is treated as runaway and killed. The SDK
+# The most output of one command the engine keeps; past it the command is treated as runaway. The SDK
 # keeps everything a command prints in memory until the command exits, with no limit of its own, so
 # a command that floods its output (`yes`, `cat /dev/urandom | base64`) would grow the engine for as
-# long as the execution timeout allows. This is a memory ceiling, not the output cap:
-# max_output_chars still decides what the agent is shown, and a chatty but finite command (a large
-# apt-get install, pytest -v, a build) runs to completion and is merely truncated. It sits above the
-# most the agent can ever be shown (1M characters, at most 4 MB of UTF-8), so it never cuts into that.
+# long as the execution timeout allows. At this limit the node stops the SDK keeping any more of it,
+# keeps what it has for the agent, and kills the command (see _OutputGuard). This is a memory ceiling,
+# not the output cap: max_output_chars still decides what the agent is shown, and a chatty but finite
+# command (a large apt-get install, pytest -v, a build) runs to completion and is merely truncated. It
+# sits above the most the agent can ever be shown (1M characters, at most 4 MB of UTF-8), so it never
+# cuts into that.
 _OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024
 # The largest file read_file fetches. It reads through the SDK's unary ReadFile call, which the node
 # sends with a deadline (see file_deadline); the streaming read has none, so a half-open connection
@@ -113,19 +117,39 @@ _READ_LIMIT_BYTES = 4_000_000
 # the command's) and is inherited by everything the command starts, whatever becomes of its parent. To
 # stop a command, a second command finds the processes carrying that marker in /proc and stops them all,
 # then kills them, until none is left: bash builtins and /proc only, so no procps is needed, and a parent
-# that forks again is stopped before it can. Only the command's own processes carry its marker: never
-# the sandbox's agent, another command or another session. Out of reach: a process that clears its
-# environment (`env -i`, sudo's env_reset) or runs as another user; the sandbox's own kill is sent after,
-# and Tenki's execution timeout, at which it stops the command and its children (measured), is the
-# backstop. Tested on real Linux (python:3.12-slim and node:24-slim, neither with procps): simple command,
-# pipeline, background and nohup jobs whose shell had exited, a setsid child, a re-forking loop and nested
-# subshells all left no process, and another command's processes and the agent's were untouched.
+# that forks again is stopped before it can. It then prints how many it found, how many of those it killed
+# and how many are left, and exits non-zero if any are. Only the command's own processes carry its marker:
+# never the sandbox's agent, another command or another session. Out of reach: a process that clears its
+# environment (`env -i`, sudo's env_reset) or runs as another user. That runs on in the VM until Tenki's
+# execution timeout, at which Tenki stops the command and its children (measured): a limit on VM time, not
+# on the engine's memory, which the node bounds by no longer keeping the output (see _OutputGuard). The
+# sandbox's own kill is sent after. Tested on real Linux (python:3.12-slim and node:24-slim, neither with
+# procps): simple command, pipeline, background and nohup jobs whose shell had exited, a setsid child, a
+# re-forking loop and nested subshells all left no process, and another command's processes and the
+# agent's were untouched.
 _RUN_MARKER = 'TOOL_TENKI_RUN'
-_KILL_TREE_SCRIPT = 'm="$1"; n=0; for pass in 1 2 3 4 5 6; do hit=""; for d in /proc/[0-9]*; do p="${d##*/}"; [ "$p" = "$$" ] && continue; { while IFS= read -r -d "" kv; do if [ "$kv" = "$m" ]; then kill -STOP "$p" 2>/dev/null && hit="$hit $p"; break; fi; done < "$d/environ"; } 2>/dev/null; done; [ -z "$hit" ] && break; for p in $hit; do kill -KILL "$p" 2>/dev/null && n=$((n+1)); done; done; echo "killed=$n"'
+_KILL_TREE_SCRIPT = (
+    'm="$1"; found=" "; killed=" "; '
+    'scan() { hit=""; for d in /proc/[0-9]*; do p="${d##*/}"; [ "$p" = "$$" ] && continue; '
+    '{ while IFS= read -r -d "" kv; do if [ "$kv" = "$m" ]; then hit="$hit $p"; '
+    '[ "$1" = stop ] && kill -STOP "$p" 2>/dev/null; break; fi; done < "$d/environ"; } 2>/dev/null; done; }; '
+    'for pass in 1 2 3 4 5 6; do scan stop; [ -z "$hit" ] && break; for p in $hit; do '
+    'case "$found" in *" $p "*) ;; *) found="$found$p ";; esac; '
+    'kill -KILL "$p" 2>/dev/null && case "$killed" in *" $p "*) ;; *) killed="$killed$p ";; esac; done; done; '
+    'scan; k=0; for p in $killed; do case "$hit " in *" $p "*) ;; *) k=$((k+1));; esac; done; '
+    'set -- $found; f=$#; set -- $hit; echo "found=$f killed=$k left=$#"; [ $# -eq 0 ]'
+)
 _KILL_TREE_WAIT_SECS = 15
 _KILLED_NOTICE = (
     '[tool_tenki: the command was killed before it finished, because it produced more than {limit:,} bytes '
-    'of output, the most a command may stream back. Send large output to a file instead (for example '
+    'of output, the most a command may stream back, and output past that point was not kept. Send large '
+    'output to a file instead (for example `> out.log 2>&1`) and read back the part you need.]'
+)
+_CUT_NOTICE = (
+    '[tool_tenki: the command produced more than {limit:,} bytes of output, the most a command may stream '
+    'back, and output past that point was not kept. The node could not confirm that it stopped the command: '
+    'it had finished by then, or part of it was out of reach (run under sudo, for example) and ran until it '
+    'ended or reached the execution timeout. Send large output to a file instead (for example '
     '`> out.log 2>&1`) and read back the part you need.]'
 )
 
@@ -185,8 +209,8 @@ _EXEC_OUTPUT_SCHEMA = {
         },
         'truncated': {
             'type': 'boolean',
-            'description': 'True if stdout or stderr was cut to fit the output cap, or the command was killed for '
-            'producing too much output (stderr then says so).',
+            'description': 'True if stdout or stderr was cut to fit the output cap, or the command produced more '
+            'output than is kept (stderr then says so, and whether the command was killed for it).',
         },
         'error': {'type': 'string', 'description': 'Error message if the sandbox call failed.'},
         'session': _SESSION_EVENT,
@@ -425,19 +449,22 @@ def _truncate(text: str, cap: int) -> tuple[str, bool]:
     return text[:cap], True
 
 
-def _exec_result(result, cap: int, *, killed: bool = False) -> dict:
+def _exec_result(result, cap: int, *, cut: bool = False, killed: int = 0) -> dict:
     """Shape a Tenki CommandResult into the tool output, with ``cap`` shared by both streams.
 
     Errors usually land on stderr, so a flood on stdout must not push them out: stderr may
     always keep up to half of the cap, and either stream may use whatever the other leaves.
-    ``killed`` means the command was stopped for producing too much output; the agent is told
-    so on stderr, where a shell would report the kill, after the cap so it is never cut off.
+    ``cut`` means the command printed more than the node keeps (see _OutputGuard), and ``killed``
+    how many of its processes the node's kill then stopped. The agent is told on stderr, where a
+    shell would report a kill, after the cap so it is never cut off. The command is said to be
+    killed on that count alone: its exit status is its root process's, which can be 0 while a
+    background job it started was killed, or a kill signal while what flooded ran on.
     """
     stdout_text, stderr_text = result.stdout_text, result.stderr_text
     stderr, stderr_cut = _truncate(stderr_text, max(cap // 2, cap - len(stdout_text)))
     stdout, stdout_cut = _truncate(stdout_text, cap - len(stderr))
-    if killed:
-        notice = _KILLED_NOTICE.format(limit=_OUTPUT_LIMIT_BYTES)
+    if cut:
+        notice = (_KILLED_NOTICE if killed else _CUT_NOTICE).format(limit=_OUTPUT_LIMIT_BYTES)
         stderr = f'{stderr}\n{notice}' if stderr else notice
     if _INJECTION_DENIED in stdout_text or _INJECTION_DENIED in stderr_text:
         # After the cap, like the kill notice, so it is never the part that gets cut off.
@@ -447,16 +474,19 @@ def _exec_result(result, cap: int, *, killed: bool = False) -> dict:
         'stdout': stdout,
         'stderr': stderr,
         'timed_out': bool(result.timed_out),
-        'truncated': killed or stdout_cut or stderr_cut,
+        'truncated': cut or stdout_cut or stderr_cut,
     }
 
 
-def _kill_command_tree(session, process, marker: str | None) -> None:
+def _kill_command_tree(session, process, marker: str | None) -> int:
     """Kill every process carrying the command's ``marker`` in the sandbox, then send the sandbox's own kill.
 
-    See ``_KILL_TREE_SCRIPT``. Without a session or a marker only the sandbox's kill is sent. A kill that
-    could not run is logged for the operator: the command then streams on until Tenki's execution timeout.
+    Returns how many processes the kill stopped, as its report says (see ``_KILL_TREE_SCRIPT``), or 0 when it
+    did not do its job: it could not run, ran into its timeout, gave no report, or left a marked process
+    behind. Those, and a kill that found none of the command's processes, are logged for the operator.
+    Without a session or a marker only the sandbox's kill is sent.
     """
+    killed = 0
     if session is not None and marker:
         try:
             killer = session.start(
@@ -464,24 +494,43 @@ def _kill_command_tree(session, process, marker: str | None) -> None:
             )
             killer.close_stdin()
             outcome = killer.wait(timeout=_KILL_TREE_WAIT_SECS + _RESULT_GRACE_SECS)
-            if getattr(outcome, 'exit_code', 0) != 0:
-                raise SandboxError(f'the kill command exited {outcome.exit_code}')
+            report = outcome.stdout_text.strip()
+            counts = re.fullmatch(r'found=(\d+) killed=(\d+) left=(\d+)', report)
+            if counts is None or outcome.exit_code != 0 or outcome.signal or outcome.timed_out:
+                stopped = ', stopped at its timeout' if outcome.timed_out else ''
+                raise SandboxError(
+                    f'the kill command reported {report or "nothing"!r} and exited {outcome.exit_code}{stopped}'
+                )
+            if counts[1] == '0':
+                warning(
+                    'tool_tenki: a command passed the output limit, and the kill found none of its processes: they '
+                    'had exited, or what kept printing had left its environment (sudo, env -i) and runs on in the VM '
+                    'until the execution timeout. None of its output past the limit is kept.'
+                )
+            killed = int(counts[2])
         except Exception as e:
-            # Best effort: the sandbox's kill is still sent, and the execution timeout is the backstop.
+            # Best effort: the sandbox's kill is still sent, and the execution timeout stops what is left.
             warning(
-                'tool_tenki: could not stop all the processes of a command that flooded its output '
-                f'({e}); Tenki stops it at the execution timeout'
+                'tool_tenki: could not stop all the processes of a command that passed the output limit '
+                f'({e}); what is left runs on in the VM until the execution timeout. None of its output past '
+                'the limit is kept.'
             )
     process.kill()
+    return killed
 
 
 class _OutputGuard:
-    """Reads a running command's output as it arrives, and kills the command once there is too much.
+    """Reads a running command's output as it arrives, and stops keeping it once there is too much.
 
-    Reading as it arrives is what lets the limit be noticed while the command runs rather than after
-    it exits. It does not shrink what the SDK holds, which keeps its own copy of every chunk until
-    the command exits; that is why the command is killed rather than merely no longer read. The
-    whole process tree is killed, not only the process the sandbox started (see ``_kill_command_tree``).
+    The SDK keeps its own copy of every chunk until the command exits, with no limit, and the node
+    cannot cancel the run. So once the command has printed more than ``limit`` bytes, the guard
+    replaces the process's streams with ones that keep nothing (see output_sink): that is what bounds
+    the engine's memory, whatever the command does next. The guard keeps the first ``limit`` bytes
+    itself, for the agent. Then it kills the command, every process it started (see
+    ``_kill_command_tree``), and records how many processes that stopped. The kill is cleanup, not the
+    bound: what it cannot reach runs on in the VM until the execution timeout, and the SDK receives
+    that output and drops it. Reading as it arrives is what lets the limit be noticed while the command
+    runs rather than after it exits.
     """
 
     def __init__(self, process, limit: int, session=None, marker: str | None = None):
@@ -491,23 +540,34 @@ class _OutputGuard:
         self._limit = limit
         self._lock = threading.Lock()
         self._received = 0
-        self.killed = False
+        self._kept = ([], [])
+        #: Whether the command printed more than ``limit`` bytes, so that its output is no longer kept.
+        self.cut = False
+        #: How many of the command's processes the kill stopped (see _kill_command_tree).
+        self.killed = 0
         self._readers = [
-            threading.Thread(target=self._read, args=(stream,), name='tool_tenki-output', daemon=True)
-            for stream in (process.stdout, process.stderr)
+            threading.Thread(target=self._read, args=(stream, kept), name='tool_tenki-output', daemon=True)
+            for stream, kept in zip((process.stdout, process.stderr), self._kept)
         ]
         for reader in self._readers:
             reader.start()
 
-    def _read(self, stream) -> None:
+    def kept(self) -> tuple[bytes, bytes]:
+        """The stdout and stderr the guard kept: all of both, or, once ``cut``, the first ``limit`` bytes."""
+        return b''.join(self._kept[0]), b''.join(self._kept[1])
+
+    def _read(self, stream, kept: list) -> None:
         try:
             for chunk in stream:
                 with self._lock:
+                    if self.cut:
+                        continue  # arrived before the streams were replaced, and past the limit: not kept
+                    kept.append(chunk[: self._limit - self._received])
                     self._received += len(chunk)
-                    kill = self._received > self._limit and not self.killed
-                    self.killed = self.killed or kill
-                if kill:
-                    _kill_command_tree(self._session, self._process, self._marker)
+                    cut = self.cut = self._received > self._limit
+                if cut:
+                    stop_keeping_output(self._process)
+                    self.killed = _kill_command_tree(self._session, self._process, self._marker)
         except Exception:
             # A stream fails when its run does, and wait() raises that same error, so it is reported there.
             pass
@@ -517,7 +577,8 @@ class _OutputGuard:
 
         Once a command exits the SDK has ended its streams already, and this only adds an end marker
         nobody reads. After a stalled run it never will, and without this the readers would block for
-        good: the one thing that releases them is ending the streams they are reading.
+        good: the one thing that releases them is ending the streams they are reading. Once the streams
+        were replaced (see output_sink), the ones the readers read were ended then.
         """
         for stream in (self._process.stdout, self._process.stderr):
             stream.close()
@@ -673,9 +734,10 @@ class _ChangeOnce:
 def _run_process(session, argv, timeout: int, started: list):
     """Run ``argv`` in ``session``, without ever waiting unboundedly or holding unbounded output.
 
-    Returns the CommandResult, and whether the command was killed for producing more than
-    _OUTPUT_LIMIT_BYTES of output (see _OutputGuard). ``started`` is appended to once the sandbox
-    has confirmed the start (see _StartedOnce).
+    Returns the CommandResult; whether the command printed more than _OUTPUT_LIMIT_BYTES, so that
+    the node stopped keeping its output and the result carries the part it kept; and how many of
+    the command's processes the node's kill then stopped (see _OutputGuard). ``started`` is
+    appended to once the sandbox has confirmed the start (see _StartedOnce).
 
     Sandbox.exec waits on the output stream with no local limit, so a stream that stalls (on a
     half-open connection, say) would hang the tool call for good. Tenki stops the command at
@@ -711,10 +773,11 @@ def _run_process(session, argv, timeout: int, started: list):
         ) from e
     finally:
         guard.stop()
-    # A command that crossed the limit but exited 0 by itself before any kill took was not killed: it is only cut
-    # to the cap, and the agent is not told it stopped early.
-    finished_by_itself = result.exit_code == 0 and not result.signal and not result.timed_out
-    return result, guard.killed and not finished_by_itself
+    if guard.cut:
+        # The SDK kept nothing once its streams were replaced, and its result carries no output.
+        stdout, stderr = guard.kept()
+        result = dataclasses.replace(result, stdout=stdout, stderr=stderr)
+    return result, guard.cut, guard.killed
 
 
 def _with_session_event(output: dict, events: list) -> dict:
@@ -812,10 +875,11 @@ class IInstance(IInstanceBase):
         events = []
         once = _StartedOnce(run, events)
         try:
-            result, killed = self.IGlobal.call_with_session(once, on_event=once.recovered)
+            result, cut, killed = self.IGlobal.call_with_session(once, on_event=once.recovered)
         except SandboxError as e:
             return _with_session_event(_exec_error(once.reported(e)), events)
-        return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars, killed=killed), events)
+        output = _exec_result(result, self.IGlobal.max_output_chars, cut=cut, killed=killed)
+        return _with_session_event(output, events)
 
     @tenki_tool(
         group='execution',
@@ -876,10 +940,11 @@ class IInstance(IInstanceBase):
         events = []
         once = _StartedOnce(run, events)
         try:
-            result, killed = self.IGlobal.call_with_session(once, on_event=once.recovered)
+            result, cut, killed = self.IGlobal.call_with_session(once, on_event=once.recovered)
         except SandboxError as e:
             return _with_session_event(_exec_error(once.reported(e)), events)
-        return _with_session_event(_exec_result(result, self.IGlobal.max_output_chars, killed=killed), events)
+        output = _exec_result(result, self.IGlobal.max_output_chars, cut=cut, killed=killed)
+        return _with_session_event(output, events)
 
     # -----------------------------------------------------------------------
     # Group: filesystem
@@ -1290,7 +1355,7 @@ class IInstance(IInstanceBase):
             error = str(once.reported(e))
         else:
             if private is not None:
-                output, killed = output
+                output, _, killed = output
                 text = '\n'.join(part for part in (output.stderr_text.strip(), output.stdout_text.strip()) if part)
                 if killed:
                     # The note first, so that truncating git's output cannot cut it off.

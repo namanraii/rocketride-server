@@ -35,6 +35,9 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import threading
+import time
+import tracemalloc
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,11 +58,17 @@ from tenki_sandbox.process import Process, ProcessStream
 
 _REQUIRED = inspect.Parameter.empty
 
-# The node's own module, loaded from source: it has no engine imports, so it runs against the real SDK.
-_SOURCE = Path(__file__).resolve().parents[1] / 'src' / 'nodes' / 'tool_tenki' / 'file_deadline.py'
-_spec = importlib.util.spec_from_file_location('tool_tenki_file_deadline', _SOURCE)
-file_deadline = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(file_deadline)
+
+def _node_module(name: str):
+    """One of the node's own modules, loaded from source: those without engine imports run against the real SDK."""
+    source = Path(__file__).resolve().parents[1] / 'src' / 'nodes' / 'tool_tenki' / f'{name}.py'
+    spec = importlib.util.spec_from_file_location(f'tool_tenki_{name}', source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+file_deadline = _node_module('file_deadline')
 
 
 def _parameters(function):
@@ -565,3 +574,77 @@ def test_a_resume_drops_the_routes_verification_so_the_no_op_command_runs_again(
     assert 'self._reset_data_plane()' in inspect.getsource(tenki.Sandbox.resume)
     session._reset_data_plane()
     assert session._data_plane_verified is False
+
+
+# ---------------------------------------------------------------------------
+# What bounds the engine's memory once a command passes the output limit (IInstance._OutputGuard)
+# ---------------------------------------------------------------------------
+
+
+class _FloodingDataPlane:
+    """In place of a session's data plane: a command that prints ``before`` bytes, waits for ``go_on``, then prints
+    ``after`` more, in 64 KiB frames, and exits 0.
+    """
+
+    endpoint = 'https://127.0.0.1:9'
+    frame = b'y\n' * 32768
+
+    def __init__(self, before: int, after: int):
+        self.before, self.after = before, after
+        self.go_on = threading.Event()
+
+    def ensure_serving(self, session_id, **kwargs):
+        pass
+
+    def run(self, requests, **kwargs):
+        next(iter(requests))  # the start
+        yield pb.RunResponse(started=pb.RunStarted(pid=7))
+        for _ in range(self.before // len(self.frame)):
+            yield pb.RunResponse(stdout=self.frame)
+        self.go_on.wait(timeout=30)
+        for _ in range(self.after // len(self.frame)):
+            yield pb.RunResponse(stdout=self.frame)
+        yield pb.RunResponse(exit=pb.RunExit(exit_code=0))
+
+    def close(self):
+        pass
+
+
+def test_once_the_node_replaces_a_processs_streams_the_sdk_keeps_none_of_the_output_that_follows():
+    # The SDK keeps every chunk until the command exits and cannot cancel a run, so at the limit the node replaces
+    # the process's streams with ones that keep nothing. That holds only while the SDK's stream thread looks the
+    # streams up for every frame: were it to hold on to the ones it started with, or keep frames anywhere else, the
+    # 64 MiB that follow the swap here would stay in memory, and this fails.
+    output_sink = _node_module('output_sink')
+    before, after = 1024 * 1024, 64 * 1024 * 1024
+    plane = _FloodingDataPlane(before, after)
+    session = tenki.Sandbox(SimpleNamespace(_rpc=object()), tenki.SandboxInfo(id='sb-contract'))
+    session._data_plane_rpc, session._data_plane_verified = plane, True
+    process = session.start('yes', timeout=60)
+    process.close_stdin()
+    first = process.stdout
+    deadline = time.monotonic() + 30
+    while len(first.read()) < before:
+        assert time.monotonic() < deadline, 'the frames before the swap never arrived'
+        time.sleep(0.01)
+    reader = threading.Thread(target=lambda: sum(1 for _ in first), daemon=True)
+    reader.start()
+    tracing = tracemalloc.is_tracing()
+    if not tracing:
+        tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        baseline = tracemalloc.get_traced_memory()[0]
+        output_sink.stop_keeping_output(process)
+        plane.go_on.set()
+        result = process.wait(timeout=60)
+        grown, peak = (size - baseline for size in tracemalloc.get_traced_memory())
+    finally:
+        if not tracing:
+            tracemalloc.stop()
+    assert result.exit_code == 0 and result.stdout == b''
+    assert len(first.read()) == before, 'the stream the SDK started with kept growing after the swap'
+    assert peak < 4 * 1024 * 1024 and grown < 1024 * 1024, f'peak {peak:,} bytes, still held {grown:,} bytes'
+    # Ending the stream the SDK started with is what releases a reader blocked on it.
+    reader.join(timeout=5)
+    assert not reader.is_alive()

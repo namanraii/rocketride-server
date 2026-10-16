@@ -31,8 +31,11 @@ import importlib
 import importlib.util
 import itertools
 import json
+import os
 import posixpath
 import queue
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -245,12 +248,20 @@ class _FakeSession:
         kill_tree_error=None,
         orphans=False,
         kill_tree_exit=0,
+        escapes=False,
+        kill_tree_report=None,
+        kill_tree_timed_out=False,
     ):
         self.id = session_id
         # A flood from a background job whose shell has already exited: neither the sandbox's kill nor a walk from
         # the dead root reaches it; only the command's marker does.
         self._orphans = orphans
+        # A flood no kill reaches (see _FakeProcess). The kill command's own answer, unless kill_tree_report and the
+        # two after it say otherwise, is its count of the command's processes it found and killed.
+        self._escapes = escapes
         self.kill_tree_exit = kill_tree_exit
+        self.kill_tree_report = kill_tree_report
+        self.kill_tree_timed_out = kill_tree_timed_out
         # A flooding command that forks (a pipeline): the sandbox's kill ends the process it started and nothing
         # else, so only the node's kill of the process tree stops the flood. kill_tree_error is what starting
         # that second command raises, if anything.
@@ -300,12 +311,25 @@ class _FakeSession:
             self.calls.append(('kill_tree', target))
             if self._kill_tree_error is not None:
                 raise self._kill_tree_error
+            killed = 0
             for process in self.processes + self.warm_up_processes:
-                if process.marker is not None and process.marker == target:
+                if process.escapes or process._exited.is_set():
+                    continue  # its processes carry no marker, or are gone
+                if (process.marker is not None and process.marker == target) or (
+                    str(process.pid) == target and not process.orphaned
+                ):
                     process.tree_killed()
-                elif str(process.pid) == target and not process.orphaned:
-                    process.tree_killed()
-            killer = _FakeProcess(self, _CommandResult(argv=list(argv), exit_code=self.kill_tree_exit))
+                    killed += 1
+            report = (
+                self.kill_tree_report if self.kill_tree_report is not None else f'found={killed} killed={killed} left=0'
+            )
+            answer = _CommandResult(
+                argv=list(argv),
+                exit_code=self.kill_tree_exit,
+                stdout=report.encode(),
+                timed_out=self.kill_tree_timed_out,
+            )
+            killer = _FakeProcess(self, answer)
             self.kill_processes.append(killer)
             return killer
         warm_up = argv == _WARM_UP and not self.warm_up_faults
@@ -325,6 +349,7 @@ class _FakeSession:
             forks=self._forks or self._orphans,
             marker=marker,
             orphaned=self._orphans,
+            escapes=self._escapes,
         )
         process.raw_argv = raw_argv
         if argv == _WARM_UP:
@@ -371,18 +396,28 @@ class _FakeSession:
 class _FakeStream:
     """Stand-in for tenki's ProcessStream: a queue the run pushes chunks into, read by iterating.
 
-    Iteration blocks until the next chunk or the end, as the SDK's does. ``taken`` is set each time
-    a reader takes something from it, which is how a flooding command is paced by its reader, as a
-    real one is paced by the network.
+    Iteration blocks until the next chunk or the end, as the SDK's does. As in the SDK, every chunk
+    pushed is also kept until the command exits (``held`` counts them), and ``read`` joins them.
+    ``taken`` is set each time a reader takes something from it, which is how a flooding command is
+    paced by its reader, as a real one is paced by the network.
     """
 
     def __init__(self):
         self._queue = queue.Queue()
+        self._chunks = []
         self.taken = threading.Event()
+
+    @property
+    def held(self):
+        return sum(len(chunk) for chunk in self._chunks)
 
     def push(self, data):
         if data:
+            self._chunks.append(data)
             self._queue.put(data)
+
+    def read(self):
+        return b''.join(self._chunks)
 
     def close(self):
         self._queue.put(None)
@@ -412,23 +447,39 @@ class _FakeProcess:
     without cancelling anything, while a wait that runs out kills the process before it raises.
     Output streams in while the command runs and the result arrives once it exits. ``flood``, a
     ``(chunk, budget)`` pair, makes the command print ``chunk`` until it is killed, or until it has
-    printed ``budget`` bytes or nothing reads it, either of which ends it on its own.
+    printed ``budget`` bytes or nothing reads it, either of which ends it on its own. As in the SDK,
+    each chunk goes to whatever ``stdout`` is when it arrives, and the result joins what that stream
+    kept. ``orphaned``: what floods is a background job whose shell exited 0 at once, so the result is
+    that exit, whatever becomes of the job. ``escapes``: what floods carries no marker and survives
+    the sandbox's kill, as a child of `sudo` does, though the root (sudo) dies of that kill.
     """
 
     def __init__(
-        self, session, result, *, stalls=None, flood=None, run_error=None, forks=False, marker=None, orphaned=False
+        self,
+        session,
+        result,
+        *,
+        stalls=None,
+        flood=None,
+        run_error=None,
+        forks=False,
+        marker=None,
+        orphaned=False,
+        escapes=False,
     ):
         self.marker = marker
         self.orphaned = orphaned
+        self.escapes = escapes
         self._session = session
         self._result = result
         self._stalls = stalls
         self._error = run_error
         self._forks = forks
         self.pid = next(_PIDS)
-        self.stdout = _FakeStream()
+        self.stdout = self.first_stdout = _FakeStream()
         self.stderr = _FakeStream()
         self.printed = 0
+        self._root_killed = False
         self._killed = threading.Event()
         self._exited = threading.Event()
         if stalls is None:
@@ -445,17 +496,23 @@ class _FakeProcess:
         else:
             chunk, budget = flood
             while self.printed < budget and not self._killed.is_set():
-                self.stdout.taken.clear()
-                self.stdout.push(chunk)
+                stream = self.stdout
+                taken = getattr(stream, 'taken', None)
+                if taken is not None:
+                    taken.clear()
+                stream.push(chunk)
                 self.printed += len(chunk)
-                if not self.stdout.taken.wait(timeout=1):
+                if taken is None:
+                    # A stream the node put in place: nobody reads it, and the network still paces what arrives.
+                    self._killed.wait(timeout=0.001)
+                elif not taken.wait(timeout=1):
                     break
-            killed = self._killed.is_set()
+            root_killed = (self._killed.is_set() or self._root_killed) and not self.orphaned
             self._result = _CommandResult(
                 argv=self._result.argv,
-                exit_code=-1 if killed else 0,
-                stdout=chunk * (self.printed // len(chunk)),
-                signal='SIGKILL' if killed else None,
+                exit_code=-1 if root_killed else 0,
+                stdout=self.stdout.read(),
+                signal='SIGKILL' if root_killed else None,
             )
         # As in the SDK: the result is ready before the streams are ended.
         self._exited.set()
@@ -478,13 +535,16 @@ class _FakeProcess:
 
     def kill(self):
         self._session.calls.append(('kill',))
-        if not self._forks:
+        if self.escapes:
+            self._root_killed = True
+        elif not self._forks:
             # The sandbox's kill ends the process it started. A pipeline's children live on (measured), so a
             # forking flood is stopped by tree_killed only.
             self._killed.set()
 
     def tree_killed(self):
-        self._killed.set()
+        if not self.escapes:
+            self._killed.set()
 
 
 class _FakeFileCalls:
@@ -3215,8 +3275,10 @@ def test_a_command_that_floods_its_output_is_killed_and_the_agent_told_why(monke
     result = getattr(inst, tool)(args)
     assert ('kill',) in session.calls
     [process] = session.processes
-    # Killed on the chunk that crossed the limit, not left to print until it stopped on its own.
-    assert process.printed <= limit + 2 * len(_FLOOD)
+    # Nothing past the chunk that crossed the limit was kept, and the command was killed, not left to print until it
+    # stopped on its own.
+    assert process.first_stdout.held <= limit + 2 * len(_FLOOD)
+    assert process.printed < 64 * limit
     assert result['truncated'] is True
     assert 'killed' in result['stderr']
     assert f'{limit:,} bytes' in result['stderr']
@@ -3239,7 +3301,8 @@ def test_a_flooding_command_whose_children_outlive_the_sandboxs_kill_is_still_st
     result = getattr(inst, tool)(args)
     [process] = session.processes
     assert ('kill_tree', process.marker) in session.calls
-    assert process.printed <= limit + 2 * len(_FLOOD)
+    assert process.first_stdout.held <= limit + 2 * len(_FLOOD)
+    assert process.printed < 64 * limit
     assert result['truncated'] is True and 'killed' in result['stderr']
     # The kill command itself is bounded: a start deadline, and a wait that cannot outlast a stalled VM for good.
     [(_, argv, kwargs)] = [c for c in session.calls if c[0] == 'start' and c[1][:2] == ('bash', '-c')]
@@ -3257,7 +3320,10 @@ def test_a_tree_kill_that_fails_still_sends_the_sandboxs_kill(monkeypatch, logs)
     [process] = session.processes
     assert ('kill_tree', process.marker) in session.calls
     assert ('kill',) in session.calls
-    assert result['truncated'] is True and 'killed' in result['stderr']
+    # The sandbox's kill ended `yes`, but only the node's own kill can say it stopped every process of the command,
+    # and it did not run: the agent is told its output was cut at the limit, not that the command was killed.
+    assert result['truncated'] is True and f'{limit:,} bytes' in result['stderr']
+    assert 'killed' not in result['stderr']
 
 
 def test_a_chatty_command_that_finishes_is_truncated_but_not_killed(monkeypatch, logs):
@@ -5326,7 +5392,7 @@ def test_a_flooding_background_job_whose_shell_has_exited_is_still_stopped(monke
     inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
     result = getattr(inst, tool)(args)
     [process] = session.processes
-    assert process.printed <= limit + 2 * len(_FLOOD), f'the flood ran on to {process.printed:,} bytes'
+    assert process.printed < 64 * limit, f'the flood ran on to {process.printed:,} bytes'
     assert result['truncated'] is True and 'killed' in result['stderr']
 
 
@@ -5399,8 +5465,170 @@ def test_a_read_whose_session_was_dropped_after_it_was_handed_out_says_the_sessi
     assert not any(call[0] == 'stat' for call in fresh.calls if isinstance(call, tuple))
 
 
-@pytest.mark.parametrize('name', ['tk_github_basic', 'sk-shared-github', 'AKIA_LEGACY_POLICY', 'ghp_rotation_note'])
+@pytest.mark.parametrize('name', ['tk_github_basic', 'sk-shared-github', 'AKIA_LEGACY_POLICY'])
 def test_a_secret_name_that_merely_begins_like_a_token_is_accepted(monkeypatch, logs, name):
     glb, _ = _make_global(monkeypatch, {'apikey': _KEY, **_PRIVATE_CFG, 'git_auth_secret': name})
     glb.beginGlobal()
     assert glb.git_auth_secret == name
+
+
+# ---------------------------------------------------------------------------
+# Third audit of 2026-10-16: output past the limit is not kept, and the kill reports what it did
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'value',
+    [
+        # A classic GitHub token is ghp_ and 36 base62 characters; about 1 in 560 has no digit at all.
+        'ghp_' + 'aBcDeFgHiJkLmNoPqRsTuVwXyZaBcDeFgHiJ',
+        'github_pat_' + 'AbCdEfGhIjKlMnOpQrStUv',
+        'glpat-' + 'xYzWvUtSrQpOnMlKjIhG',
+        'ghp_rotation_note',
+    ],
+)
+def test_a_value_with_a_prefix_only_issued_tokens_carry_is_refused_by_the_prefix_alone(monkeypatch, logs, value):
+    # Nobody names a secret ghp_ or glpat-: those prefixes mark a token whatever follows, digits or not.
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, **_PRIVATE_CFG, 'git_auth_secret': value})
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert 'tenki.git_auth_secret' in str(refused.value) and value not in str(refused.value)
+
+
+def test_output_past_the_limit_is_not_kept_when_no_kill_reaches_the_flood(monkeypatch, logs):
+    # `sudo yes`: the sandbox's kill ends sudo, but `yes` runs on as root without the command's marker, so no kill
+    # reaches it and it prints until the execution timeout. The node stops keeping output at the limit, so what the
+    # engine holds stays bounded however long that is.
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit), escapes=True)
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = inst.run_command({'command': 'sudo yes'})
+    [process] = session.processes
+    assert process.printed == 64 * limit, 'something stopped the flood, so this tests nothing'
+    # The SDK's own stream stopped growing at the limit: everything after went to one that keeps nothing.
+    assert process.first_stdout.held <= limit + 2 * len(_FLOOD), f'{process.first_stdout.held:,} bytes kept'
+    assert process.stdout is not process.first_stdout
+    # What the agent sees is the start of the output, which the node kept itself.
+    assert result['stdout'] == 'y\n' * 500
+    # The root (sudo) died of the sandbox's kill, but nothing says the command stopped: no "killed".
+    assert result['truncated'] is True and f'{limit:,} bytes' in result['stderr']
+    assert 'killed' not in result['stderr']
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args'),
+    [
+        ('run_command', {'command': 'nohup python3 noisy.py & exit 0'}),
+        ('run_code', {'code': 'import os, subprocess; subprocess.Popen(["yes"]); os._exit(0)'}),
+    ],
+)
+def test_a_background_job_the_kill_stopped_is_reported_killed_though_its_shell_exited_0(monkeypatch, logs, tool, args):
+    # The result is the root shell's, which exited 0 at once. Only the kill's own count says the job was killed; an
+    # agent told its nohup job finished normally would think it still runs.
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit), orphans=True)
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = getattr(inst, tool)(args)
+    assert result['exit_code'] == 0
+    assert result['truncated'] is True and 'killed' in result['stderr']
+
+
+def test_a_kill_that_found_none_of_the_commands_processes_is_logged_for_the_operator(monkeypatch, logs):
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    warned = []
+    monkeypatch.setattr(inst_mod, 'warning', lambda message, *a, **kw: warned.append(str(message)), raising=False)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit), escapes=True)
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    inst.run_command({'command': 'sudo yes'})
+    assert any('found none' in line and 'execution timeout' in line for line in warned), warned
+
+
+@pytest.mark.parametrize(
+    ('report', 'exit_code', 'timed_out'),
+    [
+        ('found=2 killed=1 left=1', 1, False),  # a marked process outlived the kill
+        ('found=1 killed=1 left=0', 0, True),  # the kill command itself ran into its timeout
+        ('', 0, False),  # it printed no report
+    ],
+)
+def test_a_kill_that_did_not_finish_its_job_is_logged_and_not_reported_as_a_kill(
+    monkeypatch, logs, report, exit_code, timed_out
+):
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    warned = []
+    monkeypatch.setattr(inst_mod, 'warning', lambda message, *a, **kw: warned.append(str(message)), raising=False)
+    session = _FakeSession(
+        'sb-1',
+        flood=(_FLOOD, 64 * limit),
+        kill_tree_report=report,
+        kill_tree_exit=exit_code,
+        kill_tree_timed_out=timed_out,
+    )
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = inst.run_command({'command': 'yes'})
+    assert any('could not stop' in line for line in warned), warned
+    assert result['truncated'] is True and 'killed' not in result['stderr']
+
+
+def _run_the_kill_script(tmp_path, processes, marker, survivors=()):
+    """Run the node's kill script with bash over a fake /proc; return its report, its exit code and the pids left.
+
+    ``processes`` maps a pid to its environment entries. ``kill`` is a bash function here, which bash runs in place of
+    its builtin: a signal to a listed pid succeeds, and -KILL removes the pid, except one in ``survivors``, which
+    outlives it as a process blocked in the kernel does.
+    """
+    proc = tmp_path / 'proc'
+    proc.mkdir()
+    for pid, environ in processes.items():
+        (proc / str(pid)).mkdir()
+        (proc / str(pid) / 'environ').write_bytes(b''.join(entry.encode() + b'\0' for entry in environ))
+    stub = (
+        'kill() { [ -d "$FAKE_PROC/$2" ] || return 1; '
+        'if [ "$1" = -KILL ]; then case " $SURVIVORS " in *" $2 "*) ;; *) rm -r "$FAKE_PROC/$2";; esac; fi; }'
+    )
+    script = stub + '\n' + inst_mod._KILL_TREE_SCRIPT.replace('/proc/', f'{proc}/')
+    env = {**os.environ, 'FAKE_PROC': str(proc), 'SURVIVORS': ' '.join(map(str, survivors))}
+    done = subprocess.run(
+        ['bash', '-c', script, 'tool_tenki-kill', marker], capture_output=True, text=True, timeout=60, env=env
+    )
+    return done.stdout.strip(), done.returncode, sorted(int(path.name) for path in proc.iterdir())
+
+
+_NO_BASH = pytest.mark.skipif(
+    sys.platform == 'win32' or shutil.which('bash') is None, reason='the kill script runs in the Linux VM, with bash'
+)
+
+
+@_NO_BASH
+def test_the_kill_script_kills_only_the_commands_marked_processes_and_says_how_many(tmp_path):
+    mine, other = 'TOOL_TENKI_RUN=aaaa', 'TOOL_TENKI_RUN=bbbb'
+    processes = {
+        101: ['HOME=/home/tenki', mine],  # the command's root
+        102: [mine, 'PATH=/usr/bin'],  # a background job it started
+        201: [other],  # another command's
+        301: ['HOME=/home/tenki'],  # unmarked: the sandbox's agent, say
+        401: [f'NOTE={mine}', f'{mine}0'],  # the marker as another variable's value, and a longer marker
+        501: [],  # a zombie, whose environ reads empty
+    }
+    assert _run_the_kill_script(tmp_path, processes, mine) == ('found=2 killed=2 left=0', 0, [201, 301, 401, 501])
+
+
+@_NO_BASH
+def test_the_kill_script_says_when_it_found_none(tmp_path):
+    processes = {201: ['TOOL_TENKI_RUN=bbbb'], 301: ['HOME=/home/tenki']}
+    assert _run_the_kill_script(tmp_path, processes, 'TOOL_TENKI_RUN=aaaa') == (
+        'found=0 killed=0 left=0',
+        0,
+        [201, 301],
+    )
+
+
+@_NO_BASH
+def test_the_kill_script_exits_non_zero_when_a_marked_process_outlives_it(tmp_path):
+    mine = 'TOOL_TENKI_RUN=aaaa'
+    processes = {101: [mine], 102: [mine]}
+    assert _run_the_kill_script(tmp_path, processes, mine, survivors=[102]) == ('found=2 killed=1 left=1', 1, [102])

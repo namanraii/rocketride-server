@@ -79,18 +79,29 @@ Edits of one session's files take turns: `edit_file` is a read-modify-write, and
 one wave would otherwise read the same original and the later write would drop the earlier change (measured
 2026-10-12; both calls reported success). A command still running in the VM is not covered by that lock.
 
-A command that streams back more than 8 MiB of output is killed before it finishes, together with
-every process it started. The sandbox's own kill reaches only the process it started: a pipeline such
-as `cat /dev/urandom | base64` outlived its shell and streamed on until the execution timeout
-(measured), and so would a background job whose shell had already exited. So every command runs
-under an environment variable of its own (`TOOL_TENKI_RUN`), which everything it starts inherits, and
-the node stops and then kills every process carrying it from inside the VM before sending the
-sandbox's kill. This needs only bash and `/proc`, which the commands need anyway; a process that
-clears its environment or runs as another user (through `sudo`, say) is out of its reach, and Tenki's
-execution timeout stops it. The engine holds a command's whole output in memory until it exits, so a
-runaway one would otherwise grow it for as long as the execution timeout allows. The cap and this
-limit are separate: a chatty command that finishes, such as a large `apt-get install`, is only
-truncated. A killed one comes back with `truncated` set and a note on `stderr` saying why.
+The engine keeps at most 8 MiB of one command's output. The Tenki SDK holds everything a command
+prints in memory until the command exits, with no limit of its own and no way to cancel the run, so
+once a command passes 8 MiB the node replaces the SDK's output streams with ones that keep nothing:
+what arrives after that is received and dropped, and the engine's memory stays bounded whatever the
+command does. The node keeps the first 8 MiB itself, for the agent.
+
+It then kills the command, together with every process it started. The sandbox's own kill reaches
+only the process it started: a pipeline such as `cat /dev/urandom | base64` outlived its shell and
+streamed on until the execution timeout (measured), and so would a background job whose shell had
+already exited. So every command runs under an environment variable of its own (`TOOL_TENKI_RUN`),
+which everything it starts inherits, and the node stops and then kills every process carrying it from
+inside the VM before sending the sandbox's kill. This needs only bash and `/proc`, which the commands
+need anyway. A process that clears its environment or runs as another user (through `sudo`, say) is
+out of its reach: it runs on in the VM until Tenki's execution timeout stops it, which costs VM time,
+not engine memory. The kill reports how many processes it found and killed, and the operator's log
+says when it found none or could not stop them all.
+
+The cap and this limit are separate: a chatty command that finishes within 8 MiB, such as a large
+`apt-get install`, is only truncated. One that passes the limit comes back with `truncated` set and a
+note on `stderr`: that it was killed, when the kill stopped its processes, or else that its output past
+the limit was not kept and the node could not confirm it stopped. Whether it was killed comes from the
+kill's own count, never from `exit_code`, which belongs to the process the sandbox started: 0 for
+`nohup job & exit 0` even when the job was killed.
 
 A result also carries a `session` field whenever the session changed during its call: `"created"`
 (a new, empty sandbox), `"resumed"` (it had been paused; its files survived), `"replaced"` (it had

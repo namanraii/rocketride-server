@@ -307,10 +307,9 @@ def _secret_settings(cfg) -> tuple[tuple[str, ...], tuple[str, ...]]:
 #: letters, digits, underscores and hyphens. A name outside it would never be substituted.
 _SECRET_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_-]{0,127}')
 
-#: How credential values begin, as issued by GitHub, GitLab, Tenki, Anthropic and OpenAI, Slack and AWS. A value
-#: where a secret's name belongs matches the name's shape, so it is told apart by its prefix together with an issued
-#: token's length and digits (see _looks_like_a_credential), and refused; the refusal never repeats the value.
-_CREDENTIAL_PREFIXES = (
+#: How credential values begin, as issued by GitHub, GitLab and Slack: prefixes no one gives a secret's name, so a
+#: value where the name belongs that begins with one is refused whatever follows. The refusal never repeats the value.
+_TOKEN_PREFIXES = (
     'ghp_',
     'gho_',
     'ghu_',
@@ -318,20 +317,24 @@ _CREDENTIAL_PREFIXES = (
     'ghr_',
     'github_pat_',
     'glpat-',
-    'tk_',
-    'sk-',
     'xoxb-',
     'xoxp-',
-    'AKIA',
 )
+#: How credential values begin, as issued by Tenki, Anthropic and OpenAI, and AWS, but names can too (tk_github_basic,
+#: sk-shared-github, AKIA_LEGACY_POLICY): a value beginning with one is refused only with an issued token's length and
+#: digits (see _looks_like_a_credential).
+_SHARED_PREFIXES = ('tk_', 'sk-', 'AKIA')
 
 
 def _looks_like_a_credential(value: str) -> bool:
-    """Whether ``value`` reads as an issued token rather than a name: a known prefix, at least 20 characters, a digit.
+    """Whether ``value`` reads as an issued token rather than a name.
 
-    Issued tokens are long and random, so they carry digits; names such as ``tk_github_basic`` do not, and are kept.
+    A prefix only tokens carry is enough. For a prefix names share, the value must also be at least 20 characters long
+    and carry a digit: issued tokens are long and random, so they do; names such as ``tk_github_basic`` do not.
     """
-    return value.startswith(_CREDENTIAL_PREFIXES) and len(value) >= 20 and any(c.isdigit() for c in value)
+    if value.startswith(_TOKEN_PREFIXES):
+        return True
+    return value.startswith(_SHARED_PREFIXES) and len(value) >= 20 and any(c.isdigit() for c in value)
 
 
 #: The path a private-repository prefix may have: slashes and URL characters that git leaves as they are when it
@@ -399,8 +402,8 @@ def _git_auth_settings(cfg, policies: tuple[str, ...], domains: tuple[str, ...])
         return '', ''
     if isinstance(secret, str) and _looks_like_a_credential(secret.strip()):
         raise ValueError(
-            'tenki.git_auth_secret looks like a credential value (it begins like an issued token and is as long as '
-            'one), not the name of a Tenki secret. The node never holds a secret value: create the secret in Tenki '
+            'tenki.git_auth_secret looks like a credential value (it begins the way issued tokens do), not the name '
+            'of a Tenki secret. The node never holds a secret value: create the secret in Tenki '
             'and put its name here. If this is the name of a secret, rename the secret.'
         )
     if not isinstance(secret, str) or not _SECRET_NAME.fullmatch(secret.strip()):
