@@ -93,15 +93,16 @@ which everything it starts inherits, and the node stops and then kills every pro
 inside the VM before sending the sandbox's kill. This needs only bash and `/proc`, which the commands
 need anyway. A process that clears its environment or runs as another user (through `sudo`, say) is
 out of its reach: it runs on in the VM until Tenki's execution timeout stops it, which costs VM time,
-not engine memory. The kill reports how many processes it found and killed, and the operator's log
-says when it found none or could not stop them all.
+not engine memory. The kill reports how many processes it found and killed. The operator's log says
+when it found none, when it could not stop them all, and when the command's run went on for more than
+10 seconds after it, which means part of the command was out of its reach.
 
 The cap and this limit are separate: a chatty command that finishes within 8 MiB, such as a large
 `apt-get install`, is only truncated. One that passes the limit comes back with `truncated` set and a
-note on `stderr`: that it was killed, when the kill stopped its processes, or else that its output past
-the limit was not kept and the node could not confirm it stopped. Whether it was killed comes from the
-kill's own count, never from `exit_code`, which belongs to the process the sandbox started: 0 for
-`nohup job & exit 0` even when the job was killed.
+note on `stderr`: that it was killed, when the kill stopped its processes and the run ended right after,
+or else that its output past the limit was not kept and the node could not confirm it stopped. Whether
+it was killed comes from the kill's own count and the run ending with it, never from `exit_code`, which
+belongs to the process the sandbox started: 0 for `nohup job & exit 0` even when the job was killed.
 
 A result also carries a `session` field whenever the session changed during its call: `"created"`
 (a new, empty sandbox), `"resumed"` (it had been paused; its files survived), `"replaced"` (it had

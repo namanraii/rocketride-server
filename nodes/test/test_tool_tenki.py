@@ -5536,8 +5536,10 @@ def test_a_background_job_the_kill_stopped_is_reported_killed_though_its_shell_e
 
 
 def test_a_kill_that_found_none_of_the_commands_processes_is_logged_for_the_operator(monkeypatch, logs):
+    # The flood runs on for about half a second after the kill here, past a settling time made short for the test.
     limit = 64 * 1024
     monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    monkeypatch.setattr(inst_mod, '_KILL_SETTLE_SECS', 0.05, raising=False)
     warned = []
     monkeypatch.setattr(inst_mod, 'warning', lambda message, *a, **kw: warned.append(str(message)), raising=False)
     session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit), escapes=True)
@@ -5574,12 +5576,12 @@ def test_a_kill_that_did_not_finish_its_job_is_logged_and_not_reported_as_a_kill
     assert result['truncated'] is True and 'killed' not in result['stderr']
 
 
-def _run_the_kill_script(tmp_path, processes, marker, survivors=()):
+def _run_the_kill_script(tmp_path, processes, marker, survivors=(), preamble=''):
     """Run the node's kill script with bash over a fake /proc; return its report, its exit code and the pids left.
 
     ``processes`` maps a pid to its environment entries. ``kill`` is a bash function here, which bash runs in place of
     its builtin: a signal to a listed pid succeeds, and -KILL removes the pid, except one in ``survivors``, which
-    outlives it as a process blocked in the kernel does.
+    outlives it as a process blocked in the kernel does. ``preamble`` is more bash, run before the script.
     """
     proc = tmp_path / 'proc'
     proc.mkdir()
@@ -5590,7 +5592,7 @@ def _run_the_kill_script(tmp_path, processes, marker, survivors=()):
         'kill() { [ -d "$FAKE_PROC/$2" ] || return 1; '
         'if [ "$1" = -KILL ]; then case " $SURVIVORS " in *" $2 "*) ;; *) rm -r "$FAKE_PROC/$2";; esac; fi; }'
     )
-    script = stub + '\n' + inst_mod._KILL_TREE_SCRIPT.replace('/proc/', f'{proc}/')
+    script = f'{stub}\n{preamble}\n' + inst_mod._KILL_TREE_SCRIPT.replace('/proc/', f'{proc}/')
     env = {**os.environ, 'FAKE_PROC': str(proc), 'SURVIVORS': ' '.join(map(str, survivors))}
     done = subprocess.run(
         ['bash', '-c', script, 'tool_tenki-kill', marker], capture_output=True, text=True, timeout=60, env=env
@@ -5632,3 +5634,104 @@ def test_the_kill_script_exits_non_zero_when_a_marked_process_outlives_it(tmp_pa
     mine = 'TOOL_TENKI_RUN=aaaa'
     processes = {101: [mine], 102: [mine]}
     assert _run_the_kill_script(tmp_path, processes, mine, survivors=[102]) == ('found=2 killed=1 left=1', 1, [102])
+
+
+# ---------------------------------------------------------------------------
+# Fresh critic of b6260601: a kill that reached only part of the command, killed processes still exiting, a backlog
+# behind the reader, a finite command just past the limit, and the private clone
+# ---------------------------------------------------------------------------
+
+
+def test_a_kill_that_left_part_of_the_command_running_is_not_reported_as_a_kill(monkeypatch, logs):
+    # `cd proj && sudo make V=1`: the kill finds and kills the command's own shells, but make runs as root without the
+    # marker and goes on printing. The kill's count alone would say "killed"; the run going on after it says otherwise.
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    monkeypatch.setattr(inst_mod, '_KILL_SETTLE_SECS', 0.05, raising=False)
+    warned = []
+    monkeypatch.setattr(inst_mod, 'warning', lambda message, *a, **kw: warned.append(str(message)), raising=False)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit), escapes=True, kill_tree_report='found=3 killed=2 left=0')
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = inst.run_command({'command': 'cd proj && sudo make V=1'})
+    assert result['truncated'] is True and 'killed' not in result['stderr']
+    assert any('stopped 2 of the 3' in line and 'out of the' in line for line in warned), warned
+
+
+def test_a_command_that_finished_just_past_the_limit_is_logged_as_finished_not_as_escaped(monkeypatch, logs):
+    # `cat` of a 9 MB log: it has exited by the time the kill looks, and its run ends right after. The operator is told
+    # the kill found nothing because the command had finished, not that something runs on.
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    warned = []
+    monkeypatch.setattr(inst_mod, 'warning', lambda message, *a, **kw: warned.append(str(message)), raising=False)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit), kill_tree_report='found=0 killed=0 left=0')
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = inst.run_command({'command': 'cat big.log'})
+    assert result['truncated'] is True and 'killed' not in result['stderr']
+    [line] = [line for line in warned if 'found none' in line]
+    assert 'finished' in line and 'execution timeout' not in line
+
+
+def test_the_kills_report_is_read_from_its_last_line(monkeypatch, logs):
+    # A custom image's BASH_ENV may print before the script does.
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    warned = []
+    monkeypatch.setattr(inst_mod, 'warning', lambda message, *a, **kw: warned.append(str(message)), raising=False)
+    report = 'Welcome to the build image\nfound=1 killed=1 left=0'
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit), kill_tree_report=report)
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = inst.run_command({'command': 'yes'})
+    assert 'killed' in result['stderr'] and 'output past that point was not kept' in result['stderr']
+    assert warned == []
+
+
+def test_output_queued_past_the_limit_is_neither_kept_nor_a_second_kill(monkeypatch, logs):
+    # A reader that falls behind finds chunks queued after the one that crossed the limit. They arrived before the
+    # streams were replaced, and are dropped like everything after, without another swap or kill.
+    limit = 64 * 1024
+    session = _FakeSession('sb-1')
+    process = _FakeProcess(session, _CommandResult(argv=['yes'], exit_code=0), stalls='result')  # no run of its own
+    for _ in range(6):
+        process.stdout.push(b'y' * (48 * 1024))
+    swaps = []
+    real_swap = inst_mod.stop_keeping_output
+    monkeypatch.setattr(inst_mod, 'stop_keeping_output', lambda p: (swaps.append(p), real_swap(p)))
+    guard = inst_mod._OutputGuard(process, limit)
+    guard.stop()
+    assert guard.cut is True
+    assert guard.kept() == (b'y' * limit, b'')
+    assert len(swaps) == 1 and session.calls.count(('kill',)) == 1
+
+
+@_NO_BASH
+def test_the_kill_script_waits_for_killed_processes_to_finish_exiting_before_it_counts_what_is_left(tmp_path):
+    # A killed process keeps its environ until it has released its memory, so a look right after the kill can still
+    # see it (measured: 1 to 7 percent of runs on real Linux). Here `sleep`, which the script calls between its last
+    # looks, is a bash function standing in for that time: 102 is gone once it has run.
+    mine = 'TOOL_TENKI_RUN=aaaa'
+    processes = {101: [mine], 102: [mine]}
+    report = _run_the_kill_script(
+        tmp_path, processes, mine, survivors=[102], preamble='sleep() { rm -rf "$FAKE_PROC/102"; }'
+    )
+    assert report == ('found=2 killed=2 left=0', 0, [])
+
+
+def test_a_private_clone_cut_at_the_limit_without_a_confirmed_kill_says_so(monkeypatch, logs):
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 2 * limit), forks=True, kill_tree_error=mod.SandboxError('gone'))
+    inst, _ = _instance(monkeypatch, session, cfg=_PRIVATE_CFG)
+    result = inst.git_clone({'repo': _PRIVATE_REPO})
+    said = result.get('error') or result['output']
+    assert said.startswith('[tool_tenki: the command produced more than') and f'{limit:,} bytes' in said
+
+
+def test_processes_the_kill_found_but_did_not_kill_do_not_make_it_a_kill(monkeypatch, logs):
+    # Both had exited between the kill's look and its signal: found, not killed.
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit), kill_tree_report='found=2 killed=0 left=0')
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = inst.run_command({'command': 'yes'})
+    assert result['truncated'] is True and 'killed' not in result['stderr']

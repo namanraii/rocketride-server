@@ -42,10 +42,11 @@ import posixpath
 import re
 import shlex
 import threading
+import time
 import urllib.parse
 import uuid
 from contextlib import nullcontext
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from rocketlib import IInstanceBase, warning
 
@@ -93,9 +94,9 @@ _RESULT_GRACE_SECS = 30
 # long as the execution timeout allows. At this limit the node stops the SDK keeping any more of it,
 # keeps what it has for the agent, and kills the command (see _OutputGuard). This is a memory ceiling,
 # not the output cap: max_output_chars still decides what the agent is shown, and a chatty but finite
-# command (a large apt-get install, pytest -v, a build) runs to completion and is merely truncated. It
-# sits above the most the agent can ever be shown (1M characters, at most 4 MB of UTF-8), so it never
-# cuts into that.
+# command that stays within it (a large apt-get install, most test runs and builds) runs to completion
+# and is merely truncated. It sits above the most the agent can ever be shown (1M characters, at most
+# 4 MB of UTF-8), so it never cuts into that.
 _OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024
 # The largest file read_file fetches. It reads through the SDK's unary ReadFile call, which the node
 # sends with a deadline (see file_deadline); the streaming read has none, so a half-open connection
@@ -117,9 +118,11 @@ _READ_LIMIT_BYTES = 4_000_000
 # the command's) and is inherited by everything the command starts, whatever becomes of its parent. To
 # stop a command, a second command finds the processes carrying that marker in /proc and stops them all,
 # then kills them, until none is left: bash builtins and /proc only, so no procps is needed, and a parent
-# that forks again is stopped before it can. It then prints how many it found, how many of those it killed
-# and how many are left, and exits non-zero if any are. Only the command's own processes carry its marker:
-# never the sandbox's agent, another command or another session. Out of reach: a process that clears its
+# that forks again is stopped before it can. A killed process can still be listed, with its environment,
+# until it has finished exiting, so the last look is repeated for up to a second (with coreutils' sleep
+# between looks). The script then prints how many it found, how many of those it killed and how many are
+# left, and exits non-zero if any are. Only the command's own processes carry its marker: never the
+# sandbox's agent, another command or another session. Out of reach: a process that clears its
 # environment (`env -i`, sudo's env_reset) or runs as another user. That runs on in the VM until Tenki's
 # execution timeout, at which Tenki stops the command and its children (measured): a limit on VM time, not
 # on the engine's memory, which the node bounds by no longer keeping the output (see _OutputGuard). The
@@ -136,10 +139,15 @@ _KILL_TREE_SCRIPT = (
     'for pass in 1 2 3 4 5 6; do scan stop; [ -z "$hit" ] && break; for p in $hit; do '
     'case "$found" in *" $p "*) ;; *) found="$found$p ";; esac; '
     'kill -KILL "$p" 2>/dev/null && case "$killed" in *" $p "*) ;; *) killed="$killed$p ";; esac; done; done; '
-    'scan; k=0; for p in $killed; do case "$hit " in *" $p "*) ;; *) k=$((k+1));; esac; done; '
+    'scan; for wait in 1 2 3 4 5 6 7 8 9 10; do [ -z "$hit" ] && break; sleep 0.1 2>/dev/null; scan; done; '
+    'k=0; for p in $killed; do case "$hit " in *" $p "*) ;; *) k=$((k+1));; esac; done; '
     'set -- $found; f=$#; set -- $hit; echo "found=$f killed=$k left=$#"; [ $# -eq 0 ]'
 )
 _KILL_TREE_WAIT_SECS = 15
+#: How soon after the kill a command's run must end for the kill to count as having stopped it. The run goes on while
+#: any process holds the command's output open, so a run that outlives the kill by more than this was kept going by a
+#: process out of its reach (run under sudo, say), and the agent is not told the command was killed.
+_KILL_SETTLE_SECS = 10
 _KILLED_NOTICE = (
     '[tool_tenki: the command was killed before it finished, because it produced more than {limit:,} bytes '
     'of output, the most a command may stream back, and output past that point was not kept. Send large '
@@ -453,11 +461,12 @@ def _exec_result(result, cap: int, *, cut: bool = False, killed: int = 0) -> dic
     """Shape a Tenki CommandResult into the tool output, with ``cap`` shared by both streams.
 
     Errors usually land on stderr, so a flood on stdout must not push them out: stderr may
-    always keep up to half of the cap, and either stream may use whatever the other leaves.
+    always keep up to half of the cap, and either stream may use whatever the other leaves. That
+    is of the output the node kept: past its limit, nothing more of either stream is kept.
     ``cut`` means the command printed more than the node keeps (see _OutputGuard), and ``killed``
     how many of its processes the node's kill then stopped. The agent is told on stderr, where a
     shell would report a kill, after the cap so it is never cut off. The command is said to be
-    killed on that count alone: its exit status is its root process's, which can be 0 while a
+    killed on that count, never on its exit status, which is its root process's and can be 0 while a
     background job it started was killed, or a kill signal while what flooded ran on.
     """
     stdout_text, stderr_text = result.stdout_text, result.stderr_text
@@ -478,15 +487,23 @@ def _exec_result(result, cap: int, *, cut: bool = False, killed: int = 0) -> dic
     }
 
 
-def _kill_command_tree(session, process, marker: str | None) -> int:
+class _KillReport(NamedTuple):
+    """What the kill of a command's processes reported (see ``_KILL_TREE_SCRIPT``), or why it could not say."""
+
+    found: int = 0
+    killed: int = 0
+    failure: str | None = None
+
+
+def _kill_command_tree(session, process, marker: str | None) -> _KillReport:
     """Kill every process carrying the command's ``marker`` in the sandbox, then send the sandbox's own kill.
 
-    Returns how many processes the kill stopped, as its report says (see ``_KILL_TREE_SCRIPT``), or 0 when it
-    did not do its job: it could not run, ran into its timeout, gave no report, or left a marked process
-    behind. Those, and a kill that found none of the command's processes, are logged for the operator.
+    Returns how many of the command's processes the kill found and killed, as its report says, or why it did not do
+    its job: it could not run, ran into its timeout, gave no report, or left a marked process behind. Those are
+    logged for the operator here; what the run did after the kill is judged once it ends (see ``_stopped_by_kill``).
     Without a session or a marker only the sandbox's kill is sent.
     """
-    killed = 0
+    report = _KillReport(failure='no marker to find its processes by')
     if session is not None and marker:
         try:
             killer = session.start(
@@ -494,20 +511,15 @@ def _kill_command_tree(session, process, marker: str | None) -> int:
             )
             killer.close_stdin()
             outcome = killer.wait(timeout=_KILL_TREE_WAIT_SECS + _RESULT_GRACE_SECS)
-            report = outcome.stdout_text.strip()
-            counts = re.fullmatch(r'found=(\d+) killed=(\d+) left=(\d+)', report)
+            # The last line: a custom image's BASH_ENV may print before the script does.
+            last = outcome.stdout_text.strip().rpartition('\n')[2]
+            counts = re.fullmatch(r'found=(\d+) killed=(\d+) left=(\d+)', last)
             if counts is None or outcome.exit_code != 0 or outcome.signal or outcome.timed_out:
                 stopped = ', stopped at its timeout' if outcome.timed_out else ''
                 raise SandboxError(
-                    f'the kill command reported {report or "nothing"!r} and exited {outcome.exit_code}{stopped}'
+                    f'the kill command reported {last or "nothing"!r} and exited {outcome.exit_code}{stopped}'
                 )
-            if counts[1] == '0':
-                warning(
-                    'tool_tenki: a command passed the output limit, and the kill found none of its processes: they '
-                    'had exited, or what kept printing had left its environment (sudo, env -i) and runs on in the VM '
-                    'until the execution timeout. None of its output past the limit is kept.'
-                )
-            killed = int(counts[2])
+            report = _KillReport(int(counts[1]), int(counts[2]))
         except Exception as e:
             # Best effort: the sandbox's kill is still sent, and the execution timeout stops what is left.
             warning(
@@ -515,8 +527,40 @@ def _kill_command_tree(session, process, marker: str | None) -> int:
                 f'({e}); what is left runs on in the VM until the execution timeout. None of its output past '
                 'the limit is kept.'
             )
+            report = _KillReport(failure=str(e))
     process.kill()
-    return killed
+    return report
+
+
+def _stopped_by_kill(report: _KillReport, ran_on: float) -> int:
+    """How many of the command's processes the agent is told the kill stopped: 0 unless it did its job.
+
+    ``ran_on`` is how long the run went on after the kill. The run lasts while any process holds the command's output
+    open, so one that went on for more than _KILL_SETTLE_SECS was kept going by a process out of the kill's reach,
+    and the operator is told so. So is a kill that found none of the command's processes. A kill that failed was
+    logged when it did.
+    """
+    if report.failure is not None:
+        return 0
+    if ran_on > _KILL_SETTLE_SECS:
+        what = (
+            f'stopped {report.killed} of the {report.found} processes it found'
+            if report.found
+            else 'found none of its processes'
+        )
+        warning(
+            f'tool_tenki: a command passed the output limit, and the kill {what}, but the run went on for '
+            f"{ran_on:.0f} s after it: part of the command was out of the kill's reach (run under sudo, or with a "
+            'cleared environment) and ran until it ended or reached the execution timeout. None of its output past '
+            'the limit is kept.'
+        )
+        return 0
+    if not report.found:
+        warning(
+            'tool_tenki: a command passed the output limit, and the kill found none of its processes: the run ended '
+            'right after, so the command had finished by then. None of its output past the limit is kept.'
+        )
+    return report.killed
 
 
 class _OutputGuard:
@@ -527,7 +571,7 @@ class _OutputGuard:
     replaces the process's streams with ones that keep nothing (see output_sink): that is what bounds
     the engine's memory, whatever the command does next. The guard keeps the first ``limit`` bytes
     itself, for the agent. Then it kills the command, every process it started (see
-    ``_kill_command_tree``), and records how many processes that stopped. The kill is cleanup, not the
+    ``_kill_command_tree``), and records what that kill reported. The kill is cleanup, not the
     bound: what it cannot reach runs on in the VM until the execution timeout, and the SDK receives
     that output and drops it. Reading as it arrives is what lets the limit be noticed while the command
     runs rather than after it exits.
@@ -543,8 +587,9 @@ class _OutputGuard:
         self._kept = ([], [])
         #: Whether the command printed more than ``limit`` bytes, so that its output is no longer kept.
         self.cut = False
-        #: How many of the command's processes the kill stopped (see _kill_command_tree).
-        self.killed = 0
+        #: What the kill reported once the guard cut the output (see _kill_command_tree), and when it returned.
+        self.kill = None
+        self.kill_done = 0.0
         self._readers = [
             threading.Thread(target=self._read, args=(stream, kept), name='tool_tenki-output', daemon=True)
             for stream, kept in zip((process.stdout, process.stderr), self._kept)
@@ -567,7 +612,8 @@ class _OutputGuard:
                     cut = self.cut = self._received > self._limit
                 if cut:
                     stop_keeping_output(self._process)
-                    self.killed = _kill_command_tree(self._session, self._process, self._marker)
+                    self.kill = _kill_command_tree(self._session, self._process, self._marker)
+                    self.kill_done = time.monotonic()
         except Exception:
             # A stream fails when its run does, and wait() raises that same error, so it is reported there.
             pass
@@ -736,7 +782,8 @@ def _run_process(session, argv, timeout: int, started: list):
 
     Returns the CommandResult; whether the command printed more than _OUTPUT_LIMIT_BYTES, so that
     the node stopped keeping its output and the result carries the part it kept; and how many of
-    the command's processes the node's kill then stopped (see _OutputGuard). ``started`` is
+    the command's processes the node's kill then stopped, 0 unless the run ended right after the
+    kill (see _OutputGuard and _stopped_by_kill). ``started`` is
     appended to once the sandbox has confirmed the start (see _StartedOnce).
 
     Sandbox.exec waits on the output stream with no local limit, so a stream that stalls (on a
@@ -763,6 +810,7 @@ def _run_process(session, argv, timeout: int, started: list):
     guard = _OutputGuard(process, _OUTPUT_LIMIT_BYTES, session, marker)
     try:
         result = process.wait(timeout=limit)
+        ended = time.monotonic()
     except SandboxError:
         raise
     except TimeoutError as e:
@@ -773,11 +821,13 @@ def _run_process(session, argv, timeout: int, started: list):
         ) from e
     finally:
         guard.stop()
-    if guard.cut:
-        # The SDK kept nothing once its streams were replaced, and its result carries no output.
-        stdout, stderr = guard.kept()
-        result = dataclasses.replace(result, stdout=stdout, stderr=stderr)
-    return result, guard.cut, guard.killed
+    if not guard.cut:
+        return result, False, 0
+    # The SDK kept nothing once its streams were replaced, and its result carries no output.
+    stdout, stderr = guard.kept()
+    result = dataclasses.replace(result, stdout=stdout, stderr=stderr)
+    report = guard.kill or _KillReport(failure='the kill did not run')
+    return result, True, _stopped_by_kill(report, ended - guard.kill_done)
 
 
 def _with_session_event(output: dict, events: list) -> dict:
@@ -1355,8 +1405,11 @@ class IInstance(IInstanceBase):
             error = str(once.reported(e))
         else:
             if private is not None:
-                output, _, killed = output
+                output, cut, killed = output
                 text = '\n'.join(part for part in (output.stderr_text.strip(), output.stdout_text.strip()) if part)
+                if cut and not killed:
+                    # First, like the kill notice, so that truncating git's output cannot cut it off.
+                    text = f'{_CUT_NOTICE.format(limit=_OUTPUT_LIMIT_BYTES)} git printed: {text}'
                 if killed:
                     # The note first, so that truncating git's output cannot cut it off.
                     error = f'{_KILLED_NOTICE.format(limit=_OUTPUT_LIMIT_BYTES)} git printed: {text}'
