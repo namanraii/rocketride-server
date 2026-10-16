@@ -307,6 +307,24 @@ def _secret_settings(cfg) -> tuple[tuple[str, ...], tuple[str, ...]]:
 #: letters, digits, underscores and hyphens. A name outside it would never be substituted.
 _SECRET_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_-]{0,127}')
 
+#: How credential values begin, as issued by GitHub, GitLab, Tenki, Anthropic and OpenAI, Slack and AWS. A value
+#: where a secret's name belongs matches the name's shape, so it is told apart by its prefix and refused; the
+#: refusal never repeats the value.
+_CREDENTIAL_PREFIXES = (
+    'ghp_',
+    'gho_',
+    'ghu_',
+    'ghs_',
+    'ghr_',
+    'github_pat_',
+    'glpat-',
+    'tk_',
+    'sk-',
+    'xoxb-',
+    'xoxp-',
+    'AKIA',
+)
+
 #: The path a private-repository prefix may have: slashes and URL characters that git leaves as they are when it
 #: normalizes a URL, so that the node and git read the same prefix.
 _PREFIX_PATH = re.compile(r'/[A-Za-z0-9._~/-]*')
@@ -370,6 +388,11 @@ def _git_auth_settings(cfg, policies: tuple[str, ...], domains: tuple[str, ...])
     secret = cfg.get('git_auth_secret')
     if secret is None or (isinstance(secret, str) and not secret.strip()):
         return '', ''
+    if isinstance(secret, str) and secret.strip().startswith(_CREDENTIAL_PREFIXES):
+        raise ValueError(
+            'tenki.git_auth_secret looks like a credential value, not the name of a Tenki secret. The node never '
+            'holds a secret value: create the secret in Tenki and put its name here.'
+        )
     if not isinstance(secret, str) or not _SECRET_NAME.fullmatch(secret.strip()):
         raise ValueError(
             'tenki.git_auth_secret must be the name of a Tenki secret, as a placeholder names it: a letter or '
@@ -793,6 +816,10 @@ class IGlobal(IGlobalBase):
             session = self.get_session(on_event)
             try:
                 self._ensure_warm(session)
+                # Read again now that this call holds a warm session: the warm-up may have waited on the session
+                # lock behind another call's recovery, and a failure of this call's own after that must not be
+                # taken for that recovery (which would retry the call, or tell the agent its files were gone).
+                epoch = self.session_epoch
                 self._report_late_resume(session, on_event)
                 return call(session)
             except _LIFECYCLE_ERRORS:

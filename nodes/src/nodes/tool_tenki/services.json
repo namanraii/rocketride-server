@@ -146,7 +146,7 @@
 		"tenki.toolGroups": {
 			"type": "array",
 			"title": "Tool groups",
-			"description": "Which groups of Tenki Sandbox tools this node publishes to the agent: <b>execution</b> (run commands and code), <b>filesystem</b> (write, edit, read and list files, make directories, and delete files or directories) and <b>git</b> (clone, check out, diff and log). <b>Leave this empty to publish all three</b> (12 tools). Naming groups publishes only those, and a value that names only unknown groups stops the pipeline at startup.",
+			"description": "Which groups of Tenki Sandbox tools this node publishes to the agent: <b>execution</b> (run commands and code), <b>filesystem</b> (write, edit, read and list files, make directories, and delete files or directories) and <b>git</b> (clone, check out, diff and log). <b>Leave this empty to publish all three</b> (12 tools). Naming groups publishes only those (this narrows what the agent is offered; it is not a security boundary, since git can run a command the agent configures inside the VM), and a value that names only unknown groups stops the pipeline at startup.",
 			"uniqueItems": true,
 			"items": {
 				"type": "string",

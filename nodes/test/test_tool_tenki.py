@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import itertools
 import json
 import posixpath
 import queue
@@ -240,8 +241,16 @@ class _FakeSession:
         paused_error=None,
         resume_refusals=0,
         warm_up_faults=False,
+        forks=False,
+        kill_tree_error=None,
     ):
         self.id = session_id
+        # A flooding command that forks (a pipeline): the sandbox's kill ends the process it started and nothing
+        # else, so only the node's kill of the process tree stops the flood. kill_tree_error is what starting
+        # that second command raises, if anything.
+        self._forks = forks
+        self._kill_tree_error = kill_tree_error
+        self.kill_processes = []
         # How many times resume is refused first, as Tenki does while it is still tearing the paused VM down.
         self._resume_refusals = resume_refusals
         self.state = state
@@ -273,6 +282,18 @@ class _FakeSession:
         self.calls.append(('start', argv, kwargs))
         if self.state == 'PAUSED':
             raise self.paused_error
+        if len(argv) == 5 and argv[:2] == ('bash', '-c') and argv[3] == 'tool_tenki-kill':
+            # The node's kill of a command's process tree (see IInstance._kill_command_tree).
+            pid = int(argv[4])
+            self.calls.append(('kill_tree', pid))
+            if self._kill_tree_error is not None:
+                raise self._kill_tree_error
+            for process in self.processes + self.warm_up_processes:
+                if process.pid == pid:
+                    process.tree_killed()
+            killer = _FakeProcess(self, _CommandResult(argv=list(argv), exit_code=0))
+            self.kill_processes.append(killer)
+            return killer
         warm_up = argv == _WARM_UP and not self.warm_up_faults
         if self._exec_error is not None and not warm_up:
             raise self._exec_error
@@ -281,7 +302,9 @@ class _FakeSession:
             self.warm_up_processes.append(process)
             return process
         result = self._exec_result if self._exec_result is not None else _CommandResult(argv=list(argv), exit_code=0)
-        process = _FakeProcess(self, result, stalls=self._stalls, flood=self._flood, run_error=self._run_error)
+        process = _FakeProcess(
+            self, result, stalls=self._stalls, flood=self._flood, run_error=self._run_error, forks=self._forks
+        )
         if argv == _WARM_UP:
             self.warm_up_processes.append(process)
         else:
@@ -356,6 +379,9 @@ class _FakeStream:
             yield item
 
 
+_PIDS = itertools.count(4000)
+
+
 class _FakeProcess:
     """Stand-in for tenki's Process, whose stream can stall before the command starts or before it ends.
 
@@ -366,11 +392,13 @@ class _FakeProcess:
     printed ``budget`` bytes or nothing reads it, either of which ends it on its own.
     """
 
-    def __init__(self, session, result, *, stalls=None, flood=None, run_error=None):
+    def __init__(self, session, result, *, stalls=None, flood=None, run_error=None, forks=False):
         self._session = session
         self._result = result
         self._stalls = stalls
         self._error = run_error
+        self._forks = forks
+        self.pid = next(_PIDS)
         self.stdout = _FakeStream()
         self.stderr = _FakeStream()
         self.printed = 0
@@ -423,6 +451,12 @@ class _FakeProcess:
 
     def kill(self):
         self._session.calls.append(('kill',))
+        if not self._forks:
+            # The sandbox's kill ends the process it started. A pipeline's children live on (measured), so a
+            # forking flood is stopped by tree_killed only.
+            self._killed.set()
+
+    def tree_killed(self):
         self._killed.set()
 
 
@@ -3160,6 +3194,42 @@ def test_a_command_that_floods_its_output_is_killed_and_the_agent_told_why(monke
     assert 'killed' in result['stderr']
     assert f'{limit:,} bytes' in result['stderr']
     assert 'to a file' in result['stderr']
+    # The process tree is killed from inside the VM first, then the sandbox's own kill is sent.
+    assert session.calls.index(('kill_tree', process.pid)) < session.calls.index(('kill',))
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args'),
+    [('run_command', {'command': 'cat /dev/urandom | base64'}), ('run_code', {'code': 'import os; os.system("yes")'})],
+)
+def test_a_flooding_command_whose_children_outlive_the_sandboxs_kill_is_still_stopped(monkeypatch, logs, tool, args):
+    # Measured on a real VM: the sandbox's kill ended bash, and the pipeline's children streamed on until the
+    # execution timeout. The node's kill of the process tree is what stops them.
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit), forks=True)
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = getattr(inst, tool)(args)
+    [process] = session.processes
+    assert ('kill_tree', process.pid) in session.calls
+    assert process.printed <= limit + 2 * len(_FLOOD)
+    assert result['truncated'] is True and 'killed' in result['stderr']
+    # The kill command itself is bounded: a start deadline, and a wait that cannot outlast a stalled VM for good.
+    [(_, argv, kwargs)] = [c for c in session.calls if c[0] == 'start' and c[1][:2] == ('bash', '-c')]
+    assert argv[4] == str(process.pid) and kwargs['timeout'] == inst_mod._KILL_TREE_WAIT_SECS
+    assert 'pgrep -P' in argv[2] and 'kill -KILL' in argv[2]
+
+
+def test_a_tree_kill_that_fails_still_sends_the_sandboxs_kill(monkeypatch, logs):
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit), kill_tree_error=mod.SandboxError('no pgrep here'))
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = inst.run_command({'command': 'yes'})
+    [process] = session.processes
+    assert ('kill_tree', process.pid) in session.calls
+    assert ('kill',) in session.calls
+    assert result['truncated'] is True and 'killed' in result['stderr']
 
 
 def test_a_chatty_command_that_finishes_is_truncated_but_not_killed(monkeypatch, logs):
@@ -5129,3 +5199,72 @@ def test_two_edits_to_one_file_in_the_same_wave_keep_both_changes(monkeypatch, l
         t.join(timeout=10)
     assert results['first']['success'] and results['second']['success']
     assert session.fs.files['/home/tenki/app.py'] == 'a = 10\nb = 2\nc = 30\n', 'the first edit survived the second'
+
+
+# ---------------------------------------------------------------------------
+# Audit of 2026-10-16: the recovery epoch, credentials in a clone URL's query, a value where a secret name belongs
+# ---------------------------------------------------------------------------
+
+
+def test_a_call_that_waited_behind_another_calls_recovery_reports_its_own_failure(monkeypatch, logs):
+    # The recovery epoch is read once the call holds a warm session. Read before that, a call that waited on the
+    # session lock behind another call's resume took any failure of its own for that resume: it retried and told
+    # the agent "resumed" (or, for a read, "your files are gone") when the session was running all along.
+    session = _FakeSession('sb-1', files={'/home/tenki/notes.md': 'x'})
+    inst, _ = _instance(monkeypatch, session)
+    assert inst.read_file({'path': 'notes.md'})['content'] == 'x'
+    glb = inst.IGlobal
+    glb._warm = None  # as a resume leaves it: the next call takes the session lock to run the no-op command
+    real_stat = session.fs._stat
+    failures = [mod.InvalidStateError('a transient refusal, with the session running')]
+
+    def stat_once_failing(path):
+        if failures:
+            session.calls.append(('stat', path))
+            raise failures.pop()
+        return real_stat(path)
+
+    session.fs._stat = stat_once_failing
+    results = []
+    glb._session_lock.acquire()  # another call is recovering the session
+    reader = threading.Thread(target=lambda: results.append(inst.read_file({'path': 'notes.md'})))
+    reader.start()
+    time.sleep(0.3)  # the reader is now waiting on the lock
+    glb.session_epoch += 1  # that recovery was a resume
+    glb.last_recovery = 'resumed'
+    glb._session_lock.release()
+    reader.join(timeout=10)
+    [result] = results
+    assert 'session' not in result, f'the call claimed a session change that was not its own: {result}'
+    assert 'transient refusal' in result['error']
+    # The first read, then the one that failed: no retry of the failed call.
+    assert session.calls.count(('stat', '/home/tenki/notes.md')) == 2
+
+
+@pytest.mark.parametrize(
+    'repo',
+    [
+        'https://gitlab.example.com/acme/private.git?private_token=glpat-not-a-real-token',
+        'https://github.com/acme/repo.git#access_token=x',
+    ],
+)
+def test_git_clone_refuses_a_repository_url_with_a_query_or_fragment(monkeypatch, logs, repo):
+    # git records the clone URL in .git/config, so a token in the query string would be written into the shared
+    # VM exactly as one in the userinfo would.
+    inst, _ = _instance(monkeypatch, _FakeSession('sb-1'))
+    with pytest.raises(ValueError) as refused:
+        inst.git_clone({'repo': repo})
+    assert 'query' in str(refused.value) and 'glpat' not in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    'value', ['ghp_' + 'a' * 36, 'github_pat_' + 'b' * 22, 'glpat-' + 'c' * 20, 'tk_' + 'd' * 30, 'sk-' + 'e' * 40]
+)
+def test_a_secret_name_shaped_like_a_credential_value_is_refused_without_being_echoed(monkeypatch, logs, value):
+    # The field takes the name of a Tenki secret. A pasted token matches the name's shape, would be saved in the
+    # pipeline file in clear and written into the VM's .git/config as a placeholder, so it is refused at startup.
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, **_PRIVATE_CFG, 'git_auth_secret': value})
+    with pytest.raises(ValueError) as refused:
+        glb.beginGlobal()
+    assert 'tenki.git_auth_secret' in str(refused.value) and 'name' in str(refused.value)
+    assert value not in str(refused.value) and value[8:] not in str(refused.value)

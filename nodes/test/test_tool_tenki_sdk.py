@@ -383,6 +383,14 @@ def test_a_process_can_be_waited_on_with_a_limit_and_cancelled():
     assert _parameters(Process.kill) == {}
 
 
+def test_a_process_reports_the_pid_the_sandbox_started_once_the_start_is_confirmed():
+    # The node kills a command's process tree by that pid (IInstance._kill_command_tree), after the start was
+    # confirmed, so the property must not block then.
+    assert isinstance(inspect.getattr_static(Process, 'pid'), property)
+    assert '_started' in inspect.getsource(Process.pid.fget)
+    assert 'signal' in _parameters(Process.kill) or _parameters(Process.kill) == {}
+
+
 def test_a_process_stream_yields_as_it_arrives_and_ends_when_closed():
     # _OutputGuard reads stdout and stderr while the command runs, and ends them itself after a stall.
     stream = ProcessStream()

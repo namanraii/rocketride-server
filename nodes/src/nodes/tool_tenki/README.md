@@ -62,8 +62,10 @@ functions are published depends on the **Tool groups** field; by default all thr
 | `git_diff` | Show a diff, optionally between two revisions or limited to one path. |
 | `git_log` | Show commit history, bounded by a maximum count. |
 
-Every path argument is resolved under `/home/tenki` and confined to it, so the file functions cannot
-read or write elsewhere in the VM. `read_file` fetches a file in one request, so it refuses one over
+Every path argument is resolved under `/home/tenki`, so the file functions work on the agent's own
+tree. That is a usability rule, not a security boundary: the check is lexical, a symlink can point
+outside the home directory, and `run_command` reaches the whole VM anyway. The VM is the boundary,
+and the node places nothing secret inside it. `read_file` fetches a file in one request, so it refuses one over
 4,000,000 bytes rather than pulling it into the engine; read part of a larger file with
 `run_command` instead (`head`, `tail` or `sed -n`). `edit_file` reads with the same limit and refuses
 an edit that would take the file over it; it replaces `old_text` only when that text occurs exactly
@@ -77,11 +79,14 @@ Edits of one session's files take turns: `edit_file` is a read-modify-write, and
 one wave would otherwise read the same original and the later write would drop the earlier change (measured
 2026-10-12; both calls reported success). A command still running in the VM is not covered by that lock.
 
-A command that streams back more than 8 MiB of output is killed before it finishes. The engine
-holds a command's whole output in memory until it exits, so a runaway one (`yes`, say) would
-otherwise grow it for as long as the execution timeout allows. The cap and this limit are separate:
-a chatty command that finishes, such as a large `apt-get install`, is only truncated. A killed one
-comes back with `truncated` set and a note on `stderr` saying why.
+A command that streams back more than 8 MiB of output is killed before it finishes, together with
+every process it started: the sandbox's own kill reaches only the process it started, and a pipeline
+such as `cat /dev/urandom | base64` outlived its shell and streamed on until the execution timeout
+(measured), so the node first kills the command's process tree from inside the VM. The engine holds
+a command's whole output in memory until it exits, so a runaway one would otherwise grow it for as
+long as the execution timeout allows. The cap and this limit are separate: a chatty command that
+finishes, such as a large `apt-get install`, is only truncated. A killed one comes back with
+`truncated` set and a note on `stderr` saying why.
 
 A result also carries a `session` field whenever the session changed during its call: `"created"`
 (a new, empty sandbox), `"resumed"` (it had been paused; its files survived), `"replaced"` (it had
@@ -99,10 +104,15 @@ single command, and the one that decides how much of the tool surface an agent s
 
 Which groups of functions the node publishes. Leave it empty to publish all three (`execution`,
 `filesystem`, `git`). Naming groups publishes only those, which is how you hand an agent a narrower
-surface: `["filesystem", "git"]` lets it read and edit a repository without letting it run commands.
+surface: `["filesystem", "git"]` offers it a repository to read and edit, without a command tool.
 A function that is not published is invisible to the agent and refused if it is called anyway. A
 value naming only unknown groups stops the pipeline at startup rather than quietly falling back to
 the default, so a typo surfaces immediately instead of widening access.
+
+Tool groups narrow what an agent is offered. They are not a security boundary: with only
+`filesystem` and `git` published, an agent can still make git run a command inside the VM (a hook
+or a diff driver written into a repository's `.git/config`, then `git_checkout` or `git_diff`), and
+a value that is not a list at all reads as "not configured". The VM is the boundary, as above.
 
 ### Label
 

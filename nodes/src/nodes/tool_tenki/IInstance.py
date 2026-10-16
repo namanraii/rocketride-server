@@ -46,7 +46,7 @@ import uuid
 from contextlib import nullcontext
 from typing import Callable
 
-from rocketlib import IInstanceBase
+from rocketlib import IInstanceBase, debug
 
 from ai.common.utils import normalize_tool_input, optional_bool, optional_int
 
@@ -101,6 +101,17 @@ _OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024
 # limit, which the SDK's channels keep, so a file that grows between the two calls fails there rather
 # than arriving whole.
 _READ_LIMIT_BYTES = 4_000_000
+# What Process.kill() stops is the one process the sandbox started, and nothing else. `bash -lc` runs a
+# single simple command by exec, so `yes` dies with it; a pipeline or a script forks children, which
+# outlive their bash. Measured on a real VM (2026-10-16): after the kill, `cat /dev/urandom | base64`
+# streamed on, reparented to init, until Tenki's own execution timeout, and the engine grew the whole
+# time. Every command the sandbox starts shares one process group with the sandbox's own agent (and
+# with every other command of the session), so the group cannot be signalled either. What is left is
+# the process tree: a second command walks it with pgrep, deepest first, and kills every process in
+# it; the sandbox's own kill is sent after that. Best effort: the execution timeout, at which Tenki
+# stops the command and its children (measured), remains the backstop.
+_KILL_TREE_SCRIPT = 'k() { for c in $(pgrep -P "$1"); do k "$c"; done; kill -KILL "$1" 2>/dev/null; }; k "$1"'
+_KILL_TREE_WAIT_SECS = 15
 _KILLED_NOTICE = (
     '[tool_tenki: the command was killed before it finished, because it produced more than {limit:,} bytes '
     'of output, the most a command may stream back. Send large output to a file instead (for example '
@@ -315,6 +326,12 @@ def _clone_url(repo: str) -> str:
             '"repo" must not carry credentials in the URL: they would be written into the '
             'sandbox, which this node never places a secret in.'
         )
+    if parsed.query or parsed.fragment:
+        # Some hosts take a token in the query string; git would record it in .git/config just the same.
+        raise ValueError(
+            '"repo" must not carry a query string or fragment: a token there would be written into the '
+            'sandbox, which this node never places a secret in.'
+        )
     if not parsed.hostname:
         raise ValueError(f'"repo" must be an http(s) URL with a host, but {repo!r} has none')
     return repo
@@ -423,16 +440,40 @@ def _exec_result(result, cap: int, *, killed: bool = False) -> dict:
     }
 
 
+def _kill_command_tree(session, process) -> None:
+    """Kill ``process`` and every process under it in the sandbox, then send the sandbox's own kill.
+
+    See ``_KILL_TREE_SCRIPT``. The tree is walked first: the sandbox's kill ends the process the
+    sandbox started, which reparents its children to init, where the walk could not find them.
+    Without a session or a pid (a fake, or a start the sandbox never confirmed) only the sandbox's
+    kill is sent.
+    """
+    pid = getattr(process, 'pid', None) if session is not None else None
+    if pid:
+        try:
+            killer = session.start(
+                'bash', '-c', _KILL_TREE_SCRIPT, 'tool_tenki-kill', str(pid), timeout=_KILL_TREE_WAIT_SECS
+            )
+            killer.close_stdin()
+            killer.wait(timeout=_KILL_TREE_WAIT_SECS + _RESULT_GRACE_SECS)
+        except Exception as e:
+            # Best effort: the execution timeout is the backstop, and the sandbox's kill is still sent.
+            debug(f'tool_tenki: could not kill the process tree of command {pid}: {e}')
+    process.kill()
+
+
 class _OutputGuard:
     """Reads a running command's output as it arrives, and kills the command once there is too much.
 
     Reading as it arrives is what lets the limit be noticed while the command runs rather than after
     it exits. It does not shrink what the SDK holds, which keeps its own copy of every chunk until
-    the command exits; that is why the command is killed rather than merely no longer read.
+    the command exits; that is why the command is killed rather than merely no longer read. The
+    whole process tree is killed, not only the process the sandbox started (see ``_kill_command_tree``).
     """
 
-    def __init__(self, process, limit: int):
+    def __init__(self, process, limit: int, session=None):
         self._process = process
+        self._session = session
         self._limit = limit
         self._lock = threading.Lock()
         self._received = 0
@@ -452,7 +493,7 @@ class _OutputGuard:
                     kill = self._received > self._limit and not self.killed
                     self.killed = self.killed or kill
                 if kill:
-                    self._process.kill()
+                    _kill_command_tree(self._session, self._process)
         except Exception:
             # A stream fails when its run does, and wait() raises that same error, so it is reported there.
             pass
@@ -641,7 +682,7 @@ def _run_process(session, argv, timeout: int, started: list):
         process.kill()
         raise CommandNotStartedError('the sandbox did not start the command in time, so it was cancelled') from e
     started.append(True)
-    guard = _OutputGuard(process, _OUTPUT_LIMIT_BYTES)
+    guard = _OutputGuard(process, _OUTPUT_LIMIT_BYTES, session)
     try:
         result = process.wait(timeout=limit)
     except SandboxError:
