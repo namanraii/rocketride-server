@@ -243,8 +243,14 @@ class _FakeSession:
         warm_up_faults=False,
         forks=False,
         kill_tree_error=None,
+        orphans=False,
+        kill_tree_exit=0,
     ):
         self.id = session_id
+        # A flood from a background job whose shell has already exited: neither the sandbox's kill nor a walk from
+        # the dead root reaches it; only the command's marker does.
+        self._orphans = orphans
+        self.kill_tree_exit = kill_tree_exit
         # A flooding command that forks (a pipeline): the sandbox's kill ends the process it started and nothing
         # else, so only the node's kill of the process tree stops the flood. kill_tree_error is what starting
         # that second command raises, if anything.
@@ -279,19 +285,27 @@ class _FakeSession:
 
     def start(self, *argv, cwd=None, env=None, timeout=None, stdin=None, privileged=False):
         kwargs = {'cwd': cwd, 'env': env, 'timeout': timeout, 'stdin': stdin, 'privileged': privileged}
+        raw_argv = argv
+        marker = None
+        if len(argv) > 2 and argv[0] == 'env' and argv[1].startswith(_RUN_MARKER + '='):
+            marker, argv = argv[1], argv[2:]
         self.calls.append(('start', argv, kwargs))
         if self.state == 'PAUSED':
             raise self.paused_error
         if len(argv) == 5 and argv[:2] == ('bash', '-c') and argv[3] == 'tool_tenki-kill':
-            # The node's kill of a command's process tree (see IInstance._kill_command_tree).
-            pid = int(argv[4])
-            self.calls.append(('kill_tree', pid))
+            # The node's kill of a command's processes (see IInstance._kill_command_tree). A marker reaches every
+            # process the command started, whatever became of its root; a pid (older code) reaches nothing once
+            # the root shell has exited.
+            target = argv[4]
+            self.calls.append(('kill_tree', target))
             if self._kill_tree_error is not None:
                 raise self._kill_tree_error
             for process in self.processes + self.warm_up_processes:
-                if process.pid == pid:
+                if process.marker is not None and process.marker == target:
                     process.tree_killed()
-            killer = _FakeProcess(self, _CommandResult(argv=list(argv), exit_code=0))
+                elif str(process.pid) == target and not process.orphaned:
+                    process.tree_killed()
+            killer = _FakeProcess(self, _CommandResult(argv=list(argv), exit_code=self.kill_tree_exit))
             self.kill_processes.append(killer)
             return killer
         warm_up = argv == _WARM_UP and not self.warm_up_faults
@@ -303,8 +317,16 @@ class _FakeSession:
             return process
         result = self._exec_result if self._exec_result is not None else _CommandResult(argv=list(argv), exit_code=0)
         process = _FakeProcess(
-            self, result, stalls=self._stalls, flood=self._flood, run_error=self._run_error, forks=self._forks
+            self,
+            result,
+            stalls=self._stalls,
+            flood=self._flood,
+            run_error=self._run_error,
+            forks=self._forks or self._orphans,
+            marker=marker,
+            orphaned=self._orphans,
         )
+        process.raw_argv = raw_argv
         if argv == _WARM_UP:
             self.warm_up_processes.append(process)
         else:
@@ -380,6 +402,7 @@ class _FakeStream:
 
 
 _PIDS = itertools.count(4000)
+_RUN_MARKER = 'TOOL_TENKI_RUN'
 
 
 class _FakeProcess:
@@ -392,7 +415,11 @@ class _FakeProcess:
     printed ``budget`` bytes or nothing reads it, either of which ends it on its own.
     """
 
-    def __init__(self, session, result, *, stalls=None, flood=None, run_error=None, forks=False):
+    def __init__(
+        self, session, result, *, stalls=None, flood=None, run_error=None, forks=False, marker=None, orphaned=False
+    ):
+        self.marker = marker
+        self.orphaned = orphaned
         self._session = session
         self._result = result
         self._stalls = stalls
@@ -3194,8 +3221,8 @@ def test_a_command_that_floods_its_output_is_killed_and_the_agent_told_why(monke
     assert 'killed' in result['stderr']
     assert f'{limit:,} bytes' in result['stderr']
     assert 'to a file' in result['stderr']
-    # The process tree is killed from inside the VM first, then the sandbox's own kill is sent.
-    assert session.calls.index(('kill_tree', process.pid)) < session.calls.index(('kill',))
+    # The command's processes are killed from inside the VM first, by its marker, then the sandbox's own kill is sent.
+    assert session.calls.index(('kill_tree', process.marker)) < session.calls.index(('kill',))
 
 
 @pytest.mark.parametrize(
@@ -3211,13 +3238,14 @@ def test_a_flooding_command_whose_children_outlive_the_sandboxs_kill_is_still_st
     inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
     result = getattr(inst, tool)(args)
     [process] = session.processes
-    assert ('kill_tree', process.pid) in session.calls
+    assert ('kill_tree', process.marker) in session.calls
     assert process.printed <= limit + 2 * len(_FLOOD)
     assert result['truncated'] is True and 'killed' in result['stderr']
     # The kill command itself is bounded: a start deadline, and a wait that cannot outlast a stalled VM for good.
     [(_, argv, kwargs)] = [c for c in session.calls if c[0] == 'start' and c[1][:2] == ('bash', '-c')]
-    assert argv[4] == str(process.pid) and kwargs['timeout'] == inst_mod._KILL_TREE_WAIT_SECS
-    assert 'pgrep -P' in argv[2] and 'kill -KILL' in argv[2]
+    assert argv[4] == process.marker and kwargs['timeout'] == inst_mod._KILL_TREE_WAIT_SECS
+    # Bash builtins and /proc only: no procps, which slim images lack. Stopped first, so nothing can fork again.
+    assert '/proc/' in argv[2] and 'kill -STOP' in argv[2] and 'kill -KILL' in argv[2] and 'pgrep' not in argv[2]
 
 
 def test_a_tree_kill_that_fails_still_sends_the_sandboxs_kill(monkeypatch, logs):
@@ -3227,7 +3255,7 @@ def test_a_tree_kill_that_fails_still_sends_the_sandboxs_kill(monkeypatch, logs)
     inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
     result = inst.run_command({'command': 'yes'})
     [process] = session.processes
-    assert ('kill_tree', process.pid) in session.calls
+    assert ('kill_tree', process.marker) in session.calls
     assert ('kill',) in session.calls
     assert result['truncated'] is True and 'killed' in result['stderr']
 
@@ -5258,7 +5286,14 @@ def test_git_clone_refuses_a_repository_url_with_a_query_or_fragment(monkeypatch
 
 
 @pytest.mark.parametrize(
-    'value', ['ghp_' + 'a' * 36, 'github_pat_' + 'b' * 22, 'glpat-' + 'c' * 20, 'tk_' + 'd' * 30, 'sk-' + 'e' * 40]
+    'value',
+    [
+        'ghp_' + 'aB3' * 12,
+        'github_pat_' + '11ABC' * 10,
+        'glpat-' + 'x7Yz' * 5,
+        'tk_' + 'live9' * 6,
+        'sk-' + 'proj-4f' * 6,
+    ],
 )
 def test_a_secret_name_shaped_like_a_credential_value_is_refused_without_being_echoed(monkeypatch, logs, value):
     # The field takes the name of a Tenki secret. A pasted token matches the name's shape, would be saved in the
@@ -5268,3 +5303,104 @@ def test_a_secret_name_shaped_like_a_credential_value_is_refused_without_being_e
         glb.beginGlobal()
     assert 'tenki.git_auth_secret' in str(refused.value) and 'name' in str(refused.value)
     assert value not in str(refused.value) and value[8:] not in str(refused.value)
+
+
+# ---------------------------------------------------------------------------
+# Second audit of 2026-10-16: the kill reaches every process a command started, by a marker of its own
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ('tool', 'args'),
+    [
+        ('run_command', {'command': 'nohup python3 noisy.py & exit 0'}),
+        ('run_code', {'code': 'import os, subprocess; subprocess.Popen(["yes"]); os._exit(0)'}),
+    ],
+)
+def test_a_flooding_background_job_whose_shell_has_exited_is_still_stopped(monkeypatch, logs, tool, args):
+    # Its root has exited and been reaped, so neither the sandbox's kill nor a walk down from that pid reaches it;
+    # it inherited the command's marker, which the kill finds in /proc whatever its parent became.
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit), orphans=True)
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = getattr(inst, tool)(args)
+    [process] = session.processes
+    assert process.printed <= limit + 2 * len(_FLOOD), f'the flood ran on to {process.printed:,} bytes'
+    assert result['truncated'] is True and 'killed' in result['stderr']
+
+
+def test_every_command_runs_under_a_marker_of_its_own(monkeypatch, logs):
+    session = _FakeSession('sb-1')
+    inst, _ = _instance(monkeypatch, session)
+    inst.run_command({'command': 'true'})
+    inst.run_code({'code': 'pass'})
+    first, second = session.processes
+    for process in (first, second):
+        # `env NAME=VALUE` execs in place, so the sandbox's pid is still the command's own.
+        assert process.raw_argv[0] == 'env' and process.raw_argv[1] == process.marker
+        assert process.marker.startswith('TOOL_TENKI_RUN=') and len(process.marker) > len('TOOL_TENKI_RUN=') + 16
+    assert first.marker != second.marker
+
+
+@pytest.mark.parametrize(('error', 'exit_code'), [(mod.SandboxError('bash: not found'), 0), (None, 1)])
+def test_a_kill_that_could_not_run_is_logged_for_the_operator_and_the_sandboxs_kill_still_sent(
+    monkeypatch, logs, error, exit_code
+):
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    warned = []
+    monkeypatch.setattr(inst_mod, 'warning', lambda message, *a, **kw: warned.append(str(message)), raising=False)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit), kill_tree_error=error, kill_tree_exit=exit_code)
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    inst.run_command({'command': 'yes'})
+    assert ('kill',) in session.calls
+    assert any('execution timeout' in line for line in warned), warned
+
+
+def test_a_command_that_finished_on_its_own_past_the_limit_is_not_reported_as_killed(monkeypatch, logs):
+    # The guard trips, but the command had already printed its last line and exited 0 before any kill took: the
+    # agent sees its output cut to the cap, not a note saying it was killed before it finished.
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 2 * limit), forks=True, kill_tree_error=mod.SandboxError('gone'))
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = inst.run_command({'command': 'cat big.log'})
+    [process] = session.processes
+    assert process.printed == 2 * limit and result['exit_code'] == 0
+    assert result['truncated'] is True
+    assert 'killed' not in result['stderr']
+
+
+def test_a_read_whose_session_was_dropped_after_it_was_handed_out_says_the_session_ended(monkeypatch, logs):
+    # The call got a warm session, then another call dropped it (terminated) and a third created a fresh one before
+    # this call read the epoch. Its failure on the old session must read as "ended", not as a replacement it could
+    # be retried on: a fresh, empty session cannot hold the file it was asked for.
+    old = _FakeSession('sb-1', files={'/home/tenki/notes.md': 'x'})
+    fresh = _FakeSession('sb-2')
+    inst, _ = _instance(monkeypatch, old, fresh)
+    assert inst.read_file({'path': 'notes.md'})['content'] == 'x'
+    glb = inst.IGlobal
+    real_warm = glb._ensure_warm
+
+    def warm_then_lose_the_session(session):
+        real_warm(session)
+        if session is old and glb.session is old:
+            old.state = 'TERMINATED'
+            with glb._session_lock:
+                glb._drop_session(old, 'TERMINATED', replace=True)
+            glb.get_session()  # another call creates the fresh session
+
+    monkeypatch.setattr(glb, '_ensure_warm', warm_then_lose_the_session)
+    old.fs._fail = {'stat': mod.SessionNotFoundError('session not found')}
+    result = inst.read_file({'path': 'notes.md'})
+    assert result.get('session') == 'ended', result
+    assert result['content'] == '' and 'ended' in result['error']
+    assert not any(call[0] == 'stat' for call in fresh.calls if isinstance(call, tuple))
+
+
+@pytest.mark.parametrize('name', ['tk_github_basic', 'sk-shared-github', 'AKIA_LEGACY_POLICY', 'ghp_rotation_note'])
+def test_a_secret_name_that_merely_begins_like_a_token_is_accepted(monkeypatch, logs, name):
+    glb, _ = _make_global(monkeypatch, {'apikey': _KEY, **_PRIVATE_CFG, 'git_auth_secret': name})
+    glb.beginGlobal()
+    assert glb.git_auth_secret == name

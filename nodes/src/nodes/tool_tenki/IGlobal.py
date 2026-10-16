@@ -308,8 +308,8 @@ def _secret_settings(cfg) -> tuple[tuple[str, ...], tuple[str, ...]]:
 _SECRET_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_-]{0,127}')
 
 #: How credential values begin, as issued by GitHub, GitLab, Tenki, Anthropic and OpenAI, Slack and AWS. A value
-#: where a secret's name belongs matches the name's shape, so it is told apart by its prefix and refused; the
-#: refusal never repeats the value.
+#: where a secret's name belongs matches the name's shape, so it is told apart by its prefix together with an issued
+#: token's length and digits (see _looks_like_a_credential), and refused; the refusal never repeats the value.
 _CREDENTIAL_PREFIXES = (
     'ghp_',
     'gho_',
@@ -324,6 +324,15 @@ _CREDENTIAL_PREFIXES = (
     'xoxp-',
     'AKIA',
 )
+
+
+def _looks_like_a_credential(value: str) -> bool:
+    """Whether ``value`` reads as an issued token rather than a name: a known prefix, at least 20 characters, a digit.
+
+    Issued tokens are long and random, so they carry digits; names such as ``tk_github_basic`` do not, and are kept.
+    """
+    return value.startswith(_CREDENTIAL_PREFIXES) and len(value) >= 20 and any(c.isdigit() for c in value)
+
 
 #: The path a private-repository prefix may have: slashes and URL characters that git leaves as they are when it
 #: normalizes a URL, so that the node and git read the same prefix.
@@ -388,10 +397,11 @@ def _git_auth_settings(cfg, policies: tuple[str, ...], domains: tuple[str, ...])
     secret = cfg.get('git_auth_secret')
     if secret is None or (isinstance(secret, str) and not secret.strip()):
         return '', ''
-    if isinstance(secret, str) and secret.strip().startswith(_CREDENTIAL_PREFIXES):
+    if isinstance(secret, str) and _looks_like_a_credential(secret.strip()):
         raise ValueError(
-            'tenki.git_auth_secret looks like a credential value, not the name of a Tenki secret. The node never '
-            'holds a secret value: create the secret in Tenki and put its name here.'
+            'tenki.git_auth_secret looks like a credential value (it begins like an issued token and is as long as '
+            'one), not the name of a Tenki secret. The node never holds a secret value: create the secret in Tenki '
+            'and put its name here. If this is the name of a secret, rename the secret.'
         )
     if not isinstance(secret, str) or not _SECRET_NAME.fullmatch(secret.strip()):
         raise ValueError(
@@ -819,7 +829,11 @@ class IGlobal(IGlobalBase):
                 # Read again now that this call holds a warm session: the warm-up may have waited on the session
                 # lock behind another call's recovery, and a failure of this call's own after that must not be
                 # taken for that recovery (which would retry the call, or tell the agent its files were gone).
-                epoch = self.session_epoch
+                # Only while the session is still the one this call holds: once another call has dropped it, the
+                # earlier epoch is what tells recover_session that this session ended under the call.
+                current = self.session_epoch
+                if self.session is session:
+                    epoch = current
                 self._report_late_resume(session, on_event)
                 return call(session)
             except _LIFECYCLE_ERRORS:

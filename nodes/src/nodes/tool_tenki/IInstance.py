@@ -46,7 +46,7 @@ import uuid
 from contextlib import nullcontext
 from typing import Callable
 
-from rocketlib import IInstanceBase, debug
+from rocketlib import IInstanceBase, warning
 
 from ai.common.utils import normalize_tool_input, optional_bool, optional_int
 
@@ -106,11 +106,22 @@ _READ_LIMIT_BYTES = 4_000_000
 # outlive their bash. Measured on a real VM (2026-10-16): after the kill, `cat /dev/urandom | base64`
 # streamed on, reparented to init, until Tenki's own execution timeout, and the engine grew the whole
 # time. Every command the sandbox starts shares one process group with the sandbox's own agent (and
-# with every other command of the session), so the group cannot be signalled either. What is left is
-# the process tree: a second command walks it with pgrep, deepest first, and kills every process in
-# it; the sandbox's own kill is sent after that. Best effort: the execution timeout, at which Tenki
-# stops the command and its children (measured), remains the backstop.
-_KILL_TREE_SCRIPT = 'k() { for c in $(pgrep -P "$1"); do k "$c"; done; kill -KILL "$1" 2>/dev/null; }; k "$1"'
+# with every other command of the session), so the group cannot be signalled either, and a walk down
+# from the command's pid misses a background job whose shell has already exited.
+#
+# So every command runs under `env TOOL_TENKI_RUN=<id of its own>`, which execs in place (the pid stays
+# the command's) and is inherited by everything the command starts, whatever becomes of its parent. To
+# stop a command, a second command finds the processes carrying that marker in /proc and stops them all,
+# then kills them, until none is left: bash builtins and /proc only, so no procps is needed, and a parent
+# that forks again is stopped before it can. Only the command's own processes carry its marker: never
+# the sandbox's agent, another command or another session. Out of reach: a process that clears its
+# environment (`env -i`, sudo's env_reset) or runs as another user; the sandbox's own kill is sent after,
+# and Tenki's execution timeout, at which it stops the command and its children (measured), is the
+# backstop. Tested on real Linux (python:3.12-slim and node:24-slim, neither with procps): simple command,
+# pipeline, background and nohup jobs whose shell had exited, a setsid child, a re-forking loop and nested
+# subshells all left no process, and another command's processes and the agent's were untouched.
+_RUN_MARKER = 'TOOL_TENKI_RUN'
+_KILL_TREE_SCRIPT = 'm="$1"; n=0; for pass in 1 2 3 4 5 6; do hit=""; for d in /proc/[0-9]*; do p="${d##*/}"; [ "$p" = "$$" ] && continue; { while IFS= read -r -d "" kv; do if [ "$kv" = "$m" ]; then kill -STOP "$p" 2>/dev/null && hit="$hit $p"; break; fi; done < "$d/environ"; } 2>/dev/null; done; [ -z "$hit" ] && break; for p in $hit; do kill -KILL "$p" 2>/dev/null && n=$((n+1)); done; done; echo "killed=$n"'
 _KILL_TREE_WAIT_SECS = 15
 _KILLED_NOTICE = (
     '[tool_tenki: the command was killed before it finished, because it produced more than {limit:,} bytes '
@@ -440,25 +451,27 @@ def _exec_result(result, cap: int, *, killed: bool = False) -> dict:
     }
 
 
-def _kill_command_tree(session, process) -> None:
-    """Kill ``process`` and every process under it in the sandbox, then send the sandbox's own kill.
+def _kill_command_tree(session, process, marker: str | None) -> None:
+    """Kill every process carrying the command's ``marker`` in the sandbox, then send the sandbox's own kill.
 
-    See ``_KILL_TREE_SCRIPT``. The tree is walked first: the sandbox's kill ends the process the
-    sandbox started, which reparents its children to init, where the walk could not find them.
-    Without a session or a pid (a fake, or a start the sandbox never confirmed) only the sandbox's
-    kill is sent.
+    See ``_KILL_TREE_SCRIPT``. Without a session or a marker only the sandbox's kill is sent. A kill that
+    could not run is logged for the operator: the command then streams on until Tenki's execution timeout.
     """
-    pid = getattr(process, 'pid', None) if session is not None else None
-    if pid:
+    if session is not None and marker:
         try:
             killer = session.start(
-                'bash', '-c', _KILL_TREE_SCRIPT, 'tool_tenki-kill', str(pid), timeout=_KILL_TREE_WAIT_SECS
+                'bash', '-c', _KILL_TREE_SCRIPT, 'tool_tenki-kill', marker, timeout=_KILL_TREE_WAIT_SECS
             )
             killer.close_stdin()
-            killer.wait(timeout=_KILL_TREE_WAIT_SECS + _RESULT_GRACE_SECS)
+            outcome = killer.wait(timeout=_KILL_TREE_WAIT_SECS + _RESULT_GRACE_SECS)
+            if getattr(outcome, 'exit_code', 0) != 0:
+                raise SandboxError(f'the kill command exited {outcome.exit_code}')
         except Exception as e:
-            # Best effort: the execution timeout is the backstop, and the sandbox's kill is still sent.
-            debug(f'tool_tenki: could not kill the process tree of command {pid}: {e}')
+            # Best effort: the sandbox's kill is still sent, and the execution timeout is the backstop.
+            warning(
+                'tool_tenki: could not stop all the processes of a command that flooded its output '
+                f'({e}); Tenki stops it at the execution timeout'
+            )
     process.kill()
 
 
@@ -471,9 +484,10 @@ class _OutputGuard:
     whole process tree is killed, not only the process the sandbox started (see ``_kill_command_tree``).
     """
 
-    def __init__(self, process, limit: int, session=None):
+    def __init__(self, process, limit: int, session=None, marker: str | None = None):
         self._process = process
         self._session = session
+        self._marker = marker
         self._limit = limit
         self._lock = threading.Lock()
         self._received = 0
@@ -493,7 +507,7 @@ class _OutputGuard:
                     kill = self._received > self._limit and not self.killed
                     self.killed = self.killed or kill
                 if kill:
-                    _kill_command_tree(self._session, self._process)
+                    _kill_command_tree(self._session, self._process, self._marker)
         except Exception:
             # A stream fails when its run does, and wait() raises that same error, so it is reported there.
             pass
@@ -672,7 +686,9 @@ def _run_process(session, argv, timeout: int, started: list):
     arrived late would still run the command. A kill is sent here instead.
     """
     limit = timeout + _RESULT_GRACE_SECS
-    process = session.start(*argv, timeout=timeout)
+    # The command's own marker, inherited by everything it starts (see _KILL_TREE_SCRIPT).
+    marker = f'{_RUN_MARKER}={uuid.uuid4().hex}'
+    process = session.start('env', marker, *argv, timeout=timeout)
     try:
         process.close_stdin()
     except SandboxError:
@@ -682,7 +698,7 @@ def _run_process(session, argv, timeout: int, started: list):
         process.kill()
         raise CommandNotStartedError('the sandbox did not start the command in time, so it was cancelled') from e
     started.append(True)
-    guard = _OutputGuard(process, _OUTPUT_LIMIT_BYTES, session)
+    guard = _OutputGuard(process, _OUTPUT_LIMIT_BYTES, session, marker)
     try:
         result = process.wait(timeout=limit)
     except SandboxError:
@@ -695,7 +711,10 @@ def _run_process(session, argv, timeout: int, started: list):
         ) from e
     finally:
         guard.stop()
-    return result, guard.killed
+    # A command that crossed the limit but exited 0 by itself before any kill took was not killed: it is only cut
+    # to the cap, and the agent is not told it stopped early.
+    finished_by_itself = result.exit_code == 0 and not result.signal and not result.timed_out
+    return result, guard.killed and not finished_by_itself
 
 
 def _with_session_event(output: dict, events: list) -> dict:
@@ -1199,7 +1218,10 @@ class IInstance(IInstanceBase):
             'properties': {
                 'repo': {
                     'type': 'string',
-                    'description': 'Repository URL, e.g. "https://github.com/octocat/Hello-World.git".',
+                    'description': (
+                        'Repository URL, e.g. "https://github.com/octocat/Hello-World.git": http(s) only, with no '
+                        'credentials, query string or fragment in it.'
+                    ),
                 },
                 'directory': {
                     'type': 'string',

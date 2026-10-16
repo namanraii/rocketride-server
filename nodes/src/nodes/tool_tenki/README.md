@@ -80,13 +80,17 @@ one wave would otherwise read the same original and the later write would drop t
 2026-10-12; both calls reported success). A command still running in the VM is not covered by that lock.
 
 A command that streams back more than 8 MiB of output is killed before it finishes, together with
-every process it started: the sandbox's own kill reaches only the process it started, and a pipeline
-such as `cat /dev/urandom | base64` outlived its shell and streamed on until the execution timeout
-(measured), so the node first kills the command's process tree from inside the VM. The engine holds
-a command's whole output in memory until it exits, so a runaway one would otherwise grow it for as
-long as the execution timeout allows. The cap and this limit are separate: a chatty command that
-finishes, such as a large `apt-get install`, is only truncated. A killed one comes back with
-`truncated` set and a note on `stderr` saying why.
+every process it started. The sandbox's own kill reaches only the process it started: a pipeline such
+as `cat /dev/urandom | base64` outlived its shell and streamed on until the execution timeout
+(measured), and so would a background job whose shell had already exited. So every command runs
+under an environment variable of its own (`TOOL_TENKI_RUN`), which everything it starts inherits, and
+the node stops and then kills every process carrying it from inside the VM before sending the
+sandbox's kill. This needs only bash and `/proc`, which the commands need anyway; a process that
+clears its environment or runs as another user (through `sudo`, say) is out of its reach, and Tenki's
+execution timeout stops it. The engine holds a command's whole output in memory until it exits, so a
+runaway one would otherwise grow it for as long as the execution timeout allows. The cap and this
+limit are separate: a chatty command that finishes, such as a large `apt-get install`, is only
+truncated. A killed one comes back with `truncated` set and a note on `stderr` saying why.
 
 A result also carries a `session` field whenever the session changed during its call: `"created"`
 (a new, empty sandbox), `"resumed"` (it had been paused; its files survived), `"replaced"` (it had
@@ -330,8 +334,9 @@ never asks Tenki to deliver one into the VM. For a private repository it sends a
 Tenki replaces outside the VM (see [Private repositories](#private-repositories)).
 
 `git_clone` enforces that rather than trusting the agent to respect it: it accepts `http(s)` URLs
-only, and refuses one carrying credentials in the URL (`https://token@host/org/repo.git`) along
-with the `ssh`, `git`, `file` and `git@host:path` forms, none of which it could authenticate anyway.
+only, and refuses one carrying credentials in the URL (`https://token@host/org/repo.git`) or a query
+string or fragment (some hosts take a token as `?private_token=...`), along with the `ssh`, `git`,
+`file` and `git@host:path` forms, none of which it could authenticate anyway.
 Git records the URL it cloned from in `.git/config`, so a credential passed that way would be left
 inside the VM for every later command, and every later caller, to read.
 
