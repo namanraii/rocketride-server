@@ -488,11 +488,15 @@ def _exec_result(result, cap: int, *, cut: bool = False, killed: int = 0) -> dic
 
 
 class _KillReport(NamedTuple):
-    """What the kill of a command's processes reported (see ``_KILL_TREE_SCRIPT``), or why it could not say."""
+    """What the kill of a command's processes reported (see ``_KILL_TREE_SCRIPT``), or why it could not say.
+
+    ``skipped`` means no kill was sent: the run had already ended when the output passed the limit.
+    """
 
     found: int = 0
     killed: int = 0
     failure: str | None = None
+    skipped: bool = False
 
 
 def _kill_command_tree(session, process, marker: str | None) -> _KillReport:
@@ -505,6 +509,7 @@ def _kill_command_tree(session, process, marker: str | None) -> _KillReport:
     """
     report = _KillReport(failure='no marker to find its processes by')
     if session is not None and marker:
+        killer = None
         try:
             killer = session.start(
                 'bash', '-c', _KILL_TREE_SCRIPT, 'tool_tenki-kill', marker, timeout=_KILL_TREE_WAIT_SECS
@@ -528,6 +533,10 @@ def _kill_command_tree(session, process, marker: str | None) -> _KillReport:
                 'the limit is kept.'
             )
             report = _KillReport(failure=str(e))
+        finally:
+            if killer is not None:
+                # Nothing reads the kill command's output after this, whether it answered or not.
+                stop_keeping_output(killer)
     process.kill()
     return report
 
@@ -538,9 +547,9 @@ def _stopped_by_kill(report: _KillReport, ran_on: float) -> int:
     ``ran_on`` is how long the run went on after the kill. The run lasts while any process holds the command's output
     open, so one that went on for more than _KILL_SETTLE_SECS was kept going by a process out of the kill's reach,
     and the operator is told so. So is a kill that found none of the command's processes. A kill that failed was
-    logged when it did.
+    logged when it did. No kill was sent for a run that had already ended: nothing was stopped.
     """
-    if report.failure is not None:
+    if report.failure is not None or report.skipped:
         return 0
     if ran_on > _KILL_SETTLE_SECS:
         what = (
@@ -570,11 +579,16 @@ class _OutputGuard:
     cannot cancel the run. So once the command has printed more than ``limit`` bytes, the guard
     replaces the process's streams with ones that keep nothing (see output_sink): that is what bounds
     the engine's memory, whatever the command does next. The guard keeps the first ``limit`` bytes
-    itself, for the agent. Then it kills the command, every process it started (see
-    ``_kill_command_tree``), and records what that kill reported. The kill is cleanup, not the
-    bound: what it cannot reach runs on in the VM until the execution timeout, and the SDK receives
-    that output and drops it. Reading as it arrives is what lets the limit be noticed while the command
-    runs rather than after it exits.
+    itself, for the agent. Then, while the run is still open, it kills the command, every process it
+    started (see ``_kill_command_tree``), and records what that kill reported. The kill is cleanup, not
+    the bound: what it cannot reach runs on in the VM until the execution timeout, and the SDK receives
+    that output and drops it. A run that had already ended by then is not killed: nothing more of it can
+    reach the engine, and a background process the command left behind on purpose stays. Reading as it
+    arrives is what lets the limit be noticed while the command runs rather than after it exits.
+
+    The same rule holds wherever the node stops reading a process (``stop``, and every call that gives a
+    process up): the streams are replaced before the process is let go, so a command that prints after
+    its call is over cannot grow the engine either.
     """
 
     def __init__(self, process, limit: int, session=None, marker: str | None = None):
@@ -612,24 +626,38 @@ class _OutputGuard:
                     cut = self.cut = self._received > self._limit
                 if cut:
                     stop_keeping_output(self._process)
-                    self.kill = _kill_command_tree(self._session, self._process, self._marker)
+                    if _run_ended(self._process):
+                        self.kill = _KillReport(skipped=True)
+                    else:
+                        self.kill = _kill_command_tree(self._session, self._process, self._marker)
                     self.kill_done = time.monotonic()
         except Exception:
             # A stream fails when its run does, and wait() raises that same error, so it is reported there.
             pass
 
     def stop(self) -> None:
-        """End both streams and wait for the readers.
+        """Stop keeping the process's output, end the streams the readers read, and wait for the readers.
 
-        Once a command exits the SDK has ended its streams already, and this only adds an end marker
-        nobody reads. After a stalled run it never will, and without this the readers would block for
-        good: the one thing that releases them is ending the streams they are reading. Once the streams
-        were replaced (see output_sink), the ones the readers read were ended then.
+        Once a command exits the SDK has ended its streams already. After a stalled run it never will,
+        and the SDK's own thread may yet receive what the command prints, so the streams are replaced
+        (see output_sink) rather than only ended: that ends the ones the readers read, which is the one
+        thing that releases them, and keeps nothing that arrives later. Once the output was cut, the
+        streams were replaced then, and this replaces the replacements, which hold nothing.
         """
-        for stream in (self._process.stdout, self._process.stderr):
-            stream.close()
+        stop_keeping_output(self._process)
         for reader in self._readers:
             reader.join()
+
+
+def _run_ended(process) -> bool:
+    """Whether ``process``'s run is over: its result is in, or its run failed.
+
+    The SDK sets ``_done`` as soon as either happens, before it ends the output streams (pinned in
+    test_tool_tenki_sdk.py), so the output guard can tell a limit crossed during the run from one
+    noticed only after it. A process without the attribute is taken to be still running.
+    """
+    done = getattr(process, '_done', None)
+    return done is not None and done.is_set()
 
 
 class ResultTimeoutError(CommandTimeoutError):
@@ -782,8 +810,9 @@ def _run_process(session, argv, timeout: int, started: list):
 
     Returns the CommandResult; whether the command printed more than _OUTPUT_LIMIT_BYTES, so that
     the node stopped keeping its output and the result carries the part it kept; and how many of
-    the command's processes the node's kill then stopped, 0 unless the run ended right after the
-    kill (see _OutputGuard and _stopped_by_kill). ``started`` is
+    the command's processes the node's kill then stopped, 0 unless the run was still open at the
+    kill and ended right after it (see _OutputGuard and _stopped_by_kill). Whatever ends the call,
+    the process is let go with its output no longer kept (see output_sink). ``started`` is
     appended to once the sandbox has confirmed the start (see _StartedOnce).
 
     Sandbox.exec waits on the output stream with no local limit, so a stream that stalls (on a
@@ -802,8 +831,12 @@ def _run_process(session, argv, timeout: int, started: list):
         process.close_stdin()
     except SandboxError:
         # Not the SDK's own plain "timed out waiting for command start": an SDK error is reported as itself.
+        stop_keeping_output(process)
         raise
     except TimeoutError as e:
+        # A start that arrives after this still runs the command, and its children outlive the kill (see
+        # _KILL_TREE_SCRIPT); the SDK's thread receives what they print, so it must keep none of it.
+        stop_keeping_output(process)
         process.kill()
         raise CommandNotStartedError('the sandbox did not start the command in time, so it was cancelled') from e
     started.append(True)

@@ -648,3 +648,19 @@ def test_once_the_node_replaces_a_processs_streams_the_sdk_keeps_none_of_the_out
     # Ending the stream the SDK started with is what releases a reader blocked on it.
     reader.join(timeout=5)
     assert not reader.is_alive()
+
+
+def test_a_process_says_when_its_run_has_ended_before_it_ends_its_streams():
+    # The output guard skips the kill when the run had already ended by the time the output passed the limit
+    # (IInstance._OutputGuard): nothing more can reach the engine then. The SDK sets ``_done`` once the run is over,
+    # before it ends the streams, and ``wait`` is what the node's own thread blocks on.
+    assert isinstance(inspect.getattr_static(Process, 'wait'), type(Process.wait))
+    source = inspect.getsource(Process._pump)
+    assert source.index('self._done.set()') < source.index('self.stdout.close()')
+
+    class _NoNetwork:
+        def run(self, requests):
+            raise ConnectionError('no network in contract tests')
+
+    process = Process(_NoNetwork(), 'sb-contract', ['true'])
+    assert isinstance(process._done, threading.Event) and process._done.wait(timeout=5)

@@ -37,6 +37,10 @@ is what stops the keeping, whatever the command does next.
 That lookup is SDK internals, which is why this lives in a module of its own, free of engine imports:
 test_tool_tenki_sdk.py drives a real ``Process`` through it against a data plane that floods it, and
 fails if the SDK keeps anything of what follows.
+
+The node calls this wherever it stops reading a process: at the output limit, and on every path that
+gives a process up before its result (a start or a result that never arrived in time, the kill command
+itself). The SDK's thread runs on after each of those, and must keep nothing it receives.
 """
 
 from __future__ import annotations

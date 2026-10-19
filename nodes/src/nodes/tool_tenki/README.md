@@ -83,9 +83,11 @@ The engine keeps at most 8 MiB of one command's output. The Tenki SDK holds ever
 prints in memory until the command exits, with no limit of its own and no way to cancel the run, so
 once a command passes 8 MiB the node replaces the SDK's output streams with ones that keep nothing:
 what arrives after that is received and dropped, and the engine's memory stays bounded whatever the
-command does. The node keeps the first 8 MiB itself, for the agent.
+command does. The node keeps the first 8 MiB itself, for the agent. The same holds wherever the node
+stops reading a command: one whose start or result never arrived in time is let go with its output no
+longer kept, so what it prints after its call is over cannot grow the engine either.
 
-It then kills the command, together with every process it started. The sandbox's own kill reaches
+It then kills the command, while its run is still open, together with every process it started. The sandbox's own kill reaches
 only the process it started: a pipeline such as `cat /dev/urandom | base64` outlived its shell and
 streamed on until the execution timeout (measured), and so would a background job whose shell had
 already exited. So every command runs under an environment variable of its own (`TOOL_TENKI_RUN`),
@@ -100,7 +102,10 @@ when it found none, when it could not stop them all, and when the command's run 
 The cap and this limit are separate: a chatty command that finishes within 8 MiB, such as a large
 `apt-get install`, is only truncated. One that passes the limit comes back with `truncated` set and a
 note on `stderr`: that it was killed, when the kill stopped its processes and the run ended right after,
-or else that its output past the limit was not kept and the node could not confirm it stopped. Whether
+or else that its output past the limit was not kept and the node could not confirm it stopped. A command
+whose run had already ended when the limit was acted on (a fast `cat` of a 9 MB file) is not killed at
+all: nothing more of it can reach the engine, a server it started in the background stays, and the note
+says its output was cut. Whether
 it was killed comes from the kill's own count and the run ending with it, never from `exit_code`, which
 belongs to the process the sandbox started: 0 for `nohup job & exit 0` even when the job was killed.
 

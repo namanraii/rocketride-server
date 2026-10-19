@@ -251,8 +251,18 @@ class _FakeSession:
         escapes=False,
         kill_tree_report=None,
         kill_tree_timed_out=False,
+        kill_tree_stalls=None,
+        burst=False,
+        servers=False,
     ):
         self.id = session_id
+        # kill_tree_stalls: the kill command itself never answers. burst: a command's output arrives all at once,
+        # with the exit, before anything reads it (a fast pipe). servers: each command also leaves a background
+        # process of its own behind, carrying its marker, that the kill can reach.
+        self._kill_tree_stalls = kill_tree_stalls
+        self._burst = burst
+        self._servers = servers
+        self.background = []
         # A flood from a background job whose shell has already exited: neither the sandbox's kill nor a walk from
         # the dead root reaches it; only the command's marker does.
         self._orphans = orphans
@@ -320,6 +330,10 @@ class _FakeSession:
                 ):
                     process.tree_killed()
                     killed += 1
+            for server in self.background:
+                if server.alive and server.marker == target:
+                    server.alive = False
+                    killed += 1
             report = (
                 self.kill_tree_report if self.kill_tree_report is not None else f'found={killed} killed={killed} left=0'
             )
@@ -329,7 +343,7 @@ class _FakeSession:
                 stdout=report.encode(),
                 timed_out=self.kill_tree_timed_out,
             )
-            killer = _FakeProcess(self, answer)
+            killer = _FakeProcess(self, answer, stalls=self._kill_tree_stalls)
             self.kill_processes.append(killer)
             return killer
         warm_up = argv == _WARM_UP and not self.warm_up_faults
@@ -350,8 +364,11 @@ class _FakeSession:
             marker=marker,
             orphaned=self._orphans,
             escapes=self._escapes,
+            burst=self._burst,
         )
         process.raw_argv = raw_argv
+        if self._servers and argv != _WARM_UP:
+            self.background.append(SimpleNamespace(marker=marker, alive=True))
         if argv == _WARM_UP:
             self.warm_up_processes.append(process)
         else:
@@ -466,6 +483,7 @@ class _FakeProcess:
         marker=None,
         orphaned=False,
         escapes=False,
+        burst=False,
     ):
         self.marker = marker
         self.orphaned = orphaned
@@ -482,7 +500,11 @@ class _FakeProcess:
         self._root_killed = False
         self._killed = threading.Event()
         self._exited = threading.Event()
-        if stalls is None:
+        # As in the SDK: set once the run has ended, before the streams are ended.
+        self._done = self._exited
+        self._flood = flood
+        self._burst = burst
+        if stalls is None and not burst:
             threading.Thread(target=self._run, args=(flood,), daemon=True).start()
 
     def _run(self, flood):
@@ -523,6 +545,16 @@ class _FakeProcess:
         self._session.calls.append(('close_stdin',))
         if self._stalls == 'start':
             raise TimeoutError('timed out waiting for command start')
+        if self._burst:
+            # The whole output and the exit are in before anyone reads: a fast pipe, a short file.
+            chunk, budget = self._flood
+            while self.printed < budget:
+                self.stdout.push(chunk)
+                self.printed += len(chunk)
+            self._result = _CommandResult(argv=self._result.argv, exit_code=0, stdout=self.stdout.read())
+            self._exited.set()
+            self.stdout.close()
+            self.stderr.close()
 
     def wait(self, timeout=None):
         self._session.calls.append(('wait', timeout))
@@ -5701,7 +5733,8 @@ def test_output_queued_past_the_limit_is_neither_kept_nor_a_second_kill(monkeypa
     guard.stop()
     assert guard.cut is True
     assert guard.kept() == (b'y' * limit, b'')
-    assert len(swaps) == 1 and session.calls.count(('kill',)) == 1
+    # One swap at the cut and one more when the guard stopped reading, and one kill: nothing for the queued chunks.
+    assert len(swaps) == 2 and session.calls.count(('kill',)) == 1
 
 
 @_NO_BASH
@@ -5735,3 +5768,77 @@ def test_processes_the_kill_found_but_did_not_kill_do_not_make_it_a_kill(monkeyp
     inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
     result = inst.run_command({'command': 'yes'})
     assert result['truncated'] is True and 'killed' not in result['stderr']
+
+
+# ---------------------------------------------------------------------------
+# Fresh critic of 39b25fd6: every path that stops reading a process stops keeping its output first, and a run that
+# had already ended when the limit was acted on is not killed
+# ---------------------------------------------------------------------------
+
+
+def _flood_after_abandon(process, budget):
+    """Have ``process`` print ``budget`` bytes now, as a command does after the node stopped reading it."""
+    process._killed.clear()
+    process._run((_FLOOD, budget))
+
+
+def _assert_nothing_more_was_kept(process):
+    assert process.stdout is not process.first_stdout, 'the streams were not replaced'
+    assert process.first_stdout.held == 0, f'{process.first_stdout.held:,} bytes kept after the node let go'
+
+
+@pytest.mark.parametrize('stalls', ['start', 'result'])
+def test_a_command_the_call_gave_up_on_keeps_no_output_that_arrives_later(monkeypatch, logs, stalls):
+    # A start confirmed only after the SDK's 30 s wait, or a result that never came: the call is over, but the SDK's
+    # own thread still receives whatever the command prints, and pipeline children outlive the sandbox's kill.
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    session = _FakeSession('sb-1', stalls=stalls, forks=True)
+    inst, _ = _instance(monkeypatch, session, cfg={'exec_timeout_secs': 45})
+    result = inst.run_command({'command': 'cat /dev/urandom | base64'})
+    assert result['exit_code'] == -1 and result['timed_out'] is True
+    [process] = session.processes
+    _flood_after_abandon(process, 64 * limit)
+    _assert_nothing_more_was_kept(process)
+
+
+@pytest.mark.parametrize('stalls', ['start', 'result'])
+def test_the_warm_up_command_the_node_gave_up_on_keeps_no_output_that_arrives_later(monkeypatch, logs, stalls):
+    session = _FakeSession('sb-1', stalls=stalls, forks=True, warm_up_faults=True)
+    inst, _ = _instance(monkeypatch, session)
+    result = inst.run_command({'command': 'true'})
+    assert 'error' in result
+    [process] = session.warm_up_processes
+    _flood_after_abandon(process, 4 * 1024 * 1024)
+    _assert_nothing_more_was_kept(process)
+
+
+def test_a_kill_command_that_never_answered_keeps_no_output_that_arrives_later(monkeypatch, logs):
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 64 * limit), kill_tree_stalls='result')
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = inst.run_command({'command': 'yes'})
+    assert result['truncated'] is True and 'killed' not in result['stderr']
+    [killer] = session.kill_processes
+    _flood_after_abandon(killer, 4 * 1024 * 1024)
+    _assert_nothing_more_was_kept(killer)
+
+
+def test_a_command_that_ended_before_the_limit_was_acted_on_is_not_killed_and_its_server_lives(monkeypatch, logs):
+    # `./server & cat big.log`: the output and the exit are in before the reader reaches the limit. Nothing more can
+    # reach the engine, so no kill is sent, the server the command left behind lives, and the result says the output was
+    # cut at the limit, not that the command was killed.
+    limit = 64 * 1024
+    monkeypatch.setattr(inst_mod, '_OUTPUT_LIMIT_BYTES', limit)
+    warned = []
+    monkeypatch.setattr(inst_mod, 'warning', lambda message, *a, **kw: warned.append(str(message)), raising=False)
+    session = _FakeSession('sb-1', flood=(_FLOOD, 2 * limit), burst=True, servers=True)
+    inst, _ = _instance(monkeypatch, session, cfg={'max_output_chars': 1000})
+    result = inst.run_command({'command': './server >/home/tenki/server.log 2>&1 & cat big.log'})
+    assert result['exit_code'] == 0 and result['truncated'] is True
+    assert f'{limit:,} bytes' in result['stderr'] and 'killed' not in result['stderr']
+    assert not any(call[0] == 'kill_tree' for call in session.calls) and ('kill',) not in session.calls
+    [server] = session.background
+    assert server.alive
+    assert warned == []

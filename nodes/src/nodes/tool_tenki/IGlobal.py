@@ -86,6 +86,7 @@ from tenki import (
 )
 
 from .file_deadline import bound_file_calls
+from .output_sink import stop_keeping_output
 from .tool_groups import DEFAULT_GROUPS, normalize_groups, unknown_groups
 
 # The deadline for every control-plane call (create, refresh, resume, close, and git operations) and
@@ -664,20 +665,24 @@ class IGlobal(IGlobalBase):
         """
         process = session.start('true', timeout=_WARM_UP_TIMEOUT_SECS)
         try:
-            process.close_stdin()
-        except SandboxError:
-            raise
-        except TimeoutError as e:
-            process.kill()
-            raise CommandNotStartedError(
-                "the sandbox did not start the node's first command in time, so it was cancelled"
-            ) from e
-        try:
-            process.wait(timeout=_WARM_UP_WAIT_SECS)
-        except SandboxError:
-            raise
-        except TimeoutError as e:
-            raise SandboxError("the sandbox did not finish the node's first command in time") from e
+            try:
+                process.close_stdin()
+            except SandboxError:
+                raise
+            except TimeoutError as e:
+                process.kill()
+                raise CommandNotStartedError(
+                    "the sandbox did not start the node's first command in time, so it was cancelled"
+                ) from e
+            try:
+                process.wait(timeout=_WARM_UP_WAIT_SECS)
+            except SandboxError:
+                raise
+            except TimeoutError as e:
+                raise SandboxError("the sandbox did not finish the node's first command in time") from e
+        finally:
+            # Nothing reads this command's output after this; a late start or a stalled run must not grow the engine.
+            stop_keeping_output(process)
 
     def _create_session(self) -> Sandbox:
         create_kwargs = {
