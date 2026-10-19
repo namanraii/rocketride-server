@@ -289,7 +289,9 @@ reason telling you what to fix.
   tablet, phone), each with five common CSS viewports; the iframe gets those
   exact dimensions so responsive breakpoints fire exactly as on the device.
   Orientation, zoom, fit-to-window; all preview preferences persist per
-  workspace and app.
+  workspace and app. The app's own `prefs`/`appState` are not preview
+  preferences: they are saved in the connected server's file store under
+  the app id; see [State & Persistence](#state--persistence).
 - **Code** — file tree + editor (web App Builder only; in VS Code files are
   native and a strip links to them).
 - **Components** — the stock UI component gallery: live examples of
@@ -788,6 +790,40 @@ The shell persists your app's state per user in `.workspace/` on the server:
 | `.workspace/<appId>.workspace.json` | Your app's `{ prefs, appState }` |
 | `.workspace/settings.json` | User setting overrides (deltas only — defaults live in your schema) |
 
+**"On the server" means the server the page is connected to**, in the
+signed-in user's file store, and the file is named after the app id, not
+the version. A page therefore sees the state another page saved only when
+both are on the same server, signed in as the same user, under the same
+app id:
+
+- **A new version** keeps the state: every deployed version of an app reads
+  and writes the same file.
+- **The App Builder preview** runs against the connected development
+  server (`ROCKETRIDE_URI`), so the `prefs` and `appState` it saves live in
+  that server's file store; the published `@me` app lives on the deployment
+  target. When those are different servers, each copy keeps its own file,
+  and edits in one never show up in the other: not data loss, two files.
+- **A working copy under a different app id** than the published app (one
+  scaffolded as `local.<slug>`, or renamed after the org registered its
+  developer id) keeps its own file even on the same server.
+- **Same server, user and app id** (the deployment target is the
+  development server): the preview and the published copy read one file
+  but nothing syncs. Each page keeps the copy it loaded and writes it back
+  whole, so the last save wins: finish in one, close it, then reload the
+  other before editing there.
+
+Which user the preview is signed in as is set by **Inherit Auth**: on (the
+default), the preview is signed in as the App Builder is; off, as whoever
+signs in inside the preview (signed out until then).
+
+Files your app writes itself through the shell connection's file calls (for
+example `client.fsWriteJson('reports/q3.json', data)`) follow a different
+rule: a plain path is stored under the signed-in user's own root in that
+server's file store, with no app id or version in it. A development build
+and the published version on the same server and user therefore read
+and write the same files, and a file both pages write follows the same
+last-save-wins rule.
+
 ### Prefs — small UI preferences
 
 `prefs` is a shell-managed bag (active view, theme, sidebar state, plus any
@@ -918,7 +954,14 @@ await client.terminate(token);
 
 `use()` is expensive — start the pipeline once per session and keep the
 token; never start/stop around every request. `ttl` controls the idle
-shutdown window (`0` = run until terminated).
+shutdown window (`0` disables the timeout; the default is 15 minutes).
+The idle clock restarts on pipeline data requests and on `apaevt_*` events
+from the pipeline. Status polling, raw stdout, and debugger events do not
+reset it. The task stops after approximately `ttl` seconds without that
+activity, and its billing ends when the task stops. The engine checks idle
+time once a minute in 60-second steps, so the stop can come up to a minute
+before `ttl`. A long step that emits nothing can still hit it: size `ttl`
+to your longest quiet step plus at least a minute of margin.
 
 ### One task for everyone vs a task per user
 
@@ -975,7 +1018,11 @@ if (token) await client.send(token, data, undefined, 'text/plain');
   accumulates is visible to all of them.
 - Cost and lifecycle — the run bills to the owning team, resolves the
   team's environment, and outlives any one user's session; restarting or
-  terminating it affects everyone at once.
+  terminating it affects everyone at once. Shared runs do not inherit the
+  default development idle timeout. A scheduled run can have an explicit
+  `ttl`; a manual `deploy.run` has no timeout and can remain running, and
+  billing, until the pipeline finishes or someone terminates it (see
+  'Lifecycle and cost' below).
 
 **Choosing:** per-user when the pipeline holds per-user state or cost
 should follow the user; shared when the pipeline is a service — one big
@@ -1039,7 +1086,10 @@ it cannot serve.
 `apaevt_status_update` events stream the same status fields (errors and
 exit code included) while the task runs, and an `apaevt_task` event with
 `action: 'end'` that you did not cause — no `terminate()`, no TTL you
-expected — is your cue to check the status and show the error state:
+expected — is your cue to check the status and show the error state. The
+end event's body carries `reason: 'ttl'` when an idle timeout or a run
+window ended the task, so you can show "stopped by its time limit" instead
+of an error:
 
 ```typescript
 useEffect(() => {
@@ -1088,12 +1138,41 @@ that pipeline separately and manage it through the deploy API
 (`client.deploy.*` — see the SDK docs); your app can still observe its runs
 and read its outputs.
 
+### Lifecycle and cost: bundle and `use()` unless it is a service
+
+The default for an app's pipeline is the bundled one: the `.pipe` lives in
+the app folder, ships with the app so the app and the pipeline always
+match, and your code starts it with `use()`. With the default timeout, each
+user's instance stops by itself when idle. Reach for a team deployment
+when the pipeline is a service shared by a team. To limit a scheduled
+run's lifetime, configure its `ttl`: deployed runs do not inherit the
+default development timeout.
+
+| How the run started | When it stops | Who pays |
+|---|---|---|
+| `use()` from the app | finishes, is terminated, or reaches approximately `ttl` seconds without a pipeline data request or `apaevt_*` event (default 15 minutes; `0` disables timeout) | the signed-in user's development team |
+| A schedule (`deploy.setSchedule(..., { ttl })`) | finishes, is terminated, or reaches its configured `ttl`, counted from the last pipeline data request; omitted or zero `ttl` disables timeout | the deployment's billing team |
+| `deploy.run(projectId, sourceId, teamId)` by hand | no timeout: it runs until the pipeline finishes or someone with `task.control` on the deployment's team calls `terminate(token)` with the token `deploy.run` returned. Disabling the deployment refuses new runs but does not stop one already going | the deployment's billing team |
+
+A long-lived pipeline started with `deploy.run` can keep running and
+billing indefinitely: a manual run ignores the schedule's `ttl`, even
+when a schedule exists. It ends when the pipeline finishes or the task is
+terminated. To apply a configured timeout, start it through its schedule
+(see 'The team-service pattern' below). The scheduled timeout counts
+from the last pipeline data request; emitted events do not reset it. A
+long processing step can therefore be cut off even while emitting events.
+The timeout is approximate, using the same minute-by-minute checks
+described above. The `apaevt_task` end event carries `reason: 'ttl'`
+when a timeout ended the run. An absent reason does not establish a crash:
+normal completion can also omit it. Check task status and exit information
+to distinguish other outcomes.
+
 ### The team-service pattern: addressing a scheduled deployment
 
-The counterpart of embedding, and the shape "runs 9:00–18:00 for the whole
-team" requirements always take: ONE shared pipeline deployed as its own
-`kind: 'pipe'` project and scheduled on a team, with the app **addressing**
-the running task instead of starting its own. The pieces:
+For a scheduled service shared by a team, deploy the pipeline as its own
+`kind: 'pipe'` project. The app **addresses** the running task instead of
+starting its own. Cron determines the start; `ttl` does not guarantee a
+fixed closing time because pipeline data requests extend it. The pieces:
 
 - **Identity without drift** — import the `.pipe` for its `project_id` (the
   scaffold's build treats `.pipe` as JSON) and address the service as
