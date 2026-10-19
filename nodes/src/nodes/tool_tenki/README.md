@@ -102,12 +102,14 @@ when it found none, when it could not stop them all, and when the command's run 
 The cap and this limit are separate: a chatty command that finishes within 8 MiB, such as a large
 `apt-get install`, is only truncated. One that passes the limit comes back with `truncated` set and a
 note on `stderr`: that it was killed, when the kill stopped its processes and the run ended right after,
-or else that its output past the limit was not kept and the node could not confirm it stopped. A command
-whose run had already ended when the limit was acted on (a fast `cat` of a 9 MB file) is not killed at
-all: nothing more of it can reach the engine, a server it started in the background stays, and the note
-says its output was cut. Whether
-it was killed comes from the kill's own count and the run ending with it, never from `exit_code`, which
-belongs to the process the sandbox started: 0 for `nohup job & exit 0` even when the job was killed.
+or else that its output past the limit was not kept and the node could not confirm it stopped. A finite
+command just past the limit, such as a `cat` of a 9 MB file, usually gets that second note: the node
+reads the output as it streams and sees the limit crossed before the command's exit arrives, so the kill
+is sent, finds nothing left to kill, and the run is reported as cut, not killed. Only when the exit had
+already arrived by the time the limit was noticed (output that was already in the engine's memory) is no
+kill sent at all, and a server such a command started in the background then stays. Whether it was
+killed comes from the kill's own count and the run ending with it, never from `exit_code`, which belongs
+to the process the sandbox started: 0 for `nohup job & exit 0` even when the job was killed.
 
 A result also carries a `session` field whenever the session changed during its call: `"created"`
 (a new, empty sandbox), `"resumed"` (it had been paused; its files survived), `"replaced"` (it had

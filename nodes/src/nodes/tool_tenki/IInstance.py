@@ -582,9 +582,12 @@ class _OutputGuard:
     itself, for the agent. Then, while the run is still open, it kills the command, every process it
     started (see ``_kill_command_tree``), and records what that kill reported. The kill is cleanup, not
     the bound: what it cannot reach runs on in the VM until the execution timeout, and the SDK receives
-    that output and drops it. A run that had already ended by then is not killed: nothing more of it can
-    reach the engine, and a background process the command left behind on purpose stays. Reading as it
-    arrives is what lets the limit be noticed while the command runs rather than after it exits.
+    that output and drops it. A run whose exit had already arrived by then is not killed: nothing more of
+    it can reach the engine, and a background process the command left behind on purpose stays. That is
+    the rare case (output already in memory when the limit was noticed); a finite command just past the
+    limit usually still has its exit on the way when the reader sees the limit crossed, so the kill is
+    sent, finds nothing, and the run is reported as cut. Reading as it arrives is what lets the limit be
+    noticed while the command runs rather than after it exits.
 
     The same rule holds wherever the node stops reading a process (``stop``, and every call that gives a
     process up): the streams are replaced before the process is let go, so a command that prints after
