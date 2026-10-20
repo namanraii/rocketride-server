@@ -216,7 +216,9 @@ environment, any process's environment, files under `/home/tenki` and `/tmp`, gi
 shell history; a request outside the policy that carried a placeholder was answered
 `403 secret_injection_denied`; and a push was refused by GitHub.
 
-Attaches Tenki request policies to the sandbox, by name, for transparent secret injection. As Tenki
+Attaches Tenki request policies to the sandbox, by name, for transparent secret injection
+([Tenki: secrets in a sandbox](https://tenki.cloud/docs/sandbox/secrets),
+[request policies](https://tenki.cloud/docs/secrets/request-policies)). As Tenki
 documents it: code in the sandbox refers to a secret by a placeholder such as
 `secrets://GITHUB_TOKEN`, in a header, query parameter or JSON field of an HTTPS request; Tenki's
 proxy, on the host and outside the VM, substitutes the real value only into requests an attached
@@ -237,15 +239,18 @@ repository or gist the credential, or any other one the agent is given, can writ
 Create the secrets and policies in Tenki first (see [Private repositories](#private-repositories)).
 The API key needs Secrets access; without it Tenki refuses the session, and the tool result says so
 (measured). See [Authentication](#authentication) for how far that access reaches. Tenki
-documents that the image has to carry its managed HTTPS trust. Nothing advertises the placeholders
+documents that transparent injection also requires an image with its managed HTTPS trust, which its
+base image has; with a custom image that lacks it, HTTPS requests from the sandbox fail certificate
+verification, and the node does not check for that at startup. Nothing advertises the placeholders
 to the agent, so name the ones it may use in its instructions. If a command's output contains
 Tenki's denial text, the tool result adds a note on stderr that repeating the request will not help.
 `curl` prints that text, and `git` prints it after `remote:` (both measured).
 
 ### Allowed outbound domains
 
-Restricts the sandbox's outbound traffic to the listed hostnames. Empty, the default, sends no
-allowlist, and outbound traffic is then open. Measured on 2026-10-09, a session created without one
+Restricts the sandbox's outbound traffic to the listed hostnames
+([Tenki: outbound allowlists](https://tenki.cloud/docs/sandbox/sessions#outbound-allowlists)). Empty,
+the default, sends no allowlist, and outbound traffic is then as open as the workspace allows. Measured on 2026-10-09, a session created without one
 reached every host tried (`github.com`, `pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`,
 `example.com`), bare IP addresses over HTTP and HTTPS, and DNS and SSH servers directly. Tenki's
 changelog of 2026-09-25 says outbound allowlists were "enabled by default in all existing and new
@@ -278,7 +283,8 @@ digits and inner hyphens, with at most one leading `*.`, and at most 256 of them
 that the wildcard matches exactly one label (`*.example.com` matches `api.example.com`, not
 `example.com` or `a.b.example.com`). Measured: Tenki accepts `localhost`, `10.0.0.1`, punycode and
 `*.co.uk`, and refuses underscores, non-ASCII names, a wildcard anywhere but first, ports, schemes
-and paths. How wide a wildcard is, `*.co.uk` say, is the operator's call. An entry Tenki would refuse
+and paths. How wide a wildcard is, `*.co.uk` say, is the operator's call. Tenki's sessions page also
+accepts IPv4 CIDRs in an allowlist; this node takes hostnames only and refuses an entry with a slash. An entry Tenki would refuse
 stops the pipeline instead of being dropped (had every entry been dropped, no allowlist would apply
 at all), and so does a setting that is not a list. The list is fixed when the session is created,
 and a session that replaces an ended one is created with the same list.
@@ -295,12 +301,15 @@ letters, digits, underscores and hyphens.
 ## Authentication
 
 The node needs a Tenki **workspace API key**, which begins with `tk_`. Create one in the Tenki
-console under API Keys, then set it as the node's API Key field or reference it from the environment
-as `${ROCKETRIDE_TENKI_APIKEY}` rather than writing the literal into a pipeline file.
+console under API Keys ([Tenki: API keys](https://tenki.cloud/docs/account/api-keys); each key
+belongs to one workspace, and an expiry date can be set when it is created), then set it as the
+node's API Key field or reference it from the environment as `${ROCKETRIDE_TENKI_APIKEY}` rather than
+writing the literal into a pipeline file.
 
 The key authenticates the engine to Tenki and stays on the engine host. It is never placed inside the
 sandbox, so nothing the agent runs can read it. Attaching [secret policies](#secret-policies) also
-needs the key to have Secrets access, chosen when the key is created (**Allow Secrets access**). A
+needs the key to have Secrets access, chosen when the key is created (**Allow Secrets access**,
+[Tenki: access permissions](https://tenki.cloud/docs/secrets/manage-secrets#access-permissions)). A
 key without it cannot be given it later; create a replacement.
 
 Secrets access is one option, and it is broad. Tenki's SDK gives a key that has it the means to
@@ -532,6 +541,14 @@ them fails there rather than in production.
 
 ## Upstream docs
 
+- [Tenki Sandbox: quickstart](https://tenki.cloud/docs/sandbox/quickstart)
+- [Tenki Sandbox: sessions](https://tenki.cloud/docs/sandbox/sessions) (lifecycle, pause and resume, outbound allowlists)
+- [Tenki Sandbox: secrets](https://tenki.cloud/docs/sandbox/secrets) (transparent injection and its placeholders)
+- [Tenki: request policies](https://tenki.cloud/docs/secrets/request-policies)
+- [Tenki: manage secrets](https://tenki.cloud/docs/secrets/manage-secrets) (Secrets access on an API key)
+- [Tenki: API keys](https://tenki.cloud/docs/account/api-keys)
+- [Tenki Sandbox: templates](https://tenki.cloud/docs/sandbox/templates) (custom images)
+- [Tenki: changelog](https://tenki.cloud/docs/changelog)
 - [Tenki Sandbox documentation](https://tenki.cloud/docs)
 - [Tenki Cloud](https://tenki.cloud)
 
