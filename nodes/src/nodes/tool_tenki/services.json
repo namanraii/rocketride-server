@@ -25,7 +25,7 @@
 		"tenki.apikey": {
 			"type": "string",
 			"title": "API Key",
-			"description": "Tenki workspace API key (starts with tk_), from the API Keys screen in the Tenki console.",
+			"description": "Tenki workspace API key (starts with tk_), from the API Keys screen in the Tenki dashboard.",
 			"default": "",
 			"secure": true,
 			"ui": {
@@ -105,7 +105,7 @@
 		"tenki.label": {
 			"type": "string",
 			"title": "Label",
-			"description": "A name for this node instance, put into its sessions' names (rocketride-tool-tenki-<label>-<suffix>) and metadata (label). With several Tenki Sandbox nodes in one pipeline, this is what tells their sessions apart in the Tenki console or in anything that lists them. 1 to 32 letters, digits, _ or -, starting with a letter or digit; a value outside that stops the pipeline at startup. Leave empty for none.",
+			"description": "A name for this node instance, put into its sessions' names (rocketride-tool-tenki-<label>-<suffix>) and metadata (label). With several Tenki Sandbox nodes in one pipeline, this is what tells their sessions apart in the Tenki dashboard or in anything that lists them. 1 to 32 letters, digits, _ or -, starting with a letter or digit; a value outside that stops the pipeline at startup. Leave empty for none.",
 			"default": "",
 			"optional": true
 		},
