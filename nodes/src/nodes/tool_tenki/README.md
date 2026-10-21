@@ -71,12 +71,13 @@ A policy cannot protect the value from an allowed destination, which receives it
 
 ### Private repositories: URL prefix / Private repositories: Tenki secret
 
-Name a Tenki secret holding the HTTP Basic credential (the base64 of `x-access-token:` followed by
-a read-only GitHub token), and narrow the prefix to what its policy covers, such as
-`https://github.com/acme/`. The policy needs `GET` and `POST` rules for that path and the
-`Authorization` header. `git_clone` then sends the placeholder for URLs under the prefix only.
-Keep the token read-only: a push matches the `POST` rule. `git_clone` refuses URLs carrying
-credentials, a query string or a fragment, because git stores the URL in `.git/config`.
+Name a Tenki secret holding the HTTP Basic credential: the base64 of the whole string
+`x-access-token:<token>`, where `<token>` is a read-only GitHub token. Narrow the prefix to what
+its policy covers, such as `https://github.com/acme/`. The policy needs `GET` and `POST` rules for
+that path and the `Authorization` header. `git_clone` then sends the placeholder for URLs under
+the prefix only. Keep the token read-only: a push matches the `POST` rule. `git_clone` refuses
+URLs carrying credentials, a query string or a fragment, because git stores the URL in
+`.git/config`.
 
 ## Authentication
 

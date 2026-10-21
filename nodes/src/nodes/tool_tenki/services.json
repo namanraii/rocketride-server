@@ -139,7 +139,7 @@
 		"tenki.git_auth_secret": {
 			"type": "string",
 			"title": "Private repositories: Tenki secret",
-			"description": "Name of the Tenki secret holding the HTTP Basic credential for the repositories under the prefix above: for GitHub, the base64 of x-access-token: followed by a read-only token for those repositories (see the README). Only the name is set here; the value stays in Tenki, which adds it outside the VM. Requires Secret policies and Allowed outbound domains. Leave empty to clone public repositories only.",
+			"description": "Name of the Tenki secret holding the HTTP Basic credential for the repositories under the prefix above: for GitHub, the base64 of the whole string x-access-token:<token>, where <token> is a read-only token for those repositories (see the README). Only the name is set here; the value stays in Tenki, which adds it outside the VM. Requires Secret policies and Allowed outbound domains. Leave empty to clone public repositories only.",
 			"default": "",
 			"optional": true
 		},
